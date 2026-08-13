@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    // Relative imports inside this package carry explicit ".ts" extensions so Node's built-in
+    // TypeScript support can run `node --test tests/` directly against the source — no build step,
+    // no test framework, no bundler in the loop. TypeScript needs this flag to accept those
+    // specifiers, and it requires noEmit, which is correct here: this package is consumed as source
+    // via the host app's `transpilePackages`, never compiled to its own dist.
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}
