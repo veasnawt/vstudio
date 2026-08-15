@@ -1,6 +1,6 @@
 import { clipDuration, clipEnd, createClip, findAsset, findClip, findTrack } from "../project/createProject.ts";
-import type { Asset, Clip, ClipTransform, Project, Track, TrackKind } from "../project/types.ts";
-import { IMAGE_DEFAULT_DURATION, isIdentityTransform } from "../project/types.ts";
+import type { Asset, Clip, ClipEffects, ClipTransform, Project, TextStyle, Track, TrackKind } from "../project/types.ts";
+import { IMAGE_DEFAULT_DURATION, isIdentityEffects, isIdentityTransform, TEXT_DEFAULT_DURATION } from "../project/types.ts";
 import { frameDuration, snapToFrame } from "./time.ts";
 
 /** Every operation here is PURE: it takes a project and returns a NEW project, never mutating the
@@ -109,15 +109,21 @@ function carveRange(
 }
 
 /** How long a newly-placed clip of this asset should be. Video/audio use their full length; a still
- *  image has no intrinsic duration and gets a sensible default the user can then trim. */
+ *  image or a text clip has no intrinsic duration and gets a sensible default the user can then trim. */
 export function defaultClipDuration(asset: Asset): number {
-  return asset.kind === "image" ? IMAGE_DEFAULT_DURATION : asset.duration;
+  if (asset.kind === "image") return IMAGE_DEFAULT_DURATION;
+  if (asset.kind === "text") return TEXT_DEFAULT_DURATION;
+  return asset.duration;
 }
 
 /** Which kind of track this asset belongs on. Images are visual, so they live on a video track
- *  alongside actual video — only audio-only media goes on an audio track. */
+ *  alongside actual video; text has its own track kind (composited OVER the video track at both
+ *  render sites — see PlaybackEngine and buildExportPlan — which a video track's single-layer model
+ *  can't do); only audio-only media goes on an audio track. */
 export function trackKindForAsset(asset: Asset): TrackKind {
-  return asset.kind === "audio" ? "audio" : "video";
+  if (asset.kind === "audio") return "audio";
+  if (asset.kind === "text") return "text";
+  return "video";
 }
 
 export function addClip(
@@ -141,8 +147,9 @@ export function addClip(
     // an audio track and then simply never render.
     const wantedKind = trackKindForAsset(asset);
     if (track.kind !== wantedKind) {
+      const describeAsset = wantedKind === "audio" ? "audio" : wantedKind === "text" ? "text" : "visual";
       throw new EditError(
-        `"${asset.name}" is ${wantedKind === "audio" ? "audio" : "visual"} media — it belongs on a ${wantedKind} track, not ${track.name}`
+        `"${asset.name}" is ${describeAsset} media — it belongs on a ${wantedKind} track, not ${track.name}`
       );
     }
 
@@ -212,9 +219,10 @@ export function trimClip(project: Project, clipId: string, edge: "in" | "out", t
     const fps = draft.sequence.fps;
     const min = frameDuration(fps);
     const asset = findAsset(draft, clip.assetId);
-    // Images have no fixed source length, so their out-point can extend freely; media is capped at
-    // its real duration.
-    const sourceLimit = asset && asset.kind !== "image" ? asset.duration : Number.POSITIVE_INFINITY;
+    // Images and text have no fixed source length, so their out-point can extend freely; real media
+    // is capped at its actual duration.
+    const sourceLimit =
+      asset && asset.kind !== "image" && asset.kind !== "text" ? asset.duration : Number.POSITIVE_INFINITY;
     const target = snapToFrame(toTime, fps);
 
     if (edge === "in") {
@@ -314,22 +322,34 @@ export function setTrackFlag(
   });
 }
 
-/** Adds a track, keeping video tracks grouped above audio tracks.
- *
- *  Appending to the end would interleave them (V1, A1, V2), which is both visually confusing and
- *  actively harmful: dragging a clip "one track down" would land it on an audio track, get refused,
- *  and look like the drag simply failed. Every editor groups by kind for this reason. */
-export function addTrack(project: Project, kind: "video" | "audio", trackId?: string): Project {
+/** Top-to-bottom grouping every track-ordering operation in this file maintains: video (the base
+ *  layer), then text (composited over it), then audio (no visual role at all). Interleaving them
+ *  would make "drag a clip one track down" land on a mismatched track kind and look like the drag
+ *  simply failed — every editor groups by kind for this reason. */
+const TRACK_KIND_ORDER: TrackKind[] = ["video", "text", "audio"];
+
+const TRACK_ID_PREFIX: Record<TrackKind, string> = { video: "v", audio: "a", text: "t" };
+const TRACK_NAME_PREFIX: Record<TrackKind, string> = { video: "V", audio: "A", text: "T" };
+
+/** Where a track of `kind` belongs in `tracks`, keeping `TRACK_KIND_ORDER`'s grouping: right after
+ *  the last existing track whose kind is this kind or one that sorts before it. Shared by `addTrack`
+ *  (a brand new track) and `reorderTrack` (moving one to "the end of its own kind-group"). */
+function insertionIndexForKind(tracks: Track[], kind: TrackKind): number {
+  const rank = TRACK_KIND_ORDER.indexOf(kind);
+  let insertAt = 0;
+  for (let i = 0; i < tracks.length; i++) {
+    if (TRACK_KIND_ORDER.indexOf(tracks[i].kind) <= rank) insertAt = i + 1;
+  }
+  return insertAt;
+}
+
+/** Adds a track, keeping same-kind tracks grouped together (see `TRACK_KIND_ORDER`). */
+export function addTrack(project: Project, kind: TrackKind, trackId?: string): Project {
   return edit(project, (draft) => {
     const count = draft.sequence.tracks.filter((t) => t.kind === kind).length;
-    const name = `${kind === "video" ? "V" : "A"}${count + 1}`;
-    // A new video track goes after the last existing video track; a new audio track goes at the end.
-    const insertAt =
-      kind === "video"
-        ? draft.sequence.tracks.findLastIndex((t) => t.kind === "video") + 1
-        : draft.sequence.tracks.length;
-    draft.sequence.tracks.splice(insertAt, 0, {
-      id: trackId ?? `${kind === "video" ? "v" : "a"}_${crypto.randomUUID().slice(0, 8)}`,
+    const name = `${TRACK_NAME_PREFIX[kind]}${count + 1}`;
+    draft.sequence.tracks.splice(insertionIndexForKind(draft.sequence.tracks, kind), 0, {
+      id: trackId ?? newTrackId(kind),
       kind,
       name,
       clips: [],
@@ -341,15 +361,17 @@ export function addTrack(project: Project, kind: "video" | "audio", trackId?: st
   });
 }
 
+function newTrackId(kind: TrackKind): string {
+  return `${TRACK_ID_PREFIX[kind]}_${crypto.randomUUID().slice(0, 8)}`;
+}
+
 /** Moves `trackId` to just before `beforeTrackId` within its own track list. `beforeTrackId: null`
  *  means "move to the end of its kind-group" (dropped past the last track, or past the last track of
  *  its own kind).
  *
- *  Reordering is deliberately confined to same-kind tracks — video tracks stay grouped above audio
- *  tracks, the same invariant `addTrack` maintains when inserting a new one (see its own doc comment:
- *  interleaving them would make "drag a clip one track down" land on a mismatched track kind and look
- *  like the drag simply failed). Locked doesn't block this: a lock protects a track's CONTENT from
- *  edits, not where the track sits in the stack. */
+ *  Reordering is deliberately confined to same-kind tracks — see `TRACK_KIND_ORDER`, the same
+ *  invariant `addTrack` maintains when inserting a new one. Locked doesn't block this: a lock
+ *  protects a track's CONTENT from edits, not where the track sits in the stack. */
 export function reorderTrack(project: Project, trackId: string, beforeTrackId: string | null): Project {
   return edit(project, (draft) => {
     const tracks = draft.sequence.tracks;
@@ -359,19 +381,15 @@ export function reorderTrack(project: Project, trackId: string, beforeTrackId: s
     const target = beforeTrackId ? tracks.find((t) => t.id === beforeTrackId) : undefined;
     if (beforeTrackId && !target) throw new EditError("That track no longer exists");
     if (target && target.kind !== from.kind) {
-      throw new EditError("Video and audio tracks can't be mixed together");
+      throw new EditError(`${from.kind[0].toUpperCase()}${from.kind.slice(1)} and ${target.kind} tracks can't be mixed together`);
     }
 
     const without = tracks.filter((t) => t.id !== trackId);
     // No explicit target: append to the end of `from`'s own kind-group, mirroring `addTrack`'s own
-    // placement rule exactly (video goes after the last video track, audio goes at the very end) —
-    // needed so this stays correct even in the edge case where `from` was the ONLY track of its kind,
-    // where "the last same-kind track's position" doesn't exist to anchor off of.
-    const insertAt = target
-      ? without.findIndex((t) => t.id === beforeTrackId)
-      : from.kind === "video"
-        ? without.findLastIndex((t) => t.kind === "video") + 1
-        : without.length;
+    // placement rule exactly — needed so this stays correct even in the edge case where `from` was
+    // the ONLY track of its kind, where "the last same-kind track's position" doesn't exist to anchor
+    // off of.
+    const insertAt = target ? without.findIndex((t) => t.id === beforeTrackId) : insertionIndexForKind(without, from.kind);
     without.splice(insertAt, 0, from);
     draft.sequence.tracks = without;
   });
@@ -398,6 +416,18 @@ export function removeTrack(project: Project, trackId: string): Project {
 const MIN_VISIBLE_FRACTION = 0.02;
 const MIN_SCALE = 0.05;
 const MAX_SCALE = 20;
+/** A resize-corner drag multiplies `fontSize` directly (there's no separate scale field for text — see
+ *  `TextStyle.fontSize`'s own comment) — clamped so a runaway drag or a hand-edited project file can't
+ *  produce an invisible (near-zero) or absurdly-oversized-and-unrenderable value. */
+const MIN_FONT_SIZE = 8;
+const MAX_FONT_SIZE = 600;
+/** A stroke wider than this stops reading as an outline and starts swallowing the glyph shapes it's
+ *  supposed to be tracing — bounded relative to nothing in particular, just a generous ceiling. */
+const MIN_STROKE_WIDTH = 0;
+const MAX_STROKE_WIDTH = 60;
+/** Below this, lines start overlapping; above it, a caption stops reading as one block. */
+const MIN_LINE_HEIGHT_MULTIPLIER = 0.5;
+const MAX_LINE_HEIGHT_MULTIPLIER = 3;
 
 /** Clamps a user-supplied transform to values both renderers can safely draw. Rotation is the one
  *  field left untouched — see `ClipTransform.rotationDeg`'s own comment for why. */
@@ -456,6 +486,68 @@ export function setClipTransform(project: Project, clipId: string, transform: Cl
   });
 }
 
+const MIN_BRIGHTNESS = -1;
+const MAX_BRIGHTNESS = 1;
+const MIN_CONTRAST = 0;
+const MAX_CONTRAST = 2;
+const MIN_SATURATION = 0;
+const MAX_SATURATION = 2;
+const MIN_BLUR = 0;
+const MAX_BLUR = 20;
+const MIN_OPACITY = 0;
+const MAX_OPACITY = 1;
+
+function clampEffects(effects: ClipEffects): ClipEffects {
+  return {
+    brightness: Math.min(MAX_BRIGHTNESS, Math.max(MIN_BRIGHTNESS, effects.brightness)),
+    contrast: Math.min(MAX_CONTRAST, Math.max(MIN_CONTRAST, effects.contrast)),
+    saturation: Math.min(MAX_SATURATION, Math.max(MIN_SATURATION, effects.saturation)),
+    blur: Math.min(MAX_BLUR, Math.max(MIN_BLUR, effects.blur)),
+    opacity: Math.min(MAX_OPACITY, Math.max(MIN_OPACITY, effects.opacity)),
+  };
+}
+
+/** Sets a clip's effects (brightness/contrast/saturation/blur/opacity) wholesale — same "read
+ *  current, patch one field, pass the whole object back" pattern as `setClipTransform`, and for the
+ *  same reason: clamping stays in exactly one place instead of needing to merge-then-clamp on every
+ *  call site. */
+export function setClipEffects(project: Project, clipId: string, effects: ClipEffects): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    const clamped = clampEffects(effects);
+    // Storing an identity object instead of deleting the field would make undoing back to "no
+    // effects applied" leave a structurally different (if semantically equivalent) clip — the
+    // round-trip exactness every other operation in this file preserves.
+    if (isIdentityEffects(clamped)) {
+      delete found.clip.effects;
+    } else {
+      found.clip.effects = clamped;
+    }
+  });
+}
+
+/** Sets or clears a clip's `transitionIn` (`null` clears it, matching `setClipMuted`'s `false`
+ *  convention for a boolean-shaped optional field). Only `duration` is clamped — floored at one
+ *  frame so a transition can never collapse to a zero-length no-op that still occupies a field; no
+ *  ceiling here, since `findTransitionPartner` (`timeline/transitions.ts`) already bounds it against
+ *  both clips' REAL current lengths at the point something actually renders it, which is a tighter,
+ *  always-current limit than anything this function could enforce up front. */
+export function setClipTransitionIn(project: Project, clipId: string, transitionIn: Clip["transitionIn"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!transitionIn) {
+      delete found.clip.transitionIn;
+    } else {
+      const min = frameDuration(draft.sequence.fps);
+      found.clip.transitionIn = { ...transitionIn, duration: Math.max(min, transitionIn.duration) };
+    }
+  });
+}
+
 /** Mutes or unmutes a clip's own embedded audio. Like `transform`, `false` deletes the field rather
  *  than storing it explicitly — an unmuted clip's JSON stays exactly as small as it was before this
  *  feature existed, and undoing a mute toggle restores a truly absent field. */
@@ -469,5 +561,49 @@ export function setClipMuted(project: Project, clipId: string, muted: boolean): 
     } else {
       delete found.clip.mutedAudio;
     }
+  });
+}
+
+/** Sets a clip's own audio gain (linear, 0..1 — see `Clip.gain`'s own doc comment for why not
+ *  higher). Same "delete rather than store the identity value" convention as `transform`/`effects`:
+ *  an untouched clip's JSON stays exactly as small as before this feature existed, and undoing a gain
+ *  change restores a truly absent field rather than an explicit `1`. */
+export function setClipGain(project: Project, clipId: string, gain: number): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    const clamped = Math.min(1, Math.max(0, gain));
+    if (clamped === 1) {
+      delete found.clip.gain;
+    } else {
+      found.clip.gain = clamped;
+    }
+  });
+}
+
+/** Sets a text asset's content and style wholesale — same "read current, patch one field, pass the
+ *  whole object back" pattern as `setClipTransform`, and for the same reason: this is asset-level
+ *  data (see `Asset.textContent`'s own doc comment), not clip-level, so it's addressed by asset id
+ *  rather than clip id. Not locked-track-gated: editing what a text asset SAYS isn't a timeline edit
+ *  the way moving/trimming its clip is — the same reasoning `removeAsset` already applies elsewhere. */
+export function setTextAsset(project: Project, assetId: string, content: string, style: TextStyle): Project {
+  return edit(project, (draft) => {
+    const asset = draft.assets.find((a) => a.id === assetId);
+    if (!asset) throw new EditError("That text no longer exists");
+    if (asset.kind !== "text") throw new EditError("That asset isn't text");
+    asset.textContent = content;
+    // rotationDeg and the shadow offsets are deliberately left unclamped — same "any degree, multi-turn
+    // drags exceed 360" reasoning as `ClipTransform.rotationDeg` (see `clampTransform`'s own comment);
+    // a shadow offset has no natural bound the way size/stroke/line-height do.
+    asset.textStyle = {
+      ...style,
+      fontSize: Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, style.fontSize)),
+      strokeWidth: Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, style.strokeWidth)),
+      lineHeightMultiplier: Math.min(MAX_LINE_HEIGHT_MULTIPLIER, Math.max(MIN_LINE_HEIGHT_MULTIPLIER, style.lineHeightMultiplier)),
+    };
+    // Keeps the media library's own listing in sync — it shows `asset.name`, which was seeded from
+    // the content at creation and would otherwise go stale forever the moment the text changes.
+    asset.name = content.slice(0, 40) || "Text";
   });
 }

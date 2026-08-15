@@ -1,9 +1,26 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { clipDuration, findClip } from "../src/project/createProject.ts";
-import { IDENTITY_TRANSFORM } from "../src/project/types.ts";
-import { addClip, addTrack, deleteClips, EditError, moveClip, removeTrack, reorderTrack, setClipMuted, setClipTransform, setTrackFlag, splitClip, trimClip } from "../src/timeline/operations.ts";
-import { audioTrackId, clipsOf, closeTo, comparable, emptyProject, imageAsset, videoAsset, videoTrackId } from "./fixture.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import {
+  addClip,
+  addTrack,
+  deleteClips,
+  EditError,
+  moveClip,
+  removeTrack,
+  reorderTrack,
+  setClipEffects,
+  setClipGain,
+  setClipMuted,
+  setClipTransform,
+  setClipTransitionIn,
+  setTextAsset,
+  setTrackFlag,
+  splitClip,
+  trimClip,
+} from "../src/timeline/operations.ts";
+import { audioTrackId, clipsOf, closeTo, comparable, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
 
 describe("addClip", () => {
   it("places a clip spanning the asset's full duration", () => {
@@ -314,6 +331,26 @@ describe("track kind enforcement", () => {
 
     assert.throws(() => addClip(base, videoTrackId(base), "music", 0), EditError);
   });
+
+  it("puts a text asset on a text track, defaulting to TEXT_DEFAULT_DURATION", () => {
+    let base = emptyProject([textAsset()]);
+    base = addTrack(base, "text");
+    const project = addClip(base, textTrackId(base), "text1", 0);
+    const [clip] = clipsOf(project, textTrackId(project));
+
+    assert.ok(closeTo(clipDuration(clip), 5));
+  });
+
+  it("refuses to add a text asset to a video track", () => {
+    const base = emptyProject([textAsset()]);
+    assert.throws(() => addClip(base, videoTrackId(base), "text1", 0), EditError);
+  });
+
+  it("refuses to add a video asset to a text track", () => {
+    let base = emptyProject();
+    base = addTrack(base, "text");
+    assert.throws(() => addClip(base, textTrackId(base), "asset1", 0), EditError);
+  });
 });
 
 describe("moving a clip between tracks", () => {
@@ -352,6 +389,15 @@ describe("track ordering", () => {
     const project = addTrack(addTrack(emptyProject(), "video"), "video");
 
     assert.deepEqual(project.sequence.tracks.filter((t) => t.kind === "video").map((t) => t.name), ["V1", "V2", "V3"]);
+  });
+
+  it("inserts a text track between video and audio, regardless of add order", () => {
+    // [V1, A1] -> add text -> [V1, T1, A1] -> add another video -> [V1, V2, T1, A1]
+    let project = addTrack(emptyProject(), "text");
+    assert.deepEqual(project.sequence.tracks.map((t) => t.kind), ["video", "text", "audio"]);
+
+    project = addTrack(project, "video");
+    assert.deepEqual(project.sequence.tracks.map((t) => t.kind), ["video", "video", "text", "audio"]);
   });
 });
 
@@ -539,6 +585,125 @@ describe("setClipTransform", () => {
   });
 });
 
+describe("setClipEffects", () => {
+  it("stores real effects on the clip", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const adjusted = setClipEffects(project, clip.id, {
+      brightness: 0.2,
+      contrast: 1.3,
+      saturation: 0.5,
+      blur: 4,
+      opacity: 0.8,
+    });
+    const [result] = clipsOf(adjusted, videoTrackId(adjusted));
+
+    assert.deepEqual(result.effects, { brightness: 0.2, contrast: 1.3, saturation: 0.5, blur: 4, opacity: 0.8 });
+  });
+
+  it("deletes the field entirely when set back to identity, not stores an identity object", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    let adjusted = setClipEffects(project, clip.id, { ...IDENTITY_EFFECTS, brightness: 0.3 });
+    adjusted = setClipEffects(adjusted, clip.id, IDENTITY_EFFECTS);
+    const [result] = clipsOf(adjusted, videoTrackId(adjusted));
+
+    assert.equal(result.effects, undefined);
+    assert.deepEqual(comparable(adjusted), comparable(project));
+  });
+
+  it("clamps every field to its valid range instead of accepting out-of-range values", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const extreme = setClipEffects(project, clip.id, {
+      brightness: -5,
+      contrast: 10,
+      saturation: -3,
+      blur: 500,
+      opacity: 5,
+    });
+    const effects = clipsOf(extreme, videoTrackId(extreme))[0].effects!;
+
+    assert.equal(effects.brightness, -1);
+    assert.equal(effects.contrast, 2);
+    assert.equal(effects.saturation, 0);
+    assert.equal(effects.blur, 20);
+    assert.equal(effects.opacity, 1);
+  });
+
+  it("refuses to adjust effects on a locked track", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setTrackFlag(project, videoTrackId(project), "locked", true);
+
+    assert.throws(() => setClipEffects(project, clip.id, { ...IDENTITY_EFFECTS, opacity: 0.5 }), EditError);
+  });
+
+  it("rejects an unknown clip", () => {
+    const project = emptyProject();
+    assert.throws(() => setClipEffects(project, "missing", IDENTITY_EFFECTS), EditError);
+  });
+});
+
+describe("setClipTransitionIn", () => {
+  it("stores a real transition on the clip", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const withTransition = setClipTransitionIn(project, clip.id, { duration: 0.5, type: "crossfade" });
+    const [result] = clipsOf(withTransition, videoTrackId(withTransition));
+
+    assert.deepEqual(result.transitionIn, { duration: 0.5, type: "crossfade" });
+  });
+
+  it("deletes the field entirely when cleared, rather than storing null", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransitionIn(project, clip.id, { duration: 0.5, type: "crossfade" });
+
+    const cleared = setClipTransitionIn(project, clip.id, null);
+    const [result] = clipsOf(cleared, videoTrackId(cleared));
+
+    assert.equal(result.transitionIn, undefined);
+    assert.ok(!("transitionIn" in result));
+  });
+
+  it("clamps duration up to at least one frame instead of accepting zero or negative", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const withTransition = setClipTransitionIn(project, clip.id, { duration: -5, type: "crossfade" });
+    const [result] = clipsOf(withTransition, videoTrackId(withTransition));
+
+    assert.ok(result.transitionIn!.duration > 0);
+    assert.ok(closeTo(result.transitionIn!.duration, 1 / 30));
+  });
+
+  it("refuses to set a transition on a locked track", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setTrackFlag(project, videoTrackId(project), "locked", true);
+
+    assert.throws(() => setClipTransitionIn(project, clip.id, { duration: 0.5, type: "crossfade" }), EditError);
+  });
+
+  it("rejects an unknown clip", () => {
+    const project = emptyProject();
+    assert.throws(() => setClipTransitionIn(project, "missing", { duration: 0.5, type: "crossfade" }), EditError);
+  });
+});
+
 describe("setClipMuted", () => {
   it("mutes a clip, storing the field explicitly", () => {
     const base = emptyProject();
@@ -574,5 +739,141 @@ describe("setClipMuted", () => {
   it("rejects an unknown clip", () => {
     const project = emptyProject();
     assert.throws(() => setClipMuted(project, "missing", true), EditError);
+  });
+});
+
+describe("setClipGain", () => {
+  it("stores a real gain value", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const adjusted = setClipGain(project, clip.id, 0.5);
+
+    assert.ok(closeTo(clipsOf(adjusted, videoTrackId(adjusted))[0].gain!, 0.5));
+  });
+
+  it("clamps to 0..1", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const tooHigh = setClipGain(project, clip.id, 5);
+    const tooLow = setClipGain(project, clip.id, -5);
+
+    // Clamped-to-1 is the IDENTITY value, which the "delete rather than store" convention (tested
+    // separately below) means comes back as an absent field, not a literal stored `1`.
+    assert.equal(clipsOf(tooHigh, videoTrackId(tooHigh))[0].gain, undefined);
+    assert.ok(closeTo(clipsOf(tooLow, videoTrackId(tooLow))[0].gain!, 0));
+  });
+
+  it("setting gain back to 1 (unchanged) deletes the field entirely rather than storing 1", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipGain(project, clip.id, 0.3);
+
+    const reset = setClipGain(project, clip.id, 1);
+
+    assert.equal(clipsOf(reset, videoTrackId(reset))[0].gain, undefined);
+    assert.ok(!("gain" in clipsOf(reset, videoTrackId(reset))[0]));
+  });
+
+  it("refuses to adjust gain on a locked track", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setTrackFlag(project, videoTrackId(project), "locked", true);
+
+    assert.throws(() => setClipGain(project, clip.id, 0.5), EditError);
+  });
+
+  it("rejects an unknown clip", () => {
+    const project = emptyProject();
+    assert.throws(() => setClipGain(project, "missing", 0.5), EditError);
+  });
+});
+
+describe("setTextAsset", () => {
+  it("sets content and style, and syncs the asset's display name to the new content", () => {
+    const project = emptyProject([textAsset("text1", "Old")]);
+
+    const updated = setTextAsset(project, "text1", "New caption", { ...DEFAULT_TEXT_STYLE, fontSize: 96 });
+
+    const asset = updated.assets[0];
+    assert.equal(asset.textContent, "New caption");
+    assert.equal(asset.textStyle?.fontSize, 96);
+    assert.equal(asset.name, "New caption");
+  });
+
+  it("does not mutate the project it was given", () => {
+    const project = emptyProject([textAsset()]);
+    const before = structuredClone(project);
+
+    setTextAsset(project, "text1", "Changed", DEFAULT_TEXT_STYLE);
+
+    assert.deepEqual(project, before);
+  });
+
+  it("rejects an unknown asset", () => {
+    const project = emptyProject([textAsset()]);
+    assert.throws(() => setTextAsset(project, "missing", "x", DEFAULT_TEXT_STYLE), EditError);
+  });
+
+  it("rejects an asset that isn't text", () => {
+    const project = emptyProject(); // default video asset
+    assert.throws(() => setTextAsset(project, "asset1", "x", DEFAULT_TEXT_STYLE), EditError);
+  });
+
+  it("clamps fontSize into a renderable range", () => {
+    const project = emptyProject([textAsset("text1")]);
+
+    const tooSmall = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, fontSize: 1 });
+    const tooBig = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, fontSize: 100000 });
+
+    assert.equal(tooSmall.assets[0].textStyle?.fontSize, 8);
+    assert.equal(tooBig.assets[0].textStyle?.fontSize, 600);
+  });
+
+  it("leaves rotationDeg unclamped, including a value past a full turn", () => {
+    const project = emptyProject([textAsset("text1")]);
+
+    const updated = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, rotationDeg: 730 });
+
+    assert.equal(updated.assets[0].textStyle?.rotationDeg, 730);
+  });
+
+  it("clamps strokeWidth into a renderable range", () => {
+    const project = emptyProject([textAsset("text1")]);
+
+    const tooThin = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, strokeColor: "#000000", strokeWidth: -5 });
+    const tooThick = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, strokeColor: "#000000", strokeWidth: 9999 });
+
+    assert.equal(tooThin.assets[0].textStyle?.strokeWidth, 0);
+    assert.equal(tooThick.assets[0].textStyle?.strokeWidth, 60);
+  });
+
+  it("clamps lineHeightMultiplier into a renderable range", () => {
+    const project = emptyProject([textAsset("text1")]);
+
+    const tooTight = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, lineHeightMultiplier: 0 });
+    const tooLoose = setTextAsset(project, "text1", "x", { ...DEFAULT_TEXT_STYLE, lineHeightMultiplier: 50 });
+
+    assert.equal(tooTight.assets[0].textStyle?.lineHeightMultiplier, 0.5);
+    assert.equal(tooLoose.assets[0].textStyle?.lineHeightMultiplier, 3);
+  });
+
+  it("leaves shadow offsets unclamped", () => {
+    const project = emptyProject([textAsset("text1")]);
+
+    const updated = setTextAsset(project, "text1", "x", {
+      ...DEFAULT_TEXT_STYLE,
+      shadowColor: "#000000",
+      shadowOffsetX: 5000,
+      shadowOffsetY: -5000,
+    });
+
+    assert.equal(updated.assets[0].textStyle?.shadowOffsetX, 5000);
+    assert.equal(updated.assets[0].textStyle?.shadowOffsetY, -5000);
   });
 });

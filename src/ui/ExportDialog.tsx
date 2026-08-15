@@ -2,8 +2,12 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { cancelExport, exportAvailable, exportUrl, startExport, watchExport } from "../api/client.ts";
+import { trimProjectToRange } from "../export/trimForExport.ts";
+import { sequenceDuration } from "../project/createProject.ts";
 import { FPS_PRESETS, RESOLUTION_PRESETS } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
+import { formatTimecode } from "../timeline/time.ts";
+import { Dropdown } from "./Dropdown.tsx";
 
 type Phase = "idle" | "running" | "done" | "failed" | "cancelled";
 
@@ -11,6 +15,12 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   const project = useEditorStore((s) => s.project);
   const projectId = useEditorStore((s) => s.projectId);
   const save = useEditorStore((s) => s.save);
+  const exportRangeStart = useEditorStore((s) => s.exportRangeStart);
+  const exportRangeEnd = useEditorStore((s) => s.exportRangeEnd);
+  const clearExportRange = useEditorStore((s) => s.clearExportRange);
+
+  const total = project ? sequenceDuration(project) : 0;
+  const hasRange = exportRangeStart !== null || exportRangeEnd !== null;
 
   const [width, setWidth] = useState(project?.exportSettings.width ?? 1080);
   const [height, setHeight] = useState(project?.exportSettings.height ?? 1920);
@@ -46,7 +56,15 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
     try {
       const settings = { ...project.exportSettings, width, height, fps, crf };
-      const started = await startExport(projectId, { ...project, exportSettings: settings });
+
+      // Only clone/trim when a real (non-full) range is set — an untouched export keeps sending
+      // the original project object, unchanged from before this feature existed.
+      const { start, end } = useEditorStore.getState().exportRange();
+      const seqTotal = sequenceDuration(project);
+      const isFullRange = start <= 1e-6 && end >= seqTotal - 1e-6;
+      const exportProject = isFullRange ? project : trimProjectToRange(project, start, end);
+
+      const started = await startExport(projectId, { ...exportProject, exportSettings: settings });
       jobIdRef.current = started.jobId;
       setFileName(started.fileName);
 
@@ -100,27 +118,41 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
           </p>
         ) : (
           <>
+            {hasRange && (
+              <div className="mt-4 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                <span>
+                  Exporting range {formatTimecode(Math.min(exportRangeStart ?? 0, exportRangeEnd ?? total), fps)}{" "}
+                  – {formatTimecode(Math.max(exportRangeStart ?? 0, exportRangeEnd ?? total), fps)}
+                </span>
+                <button
+                  disabled={busy}
+                  onClick={clearExportRange}
+                  className="font-medium text-amber-100 underline decoration-amber-100/40 underline-offset-2 transition hover:text-white disabled:opacity-50"
+                >
+                  Reset to full timeline
+                </button>
+              </div>
+            )}
+
             <div className="mt-4 space-y-3">
               <label className="block">
                 <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
                   Resolution
                 </span>
-                <select
+                <Dropdown
                   disabled={busy}
+                  ariaLabel="Resolution"
                   value={`${width}x${height}`}
-                  onChange={(e) => {
-                    const [w, h] = e.target.value.split("x").map(Number);
+                  onChange={(next) => {
+                    const [w, h] = next.split("x").map(Number);
                     setWidth(w);
                     setHeight(h);
                   }}
-                  className="w-full rounded-md bg-white/5 px-2 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-sky-400/60 disabled:opacity-50"
-                >
-                  {RESOLUTION_PRESETS.map((preset) => (
-                    <option key={preset.label} value={`${preset.width}x${preset.height}`}>
-                      {preset.label}
-                    </option>
-                  ))}
-                </select>
+                  options={RESOLUTION_PRESETS.map((preset) => ({
+                    value: `${preset.width}x${preset.height}`,
+                    label: preset.label,
+                  }))}
+                />
               </label>
 
               <div className="grid grid-cols-2 gap-3">
@@ -128,36 +160,32 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                   <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
                     Frame rate
                   </span>
-                  <select
+                  <Dropdown
                     disabled={busy}
-                    value={fps}
-                    onChange={(e) => setFps(Number(e.target.value))}
-                    className="w-full rounded-md bg-white/5 px-2 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-sky-400/60 disabled:opacity-50"
-                  >
-                    {FPS_PRESETS.map((value) => (
-                      <option key={value} value={value}>
-                        {value} fps
-                      </option>
-                    ))}
-                  </select>
+                    ariaLabel="Frame rate"
+                    value={String(fps)}
+                    onChange={(next) => setFps(Number(next))}
+                    options={FPS_PRESETS.map((value) => ({ value: String(value), label: `${value} fps` }))}
+                  />
                 </label>
 
                 <label className="block">
                   <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
                     Quality
                   </span>
-                  <select
+                  {/* CRF is inverted (lower = better), which is unintuitive — the labels say what the
+                      user actually cares about and keep the numbers out of the way. */}
+                  <Dropdown
                     disabled={busy}
-                    value={crf}
-                    onChange={(e) => setCrf(Number(e.target.value))}
-                    className="w-full rounded-md bg-white/5 px-2 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-sky-400/60 disabled:opacity-50"
-                  >
-                    {/* CRF is inverted (lower = better), which is unintuitive — the labels say what
-                        the user actually cares about and keep the numbers out of the way. */}
-                    <option value={18}>High</option>
-                    <option value={20}>Balanced</option>
-                    <option value={26}>Small file</option>
-                  </select>
+                    ariaLabel="Quality"
+                    value={String(crf)}
+                    onChange={(next) => setCrf(Number(next))}
+                    options={[
+                      { value: "18", label: "High" },
+                      { value: "20", label: "Balanced" },
+                      { value: "26", label: "Small file" },
+                    ]}
+                  />
                 </label>
               </div>
             </div>

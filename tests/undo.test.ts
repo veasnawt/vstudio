@@ -3,22 +3,27 @@ import { describe, it } from "node:test";
 import {
   AddClipCommand,
   AddTrackCommand,
+  BatchCommand,
   DeleteClipsCommand,
   MoveClipCommand,
   RemoveTrackCommand,
   ReorderTrackCommand,
+  SetClipEffectsCommand,
+  SetClipGainCommand,
   SetClipMutedCommand,
   SetClipTransformCommand,
+  SetClipTransitionCommand,
+  SetTextCommand,
   SetTrackFlagCommand,
   SplitClipCommand,
   TrimClipCommand,
 } from "../src/commands/index.ts";
 import type { Command } from "../src/commands/index.ts";
 import type { Project } from "../src/project/types.ts";
-import { IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
 import { addClip, addTrack } from "../src/timeline/operations.ts";
 import { UndoStack } from "../src/undo/UndoStack.ts";
-import { clipsOf, comparable, emptyProject, videoAsset, videoTrackId } from "./fixture.ts";
+import { clipsOf, comparable, emptyProject, textAsset, videoAsset, videoTrackId } from "./fixture.ts";
 
 /** Asserts the central undo guarantee: applying a command and then reverting it returns the project
  *  to exactly the state it started in, and redoing gets back to the post-apply state. */
@@ -60,6 +65,40 @@ describe("command undo/redo round-trips", () => {
     const project = addClip(base, videoTrackId(base), "asset1", 0);
     const [clip] = clipsOf(project, videoTrackId(project));
     assertRoundTrips(project, new MoveClipCommand(clip.id, videoTrackId(project), 12));
+  });
+
+  it("BatchCommand groups several commands into one round-trippable step", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, videoTrackId(project), "asset1", 20);
+    const [first, second] = clipsOf(project, videoTrackId(project));
+
+    assertRoundTrips(
+      project,
+      new BatchCommand("Move Clips", [
+        new MoveClipCommand(first.id, videoTrackId(project), 30),
+        new MoveClipCommand(second.id, videoTrackId(project), 40),
+      ])
+    );
+  });
+
+  it("BatchCommand's revert undoes BOTH sub-commands together, not just the last one", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, videoTrackId(project), "asset1", 20);
+    const [first, second] = clipsOf(project, videoTrackId(project));
+    const command = new BatchCommand("Move Clips", [
+      new MoveClipCommand(first.id, videoTrackId(project), 30),
+      new MoveClipCommand(second.id, videoTrackId(project), 40),
+    ]);
+
+    const applied = command.apply(project);
+    assert.equal(clipsOf(applied, videoTrackId(applied)).find((c) => c.id === first.id)?.timelineStart, 30);
+    assert.equal(clipsOf(applied, videoTrackId(applied)).find((c) => c.id === second.id)?.timelineStart, 40);
+
+    const reverted = command.revert(applied);
+    assert.equal(clipsOf(reverted, videoTrackId(reverted)).find((c) => c.id === first.id)?.timelineStart, 0);
+    assert.equal(clipsOf(reverted, videoTrackId(reverted)).find((c) => c.id === second.id)?.timelineStart, 20);
   });
 
   it("MoveClipCommand that overwrites a neighbour restores what it destroyed", () => {
@@ -141,6 +180,43 @@ describe("command undo/redo round-trips", () => {
     const reverted = command.revert(applied);
 
     assert.equal(clipsOf(reverted, videoTrackId(reverted))[0].mutedAudio, undefined);
+    assert.deepEqual(comparable(reverted), comparable(project));
+  });
+
+  it("SetClipGainCommand", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    assertRoundTrips(project, new SetClipGainCommand(clip.id, 0.4));
+  });
+
+  it("SetClipGainCommand undoes back to a truly absent field, not stored `1`", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const command = new SetClipGainCommand(clip.id, 0.4);
+
+    const applied = command.apply(project);
+    const reverted = command.revert(applied);
+
+    assert.equal(clipsOf(reverted, videoTrackId(reverted))[0].gain, undefined);
+    assert.deepEqual(comparable(reverted), comparable(project));
+  });
+
+  it("SetTextCommand", () => {
+    const project = emptyProject([textAsset("text1", "Original")]);
+    assertRoundTrips(project, new SetTextCommand("text1", "Changed", { ...DEFAULT_TEXT_STYLE, fontSize: 96 }));
+  });
+
+  it("SetTextCommand restores the exact previous content and style, not just SOME prior value", () => {
+    const project = emptyProject([textAsset("text1", "Original")]);
+    const command = new SetTextCommand("text1", "Changed", { ...DEFAULT_TEXT_STYLE, bold: true });
+
+    const applied = command.apply(project);
+    const reverted = command.revert(applied);
+
+    assert.equal(reverted.assets[0].textContent, "Original");
+    assert.deepEqual(reverted.assets[0].textStyle, DEFAULT_TEXT_STYLE);
     assert.deepEqual(comparable(reverted), comparable(project));
   });
 });
@@ -285,5 +361,94 @@ describe("SetClipTransformCommand", () => {
 
     p = stack.undo(p);
     assert.equal(clipsOf(p, videoTrackId(p))[0].transform, undefined);
+  });
+});
+
+describe("SetClipEffectsCommand", () => {
+  it("round-trips like every other command", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    assertRoundTrips(
+      project,
+      new SetClipEffectsCommand(clip.id, { brightness: 0.2, contrast: 1.3, saturation: 0.5, blur: 4, opacity: 0.8 })
+    );
+  });
+
+  it("undoes back to a truly absent effects field, not an identity object", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const command = new SetClipEffectsCommand(clip.id, { ...IDENTITY_EFFECTS, brightness: 0.4 });
+
+    const applied = command.apply(project);
+    const reverted = command.revert(applied);
+
+    assert.equal(clipsOf(reverted, videoTrackId(reverted))[0].effects, undefined);
+    assert.deepEqual(comparable(reverted), comparable(project));
+  });
+
+  it("chains: two edits undo back through each intermediate value", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const stack = new UndoStack();
+
+    let p = stack.execute(project, new SetClipEffectsCommand(clip.id, { ...IDENTITY_EFFECTS, contrast: 1.2 }));
+    p = stack.execute(p, new SetClipEffectsCommand(clip.id, { ...IDENTITY_EFFECTS, contrast: 1.2, blur: 3 }));
+    assert.equal(clipsOf(p, videoTrackId(p))[0].effects?.blur, 3);
+
+    p = stack.undo(p);
+    assert.equal(clipsOf(p, videoTrackId(p))[0].effects?.blur, 0);
+    assert.equal(clipsOf(p, videoTrackId(p))[0].effects?.contrast, 1.2);
+
+    p = stack.undo(p);
+    assert.equal(clipsOf(p, videoTrackId(p))[0].effects, undefined);
+  });
+});
+
+describe("SetClipTransitionCommand", () => {
+  it("round-trips like every other command", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    assertRoundTrips(project, new SetClipTransitionCommand(clip.id, { duration: 0.5, type: "crossfade" }));
+  });
+
+  it("undoes back to a truly absent transitionIn field, not null", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const command = new SetClipTransitionCommand(clip.id, { duration: 0.5, type: "crossfade" });
+
+    const applied = command.apply(project);
+    const reverted = command.revert(applied);
+
+    assert.equal(clipsOf(reverted, videoTrackId(reverted))[0].transitionIn, undefined);
+    assert.deepEqual(comparable(reverted), comparable(project));
+  });
+
+  it("chains: two edits undo back through each intermediate value, including back to absent", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const stack = new UndoStack();
+
+    let p = stack.execute(project, new SetClipTransitionCommand(clip.id, { duration: 0.5, type: "crossfade" }));
+    p = stack.execute(p, new SetClipTransitionCommand(clip.id, { duration: 1.2, type: "crossfade" }));
+    assert.equal(clipsOf(p, videoTrackId(p))[0].transitionIn?.duration, 1.2);
+
+    p = stack.undo(p);
+    assert.equal(clipsOf(p, videoTrackId(p))[0].transitionIn?.duration, 0.5);
+
+    p = stack.undo(p);
+    assert.equal(clipsOf(p, videoTrackId(p))[0].transitionIn, undefined);
+  });
+
+  it("throws on revert if apply was never called — there is no previous value to distinguish from absent", () => {
+    const command = new SetClipTransitionCommand("clip1", { duration: 0.5, type: "crossfade" });
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    assert.throws(() => command.revert(project), /never applied/);
   });
 });

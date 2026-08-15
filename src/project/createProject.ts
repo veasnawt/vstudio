@@ -1,5 +1,5 @@
-import type { Asset, Clip, Project, Sequence, Track, TrackKind } from "./types.ts";
-import { PROJECT_SCHEMA_VERSION, SHORT_PRESET } from "./types.ts";
+import type { Asset, Clip, Project, Sequence, TextStyle, Track, TrackKind } from "./types.ts";
+import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION, SHORT_PRESET } from "./types.ts";
 
 /** `crypto.randomUUID` is available in both Node 18+ and every browser this runs in, so there's no
  *  need for a uuid dependency. Prefixed so an id is self-describing in a project file and in logs. */
@@ -7,9 +7,11 @@ export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
 }
 
+const TRACK_ID_PREFIX: Record<TrackKind, string> = { video: "v", audio: "a", text: "t" };
+
 export function createTrack(kind: TrackKind, name: string): Track {
   return {
-    id: newId(kind === "video" ? "v" : "a"),
+    id: newId(TRACK_ID_PREFIX[kind]),
     kind,
     name,
     clips: [],
@@ -17,6 +19,26 @@ export function createTrack(kind: TrackKind, name: string): Track {
     visible: true,
     muted: false,
     solo: false,
+  };
+}
+
+/** A text asset has no backing file — it's authored directly rather than imported, so there's no
+ *  import flow to go through (matching how `editorStore.importFiles` works: `assets` gets appended
+ *  to directly, not via the undo stack — creating one isn't itself an undo-able edit; the CONTENT/
+ *  STYLE edits that follow, via `setTextAsset`, are). */
+export function createTextAsset(content = "Text", style: TextStyle = DEFAULT_TEXT_STYLE): Asset {
+  const now = Date.now();
+  return {
+    id: newId("txt"),
+    kind: "text",
+    name: content.slice(0, 40) || "Text",
+    relPath: "",
+    duration: 0,
+    hasAudio: false,
+    sizeBytes: 0,
+    importedAt: now,
+    textContent: content,
+    textStyle: { ...style },
   };
 }
 

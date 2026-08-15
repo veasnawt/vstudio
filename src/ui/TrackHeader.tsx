@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { Delete, Lock, Unlock, Visibility, VisibilityOff } from "@veasnawt/vicons";
 import { RemoveTrackCommand, SetTrackFlagCommand } from "../commands/index.ts";
 import type { Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
@@ -33,7 +34,7 @@ function FlagButton({
       title={label}
       aria-label={label}
       aria-pressed={active}
-      className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
         active ? activeClass : "text-white/35 hover:bg-white/10 hover:text-white/70"
       }`}
     >
@@ -137,9 +138,9 @@ export function TrackHeader({
           }}
           title="Remove track"
           aria-label={`Remove ${track.name}`}
-          className="ml-auto shrink-0 rounded px-1 py-0.5 text-[10px] text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300 lg:text-white/0 lg:group-hover:text-white/35 lg:focus-visible:text-white/35"
+          className="ml-auto flex shrink-0 items-center rounded px-1 py-0.5 text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300 lg:text-white/0 lg:group-hover:text-white/35 lg:focus-visible:text-white/35"
         >
-          🗑
+          <Delete size={14} />
         </button>
       </div>
 
@@ -150,17 +151,19 @@ export function TrackHeader({
           label={track.locked ? "Unlock track" : "Lock track"}
           activeClass="bg-amber-500/25 text-amber-300"
         >
-          {track.locked ? "🔒" : "🔓"}
+          {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
         </FlagButton>
 
-        {track.kind === "video" ? (
+        {track.kind !== "audio" ? (
+          // Video and text tracks both have a visible on-canvas result, so both get the same
+          // show/hide toggle; only audio has nothing to show and gets mute/solo instead.
           <FlagButton
             active={!track.visible}
             onClick={() => run(new SetTrackFlagCommand(track.id, "visible", !track.visible))}
             label={track.visible ? "Hide track" : "Show track"}
             activeClass="bg-white/15 text-white/80"
           >
-            {track.visible ? "👁" : "🚫"}
+            {track.visible ? <Visibility size={13} /> : <VisibilityOff size={13} />}
           </FlagButton>
         ) : (
           <>

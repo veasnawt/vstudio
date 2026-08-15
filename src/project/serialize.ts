@@ -1,5 +1,6 @@
-import type { Asset, Clip, ClipTransform, Project, Sequence, Track } from "./types.ts";
-import { PROJECT_SCHEMA_VERSION } from "./types.ts";
+import type { Asset, Clip, ClipEffects, ClipTransform, Project, Sequence, TextStyle, Track } from "./types.ts";
+import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION } from "./types.ts";
+import { FONT_REGISTRY } from "./fonts.ts";
 
 /** Thrown when a project file can't be trusted. Callers surface the message to the user rather than
  *  loading a half-understood project and letting the damage show up later as a corrupted edit. */
@@ -37,9 +38,43 @@ function bool(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+/** Same leniency as `parseClipTransform` below, and for the same reason: a text asset's style is
+ *  additive presentation data, not something that defines what the asset fundamentally IS the way
+ *  `textContent` does. Missing/malformed fields fall back field-by-field to `DEFAULT_TEXT_STYLE`
+ *  rather than losing the asset. */
+function parseTextStyle(raw: unknown): TextStyle {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const align = r.align === "left" || r.align === "right" ? r.align : "center";
+  // Validated against the actual registry, not just "is this a string" — a font id from a NEWER
+  // VStudio build (or a hand-edited file) that this build doesn't bundle a file for falls back to the
+  // default rather than pointing `computeTextBlock`/export at a font that doesn't exist.
+  const fontFamily =
+    typeof r.fontFamily === "string" && FONT_REGISTRY.some((f) => f.id === r.fontFamily)
+      ? r.fontFamily
+      : DEFAULT_TEXT_STYLE.fontFamily;
+  return {
+    fontFamily,
+    fontSize: num(r.fontSize, "text font size", DEFAULT_TEXT_STYLE.fontSize),
+    color: str(r.color, "text color", DEFAULT_TEXT_STYLE.color),
+    bold: bool(r.bold, DEFAULT_TEXT_STYLE.bold),
+    italic: bool(r.italic, DEFAULT_TEXT_STYLE.italic),
+    align,
+    ...(typeof r.backgroundColor === "string" ? { backgroundColor: r.backgroundColor } : null),
+    ...(typeof r.strokeColor === "string" ? { strokeColor: r.strokeColor } : null),
+    strokeWidth: num(r.strokeWidth, "text stroke width", DEFAULT_TEXT_STYLE.strokeWidth),
+    ...(typeof r.shadowColor === "string" ? { shadowColor: r.shadowColor } : null),
+    shadowOffsetX: num(r.shadowOffsetX, "text shadow offset", DEFAULT_TEXT_STYLE.shadowOffsetX),
+    shadowOffsetY: num(r.shadowOffsetY, "text shadow offset", DEFAULT_TEXT_STYLE.shadowOffsetY),
+    lineHeightMultiplier: num(r.lineHeightMultiplier, "text line height", DEFAULT_TEXT_STYLE.lineHeightMultiplier),
+    offsetX: num(r.offsetX, "text offset", DEFAULT_TEXT_STYLE.offsetX),
+    offsetY: num(r.offsetY, "text offset", DEFAULT_TEXT_STYLE.offsetY),
+    rotationDeg: num(r.rotationDeg, "text rotation", DEFAULT_TEXT_STYLE.rotationDeg),
+  };
+}
+
 function parseAsset(raw: Record<string, unknown>): Asset {
   const kind = str(raw.kind, "asset kind");
-  if (kind !== "video" && kind !== "audio" && kind !== "image") {
+  if (kind !== "video" && kind !== "audio" && kind !== "image" && kind !== "text") {
     throw new ProjectFormatError(`Project file has an unknown asset kind: ${kind}`);
   }
   // Optional fields are spread in only when actually present, never written as an explicit
@@ -53,6 +88,8 @@ function parseAsset(raw: Record<string, unknown>): Asset {
     name: str(raw.name, "asset name"),
     relPath: str(raw.relPath, "asset path"),
     ...(typeof raw.thumbnailRelPath === "string" ? { thumbnailRelPath: raw.thumbnailRelPath } : null),
+    ...(typeof raw.filmstripRelPath === "string" ? { filmstripRelPath: raw.filmstripRelPath } : null),
+    ...(typeof raw.waveformRelPath === "string" ? { waveformRelPath: raw.waveformRelPath } : null),
     duration: num(raw.duration, "asset duration", 0),
     ...(typeof raw.width === "number" ? { width: raw.width } : null),
     ...(typeof raw.height === "number" ? { height: raw.height } : null),
@@ -61,6 +98,8 @@ function parseAsset(raw: Record<string, unknown>): Asset {
     sizeBytes: num(raw.sizeBytes, "asset size", 0),
     importedAt: num(raw.importedAt, "asset import time", 0),
     ...(typeof raw.offline === "boolean" ? { offline: raw.offline } : null),
+    ...(typeof raw.hiddenFromLibrary === "boolean" ? { hiddenFromLibrary: raw.hiddenFromLibrary } : null),
+    ...(kind === "text" ? { textContent: str(raw.textContent, "text content", ""), textStyle: parseTextStyle(raw.textStyle) } : null),
   };
 }
 
@@ -87,6 +126,34 @@ function parseClipTransform(raw: unknown): ClipTransform | undefined {
   };
 }
 
+/** Same leniency as `parseClipTransform` above, and for the same reason: `effects` is purely
+ *  additive enhancement data, not something that defines what a clip fundamentally IS. */
+function parseClipEffects(raw: unknown): ClipEffects | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  return {
+    brightness: num(r.brightness, "clip effects brightness", 0),
+    contrast: num(r.contrast, "clip effects contrast", 1),
+    saturation: num(r.saturation, "clip effects saturation", 1),
+    blur: num(r.blur, "clip effects blur", 0),
+    opacity: num(r.opacity, "clip effects opacity", 1),
+  };
+}
+
+/** Same leniency as `parseClipEffects` above, and for the same reason: `transitionIn` is purely
+ *  additive relationship data toward the preceding clip, not something that defines what a clip
+ *  fundamentally IS — see `Clip.transitionIn`'s own doc comment. A non-positive/malformed duration
+ *  drops the field entirely rather than storing a transition that would never render anything
+ *  (`findTransitionPartner` already treats `duration <= 0` as "no transition"). `type` is forced to
+ *  `"crossfade"` regardless of what's stored, since it's the only valid value this pass. */
+function parseClipTransitionIn(raw: unknown): Clip["transitionIn"] {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const duration = num(r.duration, "clip transition duration", 0);
+  if (duration <= 0) return undefined;
+  return { duration, type: "crossfade" };
+}
+
 function parseClip(raw: Record<string, unknown>): Clip {
   const sourceIn = num(raw.sourceIn, "clip in-point");
   const sourceOut = num(raw.sourceOut, "clip out-point");
@@ -94,6 +161,8 @@ function parseClip(raw: Record<string, unknown>): Clip {
     throw new ProjectFormatError("Project file has a clip whose out-point is not after its in-point");
   }
   const transform = parseClipTransform(raw.transform);
+  const effects = parseClipEffects(raw.effects);
+  const transitionIn = parseClipTransitionIn(raw.transitionIn);
   return {
     id: str(raw.id, "clip id"),
     assetId: str(raw.assetId, "clip asset reference"),
@@ -101,20 +170,27 @@ function parseClip(raw: Record<string, unknown>): Clip {
     sourceOut,
     timelineStart: Math.max(0, num(raw.timelineStart, "clip position")),
     ...(transform ? { transform } : null),
+    ...(effects ? { effects } : null),
+    ...(transitionIn ? { transitionIn } : null),
     ...(raw.mutedAudio === true ? { mutedAudio: true } : null),
+    ...(typeof raw.gain === "number" && Number.isFinite(raw.gain) && raw.gain !== 1
+      ? { gain: Math.min(1, Math.max(0, raw.gain)) }
+      : null),
   };
 }
 
+const TRACK_NAME_FALLBACK: Record<string, string> = { video: "V", audio: "A", text: "T" };
+
 function parseTrack(raw: Record<string, unknown>): Track {
   const kind = str(raw.kind, "track kind");
-  if (kind !== "video" && kind !== "audio") {
+  if (kind !== "video" && kind !== "audio" && kind !== "text") {
     throw new ProjectFormatError(`Project file has an unknown track kind: ${kind}`);
   }
   const clips = Array.isArray(raw.clips) ? raw.clips.map((c) => parseClip(c as Record<string, unknown>)) : [];
   return {
     id: str(raw.id, "track id"),
     kind,
-    name: str(raw.name, "track name", kind === "video" ? "V" : "A"),
+    name: str(raw.name, "track name", TRACK_NAME_FALLBACK[kind]),
     // Sorted on load so every consumer can rely on clip order matching timeline order without
     // re-sorting; edit operations maintain this same invariant.
     clips: clips.sort((a, b) => a.timelineStart - b.timelineStart),

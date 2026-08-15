@@ -2,10 +2,19 @@
 
 ## Shape
 
-`@veasna/vstudio` is a source-only React package. `studios/bp` is the host: it consumes the package
-via `transpilePackages`, mounts `<VStudioApp>` at `/projects/[id]/create`, and provides the server
-routes under `/api/vstudio/*`. This follows the repo's existing `packages/universe` →
-`studios/universe` split.
+`@veasna/vstudio` is a source-only React package. `studios/vstudio` is its real host: a standalone
+Next.js app that consumes the package via `transpilePackages`, mounts `<VStudioApp>` at `/edit`, and
+provides every server route under `/api/vstudio/*`. This follows the repo's existing
+`packages/universe` → `studios/universe` split.
+
+`studios/bp` does NOT host the editor itself — it's a consumer, exactly like Universe is a consumer
+of `studios/bp`/`studios/vstudio`/`studios/gamedev`. BP's Create stage
+(`app/projects/[id]/create/page.tsx`) embeds VStudio via `<iframe src="${vstudioUrl}/edit?projectId=...">`,
+resolving `vstudioUrl` from its own tiny `/api/vstudio-url` route (env-var-backed in the packaged
+desktop app, since the Electron `window.veasnaStudios` bridge Universe uses to resolve *its own*
+embedded studios isn't reachable from inside BP's `<webview>`). Same project data either way — BP
+never touches `project.json` or the media folder directly, it only ever talks to VStudio's API
+through the iframe's own same-origin requests.
 
 ```
 packages/vstudio/src/
@@ -19,11 +28,14 @@ packages/vstudio/src/
   playback/    PlaybackEngine (clock, media pool, canvas compositor)
   ui/          React components
 
-studios/bp/app/api/vstudio/
-  _lib/        workspace paths, ffmpeg binaries, local-only guard
-  project/     GET / PUT project.json
-  media/       POST import · DELETE remove · raw/ GET with Range
-  export/      POST start · GET SSE progress · DELETE cancel · HEAD availability
+studios/vstudio/
+  app/edit/          the editor page — reads ?projectId=&projectName= and renders <VStudioApp>
+  app/page.tsx        VStudio's own home page — list/create projects with no host app involved
+  app/api/vstudio/
+    _lib/        workspace paths, ffmpeg binaries, local-only guard
+    project/     GET / PUT project.json
+    media/       POST import · DELETE remove · raw/ GET with Range
+    export/      POST start · GET SSE progress · DELETE cancel · HEAD availability
 ```
 
 Everything under `project/`, `timeline/`, `commands/`, `undo/`, and `export/` is pure and has no
@@ -135,11 +147,98 @@ On-canvas dragging (`TransformHandles`) follows the exact local-preview-then-sin
 without touching the undo stack on every pixel of movement, and exactly one
 `SetClipTransformCommand` is dispatched on release.
 
+### Effects (brightness/contrast/saturation/blur/opacity) attach the same way Transform did
+
+`ClipEffects` is optional on `Clip`, same absent-means-default / delete-rather-than-store-identity
+rules as `ClipTransform` (`setClipEffects`, `isIdentityEffects`) — this was the literal seam this
+file's own "Extension points" section named before Effects existed, so no new pattern was needed,
+just the existing one applied to a second field.
+
+The one genuinely new problem Effects introduces (Transform didn't have it, since geometry has no
+equivalent ambiguity): preview (Canvas2D `context.filter`) and export (FFmpeg's `eq`/`gblur` filters)
+don't share one native convention for every field. `opacity`/`saturation`/`contrast` are exact
+matches (both renderers already agree on a multiplicative 1.0-is-unchanged convention for the latter
+two); `brightness` and `blur` are documented, deliberate approximations — FFmpeg's `eq=brightness=`
+is additive while CSS `brightness()` is multiplicative, and CSS `blur(Xpx)` uses a different kernel
+than FFmpeg's `gblur=sigma=X`. `ClipEffects`'s own doc comment (`project/types.ts`) is the one place
+this is spelled out; `buildCanvasFilterString` (`playback/PlaybackEngine.ts`) is the one place the
+brightness conversion formula lives.
+
+Export's chain reuses `buildTransformFilters` itself rather than a parallel function — the trigger
+for routing a clip through the full crop/scale/rotate/overlay chain (instead of the plain, cheaper
+`scale`+`pad` chain) generalized from "has a real transform" to "has a real transform OR real
+effects", so an effects-only clip (no transform) still gets `IDENTITY_TRANSFORM`'s neutral geometry
+and the full chain, while a genuinely untouched clip keeps today's exact simple path. `eq=` sits
+right after `format=rgba` (order-independent color math); `gblur=` after `scale` (so its sigma
+corresponds to the clip's FINAL on-screen size, not its source resolution); `colorchannelmixer=aa=`
+right before the final `overlay` compositing step (alpha only matters at the blend, not upstream).
+
+### Transitions (crossfade) are the first cross-clip concept
+
+Everything above describes ONE clip; a transition is the first thing that relates TWO adjacent
+clips on the same track. The key simplification is that it doesn't change that: a transition never
+makes clips overlap in storage — `Clip.timelineStart`/`sourceIn`/`sourceOut` stay exactly as
+`addClip`/`moveClip`/`trimClip`/`splitClip`/`carveRange` already enforce. `Clip.transitionIn?:
+{ duration: number; type: "crossfade" }` is purely a render-time instruction: "blend in from
+whatever clip ends exactly where I start."
+
+`timeline/transitions.ts`'s `findTransitionPartner(track, clip)` is the ONE place both
+`PlaybackEngine` and `buildExportPlan` decide whether a transition actually applies — re-checked
+fresh on every call (zero-gap adjacency, duration clamped to both clips' current lengths), not
+maintained through edits. An edit that breaks the precondition (a dragged-open gap, an over-trim)
+just makes the transition silently stop applying — falls back to a plain cut — rather than needing
+cleanup logic threaded through every edit operation. `splitClip`'s tail piece never inherits
+`transitionIn` from the clip it was split from, the same way it never inherits `transform`/
+`effects`/`mutedAudio` — no special-casing needed there either.
+
+**The blend window is asymmetric, and preview/export must agree on WHERE.** The transition's
+`duration` seconds live entirely within the INCOMING clip's own nominal window
+(`[clip.timelineStart, clip.timelineStart + duration)`), never the outgoing clip's. In preview,
+`drawVideoLayer` draws the outgoing clip's own tail frame (via a stripped-down sibling path,
+`drawTransitionPartner`) underneath the incoming clip's normal frame, cross-fading between them —
+plain alpha compositing, driven by a new `alphaMultiplier` parameter on `drawTransformed` that
+layers on TOP of a clip's own `effects.opacity` rather than replacing it. In export, `buildSegments`
+splices a third segment kind (`"transition"`, alongside `"clip"`/`"gap"`) directly into the same
+list that already feeds the one `concat=n=X:v=1:a=1` chain — the outgoing clip's own segment is
+emitted in FULL (unshortened; its tail plays once plainly, then again inside the transition), and
+only the incoming clip's segment is shortened, at its HEAD, by the transition's own duration. This
+keeps total exported duration exactly equal to the sum of every clip's nominal length, with no
+separate accounting needed. The transition segment itself prepares two small `-ss`/`-t` slices (each
+run through the SAME per-clip filter chain a plain segment already uses, so a transitioning clip's
+own transform/effects still apply to its half), then blends them with `xfade=transition=fade` and
+`acrossfade` — `offset=0` on both, since the two slices are already exactly `duration`-long and
+start together.
+
+### Multi-layer video compositing is free in preview, real work in export
+
+Every visible video track composites, in array order — later tracks drawn on top of earlier ones,
+the identical rule `drawTextLayer` already used for stacking text tracks (see its own comment).
+`PlaybackEngine.drawVideoLayer` needed almost no new logic for this: `drawFrame` clears the canvas to
+opaque black exactly ONCE per frame (not per track), and every `drawTransformed` call only ever
+touches its own destination rect via `drawImage` — so a track's own gaps and letterbox bars naturally
+show whatever a lower track already drew (or the original black clear) simply by never being painted
+over, and a clip's own `effects.opacity` blends against that same prior canvas content via
+`context.globalAlpha`. Real cross-track alpha compositing, with zero new blending code — the entire
+change was generalizing "find the one video track" into "iterate every visible one."
+
+Export has no equivalent "just don't touch those pixels" primitive, so it has to build the concept of
+transparency explicitly. Each visible video track gets its own segment-based concat chain (built by
+the exact same per-clip filter logic a single track always used), but a `transparent` flag — true for
+every track except the bottom (base) one — swaps every "nothing here" fill from opaque `black` to
+`black@0`: a non-base track's own gap segments, the plain scale+pad chain's letterbox `pad=`
+(preceded by `format=rgba`), and a transformed clip's own internal micro-background inside
+`buildTransformFilters`. The base track's own path is untouched byte-for-byte — zero regression risk
+for the single-track case, which is still the overwhelming common one. Once every track has its own
+`[cvN]`/`[caN]` pair, the video streams layer together with chained `overlay=format=auto` calls
+(base first, so the result is guaranteed fully opaque — required since the `yuv420p` output has no
+alpha channel at all), and every extra track's own audio folds into the SAME `amix` stage that
+already mixes in voiceover/music overlay clips.
+
 ### Export builds one filter graph
 
-`buildExportPlan` walks the video track and emits a segment per clip plus a **real black + silence
-segment for every gap** — otherwise the exported video would be shorter than the edit and everything
-after a gap would land at the wrong time.
+`buildExportPlan` walks each visible video track and emits a segment per clip plus a **real black (or,
+on a non-base track, transparent) + silence segment for every gap** — otherwise the exported video
+would be shorter than the edit and everything after a gap would land at the wrong time.
 
 Each clip gets its own `-i` with `-ss`/`-t` *before* it, so FFmpeg seeks and decodes only the range
 actually needed — exactly the case non-destructive editing creates. Audio-track clips are positioned
@@ -166,15 +265,22 @@ hand-editable project file) is validated and confined with `resolveWithin`.
 
 The milestone stopped short of these on purpose, but the seams exist:
 
-- **Effects** (brightness/blur/etc.) attach the same way transform did: a stage in
-  `computeTransformedBox`/`drawTransformed` and a matching filter in `buildTransformFilters` — the two
-  places already kept in sync for exactly this reason.
-- **Keyframes** want an animatable-property layer over `ClipTransform` (interpolating between
-  timestamped values instead of one static one); `SetClipTransformCommand`'s trivial-inverse shape
-  would need to become a `TrackScopedCommand`-style memento once a transform can vary within a clip.
+- **More transition styles** (wipe/slide/etc.) — crossfade (see "Transitions" above) is the only
+  `type` implemented. FFmpeg's `xfade` supports many more, but matching one in the canvas preview
+  needs real clip-path masking, not just alpha blending — deliberately left out of this pass.
+- **Blend modes** (multiply/screen/etc.) — cross-track compositing (see "Multi-layer video
+  compositing" above) is plain alpha-over only, driven by each clip's own `effects.opacity`. A blend
+  mode would need a new field (Track- or Clip-scoped) and a matching `context.globalCompositeOperation`
+  value in preview plus an FFmpeg `blend=all_mode=` value in export instead of `overlay`'s default.
+- **Keyframes** want an animatable-property layer over `ClipTransform` AND now `ClipEffects`
+  (interpolating between timestamped values instead of one static one, for either); both
+  `SetClipTransformCommand` and `SetClipEffectsCommand`'s trivial-inverse shape would need to become
+  a `TrackScopedCommand`-style memento once a value can vary within a clip.
 - **On-canvas crop handles** would reuse `TransformHandles`' existing drag-then-single-commit
   machinery, just computing crop fractions instead of scale/rotation from the drag delta.
-- **Captions** get a track kind and a render pass in both renderers.
+- **Captions** get a track kind and a render pass in both renderers (distinct from Text, which is
+  already a real track kind — captions specifically means importing/generating a synced subtitle
+  track, not just rendering text).
 - **Proxies** slot into `mediaUrlFor` (preview) while export keeps resolving originals.
 - **AI features** belong behind the API layer as separate routes; nothing in the core model needs to
   know about them.

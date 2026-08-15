@@ -5,8 +5,16 @@
 A fast, focused video editor for short-form creative work — built for a solo creator making 30–60
 second educational and cinematic videos, not as a replacement for Premiere or Resolve.
 
-VStudio is the **Create** stage of [BP Studio](../../studios/bp): a BP project goes Idea → Script →
-**Create** → Publish, and this is where it becomes an actual video.
+VStudio is both a real **standalone studio** in Veasna OS (its own desktop icon, its own home page
+at [studios/vstudio](../../studios/vstudio), its own port) and the **Create** stage of
+[BP Studio](../../studios/bp): a BP project goes Idea → Script → **Create** → Publish, and BP embeds
+VStudio via `<iframe>` for that last-but-one stage rather than owning the editor itself. Same editor,
+same projects, two doors in.
+
+<p align="center">
+  <img src="assets/screenshots/editor.png" width="49%" alt="The editor — multi-track timeline, transform handles, and a themed Properties panel" />
+  <img src="assets/screenshots/export.png" width="49%" alt="The Export dialog, showing an in/out range and themed dropdowns" />
+</p>
 
 ---
 
@@ -45,20 +53,63 @@ media on the wrong kind of track is refused with an explanation rather than sile
 on a track that can't render it would just never appear. Video tracks are always grouped above audio
 tracks, so "drag one track down" never lands somewhere it isn't allowed.
 
+**Effects.** Every video/image clip can have Brightness, Contrast, Saturation, Blur, and Opacity
+applied, numerically in the Inspector — the same "one pipeline, computed once, agreeing everywhere"
+approach Transform uses, extended with a matching stage in both the canvas preview and the FFmpeg
+export graph.
+
+**Text.** Text clips (add, edit content, style — font, color, stroke, shadow, line-height, position/
+rotation) are a real track kind, rendered in preview and export alike.
+
+**Transitions.** A clip can crossfade in from whatever clip immediately precedes it on the same
+track — toggle it on and set the duration in the Inspector's "Transition In" section. Clips never
+overlap in storage; the blend is purely a render-time synthesis, kept in sync between the canvas
+preview and the FFmpeg export graph (`xfade`/`acrossfade`) the same way Transform and Effects are.
+
+**Multi-layer video compositing.** Every visible video track composites, in track order — later
+tracks drawn on top of earlier ones — in both the canvas preview and the exported file. A clip's own
+Transform (position/scale/rotation/crop), Effects (including Opacity), and Transitions all keep
+working exactly as on a single track; opacity below 1 genuinely blends against whatever's on the
+track(s) beneath it, not against black. Reorder tracks by dragging them in the timeline to change
+the stacking order.
+
+**Waveforms.** Every audio clip shows a real waveform (peaks over the source's full duration, one PNG
+generated at import), cropped and positioned to match that clip's own trim — dragging a trim handle
+crops the waveform live, in step with the drag, rather than only updating once you release.
+
+**Audio gain.** Each clip has its own volume (0–100%), set in the Inspector, applied identically in
+preview playback and in the exported file.
+
+**Live voiceover recording.** Record straight from the microphone — a growing "Recording…" indicator
+appears in the timeline the instant you start (an empty audio track, or one that already has a prior
+take, picked automatically), so there's nothing to wait for and nowhere else to look while you talk.
+The finished take lands as a real clip in that exact spot the moment recording stops, and it's kept
+out of the Media Library (it's meant to live on the timeline, not clutter the library with one-off
+takes).
+
+**Export in/out range.** Export just a portion of the timeline instead of always the whole edit —
+set in/out points with `I`/`O` at the playhead or by dragging markers directly on the timeline ruler,
+with everything outside the range visibly dimmed. The Export dialog shows the resolved range and a
+one-click reset back to the full timeline.
+
+**Fullscreen preview**, and the **playhead automatically follows** playback once it scrolls past the
+right edge of the visible timeline.
+
 ## What is deliberately NOT here yet
 
 Stated plainly, because a polished UI hiding missing features is worse than an honest gap:
 
-- **Text and captions** — no text layers, no SRT/VTT import. The caption track is designed for in the
-  model but not implemented, so nothing is rendered for it.
-- **Effects, transitions, keyframes** — no brightness/blur/dissolve/etc. Position/scale/rotation/crop
-  IS implemented (see above), but it's a single static value per clip — nothing animates over the
-  clip's duration yet.
+- **Captions** — no SRT/VTT import, no auto-transcription. Text clips themselves (see above) ARE
+  implemented; captions specifically (importing/generating a synced subtitle track) are not.
+- **Keyframes** — nothing animates over a clip's duration yet. Position/scale/rotation/crop and
+  Brightness/Contrast/Saturation/Blur/Opacity ARE implemented (see above), but each is a single
+  static value per clip.
+- **More transition styles** — crossfade only. Wipes/slides/etc. would additionally need real
+  clip-path masking in the canvas preview to match FFmpeg's other `xfade` styles.
 - **On-canvas crop handles** — crop is numeric-only in the Inspector; only Position/Scale/Rotation have
   draggable handles in the preview.
-- **Multi-layer video compositing** — export renders the first visible video track. Additional video
-  tracks can hold clips and play in preview, but they are not composited over each other.
-- **Waveforms** — audio clips render as plain blocks; no waveform is drawn or cached.
+- **Blend modes** — a video track's own clip opacity is the only cross-track compositing control;
+  there's no multiply/screen/etc. blend mode selector.
 - **Proxy media** — 4K/8K sources are edited directly. There is no proxy generation step.
 - **AI features** — no speech-to-text, scene detection, or smart reframing.
 - **Native file picking** — imported files are *copied* into the project folder (see below).
@@ -86,9 +137,21 @@ other clip. They render in the preview and export correctly (FFmpeg `-loop 1`).
 
 ## Running it
 
+Standalone (its own home page — create/open a project directly, no BP involved):
+
 ```bash
 pnpm install
+pnpm dev:vstudio                 # VStudio on :3002
+```
+
+Then open `http://localhost:3002`.
+
+Or from inside BP Studio, which embeds VStudio via `<iframe>` for its **Create** stage — both need
+to be running:
+
+```bash
 pnpm dev:bp                      # BP Studio on :3001
+pnpm dev:vstudio                 # VStudio on :3002
 ```
 
 Then open a project and choose **Create**, or go straight to

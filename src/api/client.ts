@@ -34,8 +34,13 @@ async function unwrap<T>(response: Response): Promise<T> {
   throw new ApiRequestError(message, response.status, code);
 }
 
-export async function loadProject(projectId: string): Promise<Project> {
-  const response = await fetch(`${BASE}/project?projectId=${encodeURIComponent(projectId)}`, { cache: "no-store" });
+/** `projectName` is only ever CONSULTED server-side when no project exists yet at this id — it seeds
+ *  the real `project.name` on first creation (see the route's own comment for why that matters: a
+ *  host app's title would otherwise never make it past a display-only prop). Ignored entirely for an
+ *  already-existing project, which keeps whatever name it was actually given/renamed to. */
+export async function loadProject(projectId: string, projectName?: string): Promise<Project> {
+  const nameParam = projectName ? `&projectName=${encodeURIComponent(projectName)}` : "";
+  const response = await fetch(`${BASE}/project?projectId=${encodeURIComponent(projectId)}${nameParam}`, { cache: "no-store" });
   const body = await unwrap<{ project: unknown }>(response);
   // Validated on the way in as well as on the way out of the server: a project that can't be read
   // correctly should fail loudly here rather than half-populate the editor.
@@ -63,8 +68,13 @@ export async function importMedia(projectId: string, file: File): Promise<Asset>
 }
 
 export async function deleteMedia(projectId: string, asset: Asset): Promise<void> {
+  // A text asset has no backing file at all (`relPath` is always `""` — see project/types.ts), so
+  // there's nothing on disk to ask the server to remove. Skipping the request entirely rather than
+  // sending an empty relPath avoids a pointless round-trip for the one asset kind that never needs it.
+  if (!asset.relPath) return;
   const params = new URLSearchParams({ projectId, relPath: asset.relPath });
   if (asset.thumbnailRelPath) params.set("thumbnailRelPath", asset.thumbnailRelPath);
+  if (asset.waveformRelPath) params.set("waveformRelPath", asset.waveformRelPath);
   await unwrap<{ ok: boolean }>(await fetch(`${BASE}/media?${params}`, { method: "DELETE" }));
 }
 
@@ -79,6 +89,23 @@ export function thumbnailUrl(projectId: string, asset: Asset): string | null {
   if (asset.kind === "image") return mediaUrl(projectId, asset.relPath);
   if (!asset.thumbnailRelPath) return null;
   return `${mediaUrl(projectId, asset.thumbnailRelPath)}&kind=thumbnail`;
+}
+
+/** The multi-frame sprite `TimelineClip` tiles for a filmstrip — `null` for anything that doesn't have
+ *  one (audio, text, images, or a video imported before this existed), in which case the caller falls
+ *  back to `thumbnailUrl`'s single frame. */
+export function filmstripUrl(projectId: string, asset: Asset): string | null {
+  if (!asset.filmstripRelPath) return null;
+  return `${mediaUrl(projectId, asset.filmstripRelPath)}&kind=thumbnail`;
+}
+
+/** A waveform PNG spanning the asset's FULL duration — `null` for anything that doesn't have one
+ *  (non-audio, or an audio file FFmpeg couldn't read). `TimelineClip` stretches/positions it via CSS
+ *  to match each clip's own trim, the same way `filmstripUrl`'s sprite is tiled rather than the
+ *  frontend doing any per-clip image generation of its own. */
+export function waveformUrl(projectId: string, asset: Asset): string | null {
+  if (!asset.waveformRelPath) return null;
+  return `${mediaUrl(projectId, asset.waveformRelPath)}&kind=thumbnail`;
 }
 
 export function exportUrl(projectId: string, fileName: string): string {

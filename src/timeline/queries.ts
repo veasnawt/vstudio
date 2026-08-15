@@ -39,6 +39,35 @@ export function snapTime(time: number, points: number[], threshold: number): num
   return best;
 }
 
+/** Where a NEW clip of `duration` seconds should start on `track` so it doesn't destroy anything
+ *  already there: `desiredStart` (typically the playhead) if that range is actually free, or right
+ *  after the track's own last clip otherwise.
+ *
+ *  `addClip`'s own placement (operations.ts) carves away — or fully deletes — whatever already
+ *  occupies the range being placed into, which is correct for a deliberate manual placement (dragging
+ *  a clip, or double-clicking a specific asset onto a specific spot). It's a bad default for a "quick
+ *  add" action meant to be pressed repeatedly without the user picking an exact spot each time (the
+ *  toolbar's Text/Record buttons): pressing one twice without moving the playhead would silently carve
+ *  away the first result to make room for the second, identically-positioned one — which looks like
+ *  "replaced", not "added", and leaves the first one's now-orphaned asset behind in the Media library
+ *  with nothing on the timeline to show for it. */
+export function nonOverlappingStart(track: Track, desiredStart: number, duration: number): number {
+  const desiredEnd = desiredStart + duration;
+  const overlaps = track.clips.some((c) => c.timelineStart < desiredEnd && clipEnd(c) > desiredStart);
+  if (!overlaps) return desiredStart;
+  return track.clips.reduce((end, c) => Math.max(end, clipEnd(c)), 0);
+}
+
+/** Same idea as `nonOverlappingStart`, for a clip whose final duration isn't known yet (a live
+ *  recording, still growing) — so there's no meaningful duration to check overlap against. Falls
+ *  back the same way (right after the track's own last clip) whenever `at` itself already falls
+ *  inside an existing clip's span, rather than requiring an end time to compare against. */
+export function nonOverlappingPointStart(track: Track, at: number): number {
+  const inside = track.clips.some((c) => c.timelineStart <= at && clipEnd(c) > at);
+  if (!inside) return at;
+  return track.clips.reduce((end, c) => Math.max(end, clipEnd(c)), 0);
+}
+
 /** Whether anything is on the timeline at all — drives empty states and whether export is offered. */
 export function isEmpty(project: Project): boolean {
   return project.sequence.tracks.every((t) => t.clips.length === 0);

@@ -6,8 +6,9 @@
 
 export { VStudioApp } from "./ui/VStudioApp.tsx";
 
-export type { Asset, AssetKind, Clip, ClipTransform, ExportSettings, Project, Sequence, Track, TrackKind } from "./project/types.ts";
+export type { Asset, AssetKind, Clip, ClipTransform, ExportSettings, Project, Sequence, TextStyle, Track, TrackKind } from "./project/types.ts";
 export {
+  DEFAULT_TEXT_STYLE,
   FPS_PRESETS,
   IDENTITY_TRANSFORM,
   IMAGE_DEFAULT_DURATION,
@@ -15,18 +16,22 @@ export {
   PROJECT_SCHEMA_VERSION,
   RESOLUTION_PRESETS,
   SHORT_PRESET,
+  TEXT_DEFAULT_DURATION,
 } from "./project/types.ts";
 
 export {
   clipDuration,
   clipEnd,
   createProject,
+  createTextAsset,
   findAsset,
   findClip,
   findTrack,
   sequenceDuration,
 } from "./project/createProject.ts";
 export { deserializeProject, ProjectFormatError, serializeProject } from "./project/serialize.ts";
+export { DEFAULT_FONT_ID, FONT_REGISTRY, fontById, fontFileFor, resolveFontVariant } from "./project/fonts.ts";
+export type { FontDefinition, FontVariantFiles } from "./project/fonts.ts";
 
 export {
   addClip,
@@ -38,6 +43,7 @@ export {
   reorderTrack,
   setClipMuted,
   setClipTransform,
+  setTextAsset,
   setTrackFlag,
   splitClip,
   trimClip,
@@ -54,6 +60,7 @@ export {
   ReorderTrackCommand,
   SetClipMutedCommand,
   SetClipTransformCommand,
+  SetTextCommand,
   SetTrackFlagCommand,
   SplitClipCommand,
   TrimClipCommand,

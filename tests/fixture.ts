@@ -1,5 +1,6 @@
 import { createProject } from "../src/project/createProject.ts";
 import type { Asset, Project } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE } from "../src/project/types.ts";
 
 /** A 10-second 1080×1920 30fps video asset — the shape almost every test starts from. */
 export function videoAsset(id = "asset1", duration = 10): Asset {
@@ -82,4 +83,27 @@ export function audioAsset(id = "music", duration = 30): Asset {
     sizeBytes: 4096,
     importedAt: 0,
   };
+}
+
+/** A text asset — no backing file, no intrinsic duration, no audio; its own content+style (living on
+ *  the ASSET, not the clip — see `Asset.textContent`'s own doc comment) are what define it. */
+export function textAsset(id = "text1", content = "Hello"): Asset {
+  return {
+    id,
+    kind: "text",
+    name: content,
+    relPath: "",
+    duration: 0,
+    hasAudio: false,
+    sizeBytes: 0,
+    importedAt: 0,
+    textContent: content,
+    textStyle: { ...DEFAULT_TEXT_STYLE },
+  };
+}
+
+export function textTrackId(project: Project): string {
+  const track = project.sequence.tracks.find((t) => t.kind === "text");
+  if (!track) throw new Error("fixture project has no text track");
+  return track.id;
 }

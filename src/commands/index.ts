@@ -1,6 +1,6 @@
 import { findClip, findTrack } from "../project/createProject.ts";
-import type { Clip, ClipTransform, Project, Track } from "../project/types.ts";
-import { IDENTITY_TRANSFORM } from "../project/types.ts";
+import type { Clip, ClipEffects, ClipTransform, Project, TextStyle, Track, TrackKind } from "../project/types.ts";
+import { IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../project/types.ts";
 import {
   addClip,
   addTrack,
@@ -9,8 +9,12 @@ import {
   moveClip,
   removeTrack,
   reorderTrack,
+  setClipEffects,
+  setClipGain,
   setClipMuted,
   setClipTransform,
+  setClipTransitionIn,
+  setTextAsset,
   setTrackFlag,
   splitClip,
   trimClip,
@@ -19,6 +23,31 @@ import type { Command } from "./types.ts";
 
 export type { Command } from "./types.ts";
 export { EditError } from "../timeline/operations.ts";
+
+/** Groups several commands into ONE undo-stack entry — used wherever one user gesture (drag several
+ *  selected clips together, reposition a multi-selection on the canvas) needs to dispatch several
+ *  underlying per-clip commands but should only take one Ctrl+Z to fully undo. Sub-commands can be
+ *  any mix of command types (a `TrackScopedCommand` like `MoveClipCommand` alongside a trivial-inverse
+ *  one like `SetClipTransformCommand`) — this only relies on the shared `Command` interface, not any
+ *  particular implementation. Reverts in REVERSE order, mirroring how unwinding a sequence of
+ *  operations normally works (undo the last-applied change first). */
+export class BatchCommand implements Command {
+  label: string;
+  private commands: Command[];
+
+  constructor(label: string, commands: Command[]) {
+    this.label = label;
+    this.commands = commands;
+  }
+
+  apply(project: Project): Project {
+    return this.commands.reduce((p, c) => c.apply(p), project);
+  }
+
+  revert(project: Project): Project {
+    return [...this.commands].reverse().reduce((p, c) => c.revert(p), project);
+  }
+}
 
 /** Base for every clip-editing command.
  *
@@ -260,6 +289,64 @@ export class SetClipTransformCommand implements Command {
   }
 }
 
+/** Trivial-inverse command for `ClipEffects`, structurally identical to `SetClipTransformCommand` —
+ *  see that class's own comments for the reasoning (applies unchanged: effects don't carve/split
+ *  neighboring clips, so a full `TrackScopedCommand` memento isn't needed here either). */
+export class SetClipEffectsCommand implements Command {
+  label = "Adjust Effects";
+  private previous: ClipEffects | null = null;
+
+  private clipId: string;
+  private effects: ClipEffects;
+
+  constructor(clipId: string, effects: ClipEffects) {
+    this.clipId = clipId;
+    this.effects = effects;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.effects ?? IDENTITY_EFFECTS;
+    return setClipEffects(project, this.clipId, this.effects);
+  }
+
+  revert(project: Project): Project {
+    if (this.previous === null) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipEffects(project, this.clipId, this.previous);
+  }
+}
+
+/** Trivial exact inverse — but unlike `SetClipTransformCommand`/`SetClipEffectsCommand`, `transitionIn`
+ *  has no identity-value sentinel to lean on (`undefined` IS the meaningful "no transition" state, not
+ *  a placeholder for "not yet applied"), so an explicit `applied` flag distinguishes the two. */
+export class SetClipTransitionCommand implements Command {
+  label = "Set Transition";
+  private applied = false;
+  private previous: Clip["transitionIn"] | null = null;
+
+  private clipId: string;
+  private transitionIn: Clip["transitionIn"] | null;
+
+  constructor(clipId: string, transitionIn: Clip["transitionIn"] | null) {
+    this.clipId = clipId;
+    this.transitionIn = transitionIn;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.transitionIn ?? null;
+    this.applied = true;
+    return setClipTransitionIn(project, this.clipId, this.transitionIn);
+  }
+
+  revert(project: Project): Project {
+    if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipTransitionIn(project, this.clipId, this.previous);
+  }
+}
+
 /** Trivial exact inverse (the previous boolean), same shape as `SetTrackFlagCommand` — a mute toggle
  *  is a value change on one clip, not a track-topology change. */
 export class SetClipMutedCommand implements Command {
@@ -288,16 +375,45 @@ export class SetClipMutedCommand implements Command {
   }
 }
 
+/** Trivial exact inverse, same shape as `SetClipMutedCommand` — a gain change is a value change on
+ *  one clip, not a track-topology change. `previous` defaults to `1` (absent field = unchanged) when
+ *  captured, the same normalize-to-identity move `SetClipEffectsCommand` makes for `IDENTITY_EFFECTS`. */
+export class SetClipGainCommand implements Command {
+  label = "Adjust Clip Volume";
+  private previous: number | null = null;
+
+  private clipId: string;
+  private gain: number;
+
+  constructor(clipId: string, gain: number) {
+    this.clipId = clipId;
+    this.gain = gain;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.gain ?? 1;
+    return setClipGain(project, this.clipId, this.gain);
+  }
+
+  revert(project: Project): Project {
+    if (this.previous === null) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipGain(project, this.clipId, this.previous);
+  }
+}
+
 export class AddTrackCommand implements Command {
   label = "Add Track";
   /** Fixed at construction for the same reason clip ids are (see `AddClipCommand.clipId`): a redo
    *  must restore the track any later command's clips were placed on, not a fresh one. */
   readonly trackId: string;
-  private kind: "video" | "audio";
+  private kind: TrackKind;
 
-  constructor(kind: "video" | "audio") {
+  constructor(kind: TrackKind) {
     this.kind = kind;
-    this.trackId = `${kind === "video" ? "v" : "a"}_${crypto.randomUUID().slice(0, 8)}`;
+    const prefix = kind === "video" ? "v" : kind === "audio" ? "a" : "t";
+    this.trackId = `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
   }
 
   apply(project: Project): Project {
@@ -376,5 +492,35 @@ export class ReorderTrackCommand implements Command {
     draft.sequence.tracks = this.previousOrder.map((id) => byId.get(id)).filter((t) => t !== undefined);
     draft.updatedAt = Date.now();
     return draft;
+  }
+}
+
+/** A text asset's content+style has a trivial exact inverse — the previous values — addressed by
+ *  asset id rather than clip id since that's where this data actually lives (see
+ *  `Asset.textContent`'s own doc comment). Same shape as `SetClipTransformCommand`. */
+export class SetTextCommand implements Command {
+  label = "Edit Text";
+  private previous: { content: string; style: TextStyle } | null = null;
+
+  private assetId: string;
+  private content: string;
+  private style: TextStyle;
+
+  constructor(assetId: string, content: string, style: TextStyle) {
+    this.assetId = assetId;
+    this.content = content;
+    this.style = style;
+  }
+
+  apply(project: Project): Project {
+    const asset = project.assets.find((a) => a.id === this.assetId);
+    if (!asset || asset.kind !== "text") throw new EditError("That text no longer exists");
+    this.previous = { content: asset.textContent ?? "", style: asset.textStyle ?? this.style };
+    return setTextAsset(project, this.assetId, this.content, this.style);
+  }
+
+  revert(project: Project): Project {
+    if (!this.previous) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setTextAsset(project, this.assetId, this.previous.content, this.previous.style);
   }
 }
