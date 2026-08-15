@@ -12,7 +12,7 @@ VStudio via `<iframe>` for that last-but-one stage rather than owning the editor
 same projects, two doors in.
 
 <p align="center">
-  <img src="assets/screenshots/editor.png" width="49%" alt="The editor — multi-track timeline, transform handles, and a themed Properties panel" />
+  <img src="assets/screenshots/editor.png" width="49%" alt="The editor mid-edit — video, audio waveform, and a text title card composited on a multi-track timeline" />
   <img src="assets/screenshots/export.png" width="49%" alt="The Export dialog, showing an in/out range and themed dropdowns" />
 </p>
 
