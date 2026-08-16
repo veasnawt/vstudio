@@ -1,4 +1,4 @@
-import { clipDuration, clipEnd, createClip, findAsset, findClip, findTrack } from "../project/createProject.ts";
+import { clipDuration, clipEnd, createClip, findAsset, findClip, findTrack, newId } from "../project/createProject.ts";
 import type { Asset, Clip, ClipEffects, ClipTransform, Project, TextStyle, Track, TrackKind } from "../project/types.ts";
 import { IMAGE_DEFAULT_DURATION, isIdentityEffects, isIdentityTransform, TEXT_DEFAULT_DURATION } from "../project/types.ts";
 import { frameDuration, snapToFrame } from "./time.ts";
@@ -343,11 +343,34 @@ function insertionIndexForKind(tracks: Track[], kind: TrackKind): number {
   return insertAt;
 }
 
+/** One past the HIGHEST `${prefix}N` currently used by a same-kind track — NOT just "count of
+ *  same-kind tracks + 1", which produces a genuine duplicate once a track has ever been deleted:
+ *  e.g. A1+A2 exist, A1 gets deleted, leaving only A2 — the next new audio track would compute
+ *  count=1 -> "A2" again, colliding with the survivor. Confirmed live: this is exactly what happened
+ *  when a voiceover recording auto-created a new audio track (see
+ *  `editorStore.beginVoiceoverRecording`) after an earlier audio track had been removed.
+ *
+ *  Deliberately the highest-plus-one, not the lowest-unused gap: a gap-filling scheme would reuse
+ *  "A1" here, but the new track is inserted at the END of the audio group (see
+ *  `insertionIndexForKind`) — so the track list would read "A2" above "A1" top-to-bottom, numbers
+ *  running backward. Always incrementing past the highest number ever assigned keeps numbering
+ *  monotonic even across deletions, at the cost of gaps never being reclaimed — a smaller, less
+ *  confusing tradeoff. */
+function nextTrackName(tracks: Track[], kind: TrackKind): string {
+  const prefix = TRACK_NAME_PREFIX[kind];
+  let maxN = 0;
+  for (const t of tracks) {
+    if (t.kind !== kind) continue;
+    const match = /^\D*(\d+)$/.exec(t.name);
+    if (match) maxN = Math.max(maxN, Number(match[1]));
+  }
+  return `${prefix}${maxN + 1}`;
+}
+
 /** Adds a track, keeping same-kind tracks grouped together (see `TRACK_KIND_ORDER`). */
 export function addTrack(project: Project, kind: TrackKind, trackId?: string): Project {
   return edit(project, (draft) => {
-    const count = draft.sequence.tracks.filter((t) => t.kind === kind).length;
-    const name = `${TRACK_NAME_PREFIX[kind]}${count + 1}`;
+    const name = nextTrackName(draft.sequence.tracks, kind);
     draft.sequence.tracks.splice(insertionIndexForKind(draft.sequence.tracks, kind), 0, {
       id: trackId ?? newTrackId(kind),
       kind,
@@ -362,7 +385,7 @@ export function addTrack(project: Project, kind: TrackKind, trackId?: string): P
 }
 
 function newTrackId(kind: TrackKind): string {
-  return `${TRACK_ID_PREFIX[kind]}_${crypto.randomUUID().slice(0, 8)}`;
+  return newId(TRACK_ID_PREFIX[kind]);
 }
 
 /** Moves `trackId` to just before `beforeTrackId` within its own track list. `beforeTrackId: null`

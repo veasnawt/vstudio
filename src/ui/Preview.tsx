@@ -67,6 +67,16 @@ export function Preview() {
   // still shows its own chrome rather than becoming a bare, controls-less video.
   const panelRef = useRef<HTMLElement | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // iPhone Safari has no Fullscreen API for arbitrary elements at all (only a `<video>` element can
+  // go fullscreen there, via a separate WebKit-only API) — `requestFullscreen` is simply undefined on
+  // the panel element. Confirmed live: calling it unconditionally threw "requestFullscreen is not a
+  // function" the instant the button was tapped. iPad Safari DOES support it (since iPadOS 13), so
+  // this is checked per-device rather than blanket-disabled for iOS — computed after mount since
+  // `document`/`Element` don't exist during SSR.
+  const [fullscreenSupported, setFullscreenSupported] = useState(false);
+  useEffect(() => {
+    setFullscreenSupported(typeof document.documentElement.requestFullscreen === "function");
+  }, []);
   // Synced from the browser's own event rather than only toggled by the button click: fullscreen can
   // also be exited via Esc or the browser's native "exit fullscreen" UI, neither of which goes through
   // `toggleFullscreen` below — without this listener the icon/tooltip would silently go stale.
@@ -76,6 +86,7 @@ export function Preview() {
     return () => document.removeEventListener("fullscreenchange", onChange);
   }, []);
   function toggleFullscreen() {
+    if (!fullscreenSupported) return;
     if (document.fullscreenElement) void document.exitFullscreen();
     else void panelRef.current?.requestFullscreen();
   }
@@ -91,7 +102,6 @@ export function Preview() {
   const [displaySize, setDisplaySizeState] = useState<{ width: number; height: number } | null>(null);
 
   const project = useEditorStore((s) => s.project);
-  const projectId = useEditorStore((s) => s.projectId);
   const playing = useEditorStore((s) => s.playing);
   const togglePlay = useEditorStore((s) => s.togglePlay);
   const stepFrames = useEditorStore((s) => s.stepFrames);
@@ -247,10 +257,14 @@ export function Preview() {
           )}
           {/* `Maximize` stands in for BOTH directions (no dedicated "exit fullscreen"/compress icon
               exists yet — see MISSING_ICONS.md) — the tooltip/aria-label is what actually communicates
-              which action a click performs. */}
-          <ControlButton onClick={toggleFullscreen} label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
-            <Maximize size={16} />
-          </ControlButton>
+              which action a click performs. Hidden entirely (not just disabled) when unsupported —
+              iPhone Safari has no Fullscreen API for arbitrary elements at all, so a dead button here
+              would be actively misleading rather than just inert. */}
+          {fullscreenSupported && (
+            <ControlButton onClick={toggleFullscreen} label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+              <Maximize size={16} />
+            </ControlButton>
+          )}
         </div>
       </div>
     </section>

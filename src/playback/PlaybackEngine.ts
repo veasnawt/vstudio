@@ -358,7 +358,6 @@ export class PlaybackEngine {
     time: number,
     activeAudioIds: string[]
   ): void {
-    const overrides = this.host.getLiveOverrides();
     const activeClipIds = new Set<string>();
 
     for (const track of project.sequence.tracks) {

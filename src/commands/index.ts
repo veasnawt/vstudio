@@ -1,4 +1,4 @@
-import { findClip, findTrack } from "../project/createProject.ts";
+import { findClip, findTrack, newId } from "../project/createProject.ts";
 import type { Clip, ClipEffects, ClipTransform, Project, TextStyle, Track, TrackKind } from "../project/types.ts";
 import { IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../project/types.ts";
 import {
@@ -98,10 +98,10 @@ export class AddClipCommand extends TrackScopedCommand {
   label = "Add Clip";
   /** Generated once at construction, not per-apply, so redo recreates the SAME clip id. Any later
    *  command in the stack that referenced this clip would fail to resolve against a fresh id. */
-  readonly clipId = `c_${crypto.randomUUID().slice(0, 8)}`;
+  readonly clipId = newId("c");
   /** Same reasoning for the clip that overwrite can split off (see `carveRange`) — without a fixed
    *  id, redoing this edit would produce a differently-identified clip than the original apply did. */
-  private readonly carveTailId = `c_${crypto.randomUUID().slice(0, 8)}`;
+  private readonly carveTailId = newId("c");
 
   private trackId: string;
   private assetId: string;
@@ -125,7 +125,7 @@ export class AddClipCommand extends TrackScopedCommand {
 
 export class SplitClipCommand extends TrackScopedCommand {
   label = "Split Clip";
-  readonly newClipId = `c_${crypto.randomUUID().slice(0, 8)}`;
+  readonly newClipId = newId("c");
 
   private clipId: string;
   private atTime: number;
@@ -175,7 +175,7 @@ export class TrimClipCommand extends TrackScopedCommand {
 export class MoveClipCommand extends TrackScopedCommand {
   label = "Move Clip";
   /** Fixed at construction so redo reproduces the same clip ids — see `AddClipCommand.clipId`. */
-  private readonly carveTailId = `c_${crypto.randomUUID().slice(0, 8)}`;
+  private readonly carveTailId = newId("c");
 
   private clipId: string;
   private toTrackId: string;
@@ -413,7 +413,7 @@ export class AddTrackCommand implements Command {
   constructor(kind: TrackKind) {
     this.kind = kind;
     const prefix = kind === "video" ? "v" : kind === "audio" ? "a" : "t";
-    this.trackId = `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
+    this.trackId = newId(prefix);
   }
 
   apply(project: Project): Project {

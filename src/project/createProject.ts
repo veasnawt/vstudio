@@ -1,10 +1,30 @@
 import type { Asset, Clip, Project, Sequence, TextStyle, Track, TrackKind } from "./types.ts";
 import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION, SHORT_PRESET } from "./types.ts";
 
-/** `crypto.randomUUID` is available in both Node 18+ and every browser this runs in, so there's no
- *  need for a uuid dependency. Prefixed so an id is self-describing in a project file and in logs. */
+/** `crypto.randomUUID` is gated to secure contexts (HTTPS, or literally `localhost`) — a plain LAN
+ *  IP over HTTP does NOT count, even one this app's own local-only guard explicitly allows for
+ *  phone/tablet testing (see `_lib/localOnly.ts`'s `isPrivateLanIPv4`). Confirmed live: opening
+ *  VStudio on an iPad/iPhone at `http://192.168.x.x` made `crypto.randomUUID` simply undefined,
+ *  throwing "crypto.randomUUID is not a function" the instant anything tried to create an id — which
+ *  is nearly every action (add a clip, add a track, split, import...). `crypto.getRandomValues`,
+ *  unlike `randomUUID`, is NOT restricted to secure contexts, so it's the real fallback here rather
+ *  than a weaker Math.random()-based one. Prefixed so an id is self-describing in a project file and
+ *  in logs. */
 export function newId(prefix: string): string {
-  return `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
+  return `${prefix}_${randomHex8()}`;
+}
+
+function randomHex8(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID().slice(0, 8);
+  }
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = crypto.getRandomValues(new Uint8Array(4));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  // Last resort — no Web Crypto API at all. Weaker randomness, only reached on an environment with
+  // neither of the above, which nothing this app actually ships to has.
+  return Math.random().toString(16).slice(2, 10).padEnd(8, "0");
 }
 
 const TRACK_ID_PREFIX: Record<TrackKind, string> = { video: "v", audio: "a", text: "t" };

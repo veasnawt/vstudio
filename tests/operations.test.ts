@@ -399,6 +399,20 @@ describe("track ordering", () => {
     project = addTrack(project, "video");
     assert.deepEqual(project.sequence.tracks.map((t) => t.kind), ["video", "video", "text", "audio"]);
   });
+
+  it("never reuses an existing name after a gap — regression for the duplicate-track-label bug", () => {
+    // [A1] -> add audio -> [A1, A2] -> remove A1 -> [A2] -> add audio should be "A3", NOT "A2" again
+    // (naming used to be "count of same-kind tracks + 1", which collides the instant one is deleted —
+    // confirmed live: a voiceover recording auto-creating a track hit this exact case).
+    let project = addTrack(emptyProject(), "audio"); // [V1, A1, A2]
+    const a1 = project.sequence.tracks.filter((t) => t.kind === "audio")[0].id;
+    project = removeTrack(project, a1); // [V1, A2]
+    project = addTrack(project, "audio"); // [V1, A2, ???]
+
+    const audioNames = project.sequence.tracks.filter((t) => t.kind === "audio").map((t) => t.name);
+    assert.equal(new Set(audioNames).size, audioNames.length, `duplicate track name(s): ${audioNames.join(", ")}`);
+    assert.deepEqual(audioNames, ["A2", "A3"]);
+  });
 });
 
 describe("removeTrack", () => {
