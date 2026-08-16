@@ -1,6 +1,5 @@
 "use client";
 
-import React from "react";
 import type { AlignmentGuide } from "../playback/alignmentGuides.ts";
 
 /** Renders the smart-guide lines `computeAlignmentGuides` found — shared by `TransformHandles` and

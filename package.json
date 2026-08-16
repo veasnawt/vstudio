@@ -10,6 +10,8 @@
     "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/filesystem": "^7.0.0",
     "@veasnawt/vicons": "workspace:*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

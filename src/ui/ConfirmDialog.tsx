@@ -1,6 +1,5 @@
 "use client";
 
-import React from "react";
 import { createPortal } from "react-dom";
 
 /** A small confirm/cancel modal for actions that need a deliberate second click before they happen —

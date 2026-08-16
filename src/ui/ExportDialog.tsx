@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cancelExport, exportAvailable, exportUrl, startExport, watchExport } from "../api/client.ts";
 import { trimProjectToRange } from "../export/trimForExport.ts";
 import { sequenceDuration } from "../project/createProject.ts";

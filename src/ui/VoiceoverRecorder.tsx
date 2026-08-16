@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Microphone } from "@veasnawt/vicons";
 import { AddClipCommand } from "../commands/index.ts";
 import { useEditorStore } from "../store/editorStore.ts";

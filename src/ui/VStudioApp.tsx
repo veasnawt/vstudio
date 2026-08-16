@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { Delete, Pause, Play, Redo, Save, Split, Text, Transition, Undo } from "@veasnawt/vicons";
+import { Delete, Pause, Play, Redo, Save, Settings, Split, Text, Transition, Undo, Video } from "@veasnawt/vicons";
 import { DeleteClipsCommand, SetClipTransitionCommand, SplitClipCommand } from "../commands/index.ts";
 import { findClip } from "../project/createProject.ts";
 import { flushPendingSave, useEditorStore } from "../store/editorStore.ts";
@@ -15,10 +15,11 @@ import { Preview } from "./Preview.tsx";
 import { Timeline } from "./Timeline.tsx";
 import { VoiceoverRecorder } from "./VoiceoverRecorder.tsx";
 
-/** Bounds for the draggable Preview/Timeline divider (desktop only) — see `beginTimelineResize`. A
- *  fixed pixel floor for Timeline (below this a track row plus its ruler stops being useful) and a
- *  viewport-relative ceiling for Preview (a fixed pixel floor there would break on a short laptop
- *  screen; unlike Timeline, Preview's minimum useful height scales with how much screen exists at all). */
+/** Bounds for the draggable Preview/Timeline divider — see `beginTimelineResize`. A fixed pixel
+ *  floor for Timeline (below this a track row plus its ruler stops being useful) and a
+ *  viewport-relative ceiling for Preview (a fixed pixel floor there would break on a short laptop —
+ *  or phone — screen; unlike Timeline, Preview's minimum useful height scales with how much screen
+ *  exists at all). */
 const MIN_TIMELINE_HEIGHT = 120;
 const MAX_TIMELINE_HEIGHT_RATIO = 0.75;
 
@@ -106,12 +107,14 @@ function ToolbarButton({
   disabled,
   active,
   title,
+  className = "",
   children,
 }: {
   onClick: () => void;
   disabled?: boolean;
   active?: boolean;
   title: string;
+  className?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -125,14 +128,20 @@ function ToolbarButton({
         active
           ? "bg-sky-500/30 text-white hover:bg-sky-500/40"
           : "text-white/70 hover:bg-white/10 hover:text-white disabled:hover:text-white/70"
-      }`}
+      } ${className}`}
     >
       {children}
     </button>
   );
 }
 
-function StatusBar() {
+function StatusBar({
+  mobileSheet,
+  setMobileSheet,
+}: {
+  mobileSheet: "media" | "inspector" | null;
+  setMobileSheet: (next: "media" | "inspector" | null) => void;
+}) {
   const status = useEditorStore((s) => s.status);
   const dirty = useEditorStore((s) => s.dirty);
   const saving = useEditorStore((s) => s.saving);
@@ -168,65 +177,94 @@ function StatusBar() {
   const transitionDisabled = !foundForTransition || (!transitionActive && !transitionCandidate);
 
   return (
-    <footer className="flex shrink-0 items-center gap-0.5 border-t border-white/10 bg-[#0d0f14] px-2 py-1.5 text-[11px]">
-      <ToolbarButton title="Play/Pause (Space)" onClick={togglePlay}>
-        {playing ? <Pause size={20} /> : <Play size={20} />}
-      </ToolbarButton>
-      <ToolbarButton title="Split at playhead (S)" onClick={splitAtPlayhead}>
-        <Split size={20} />
-      </ToolbarButton>
-      <ToolbarButton
-        title="Delete selected (Del)"
-        disabled={selectedClipIds.length === 0}
-        onClick={() => run(new DeleteClipsCommand(selectedClipIds))}
-      >
-        <Delete size={20} />
-      </ToolbarButton>
-      <ToolbarButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={undo}>
-        <Undo size={20} />
-      </ToolbarButton>
-      <ToolbarButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={redo}>
-        <Redo size={20} />
-      </ToolbarButton>
-      <ToolbarButton
-        title="Save (Ctrl+S)"
-        onClick={() => {
-          void save();
-          setStatus("Project saved");
-        }}
-      >
-        <Save size={20} />
-      </ToolbarButton>
+    <footer className="flex shrink-0 items-center gap-1 border-t border-white/10 bg-[#0d0f14] px-2 py-1.5 text-[11px]">
+      {/* Its own scrollable strip — separate from the status/saved text after it, which stays fixed in
+          place rather than scrolling away with the buttons. Below `lg`, Media/Properties have no
+          permanent side column anymore (see VStudioApp's own comment on `mobileSheet`) — this is where
+          they're reached instead, which pushed the button count past what a phone's width can show
+          without scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
+      <div className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+        <ToolbarButton title="Play/Pause (Space)" onClick={togglePlay}>
+          {playing ? <Pause size={20} /> : <Play size={20} />}
+        </ToolbarButton>
+        <ToolbarButton title="Split at playhead (S)" onClick={splitAtPlayhead}>
+          <Split size={20} />
+        </ToolbarButton>
+        <ToolbarButton
+          title="Delete selected (Del)"
+          disabled={selectedClipIds.length === 0}
+          onClick={() => run(new DeleteClipsCommand(selectedClipIds))}
+        >
+          <Delete size={20} />
+        </ToolbarButton>
+        <ToolbarButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={undo}>
+          <Undo size={20} />
+        </ToolbarButton>
+        <ToolbarButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={redo}>
+          <Redo size={20} />
+        </ToolbarButton>
+        <ToolbarButton
+          title="Save (Ctrl+S)"
+          onClick={() => {
+            void save();
+            setStatus("Project saved");
+          }}
+        >
+          <Save size={20} />
+        </ToolbarButton>
 
-      <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
+        <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
 
-      {/* Text and voiceover recording: moved here from the Media panel so both land straight on the
-          timeline (and so in the preview) the instant they're created, rather than sitting as a
-          library-only asset waiting for a separate double-click/drag to place. */}
-      <ToolbarButton title="Add text" onClick={addTextAtPlayhead}>
-        <Text size={20} />
-      </ToolbarButton>
-      <VoiceoverRecorder />
+        {/* Text and voiceover recording: moved here from the Media panel so both land straight on the
+            timeline (and so in the preview) the instant they're created, rather than sitting as a
+            library-only asset waiting for a separate double-click/drag to place. */}
+        <ToolbarButton title="Add text" onClick={addTextAtPlayhead}>
+          <Text size={20} />
+        </ToolbarButton>
+        <VoiceoverRecorder />
 
-      {/* Quick on/off for the selected clip's crossfade — the Inspector's own "Transition In" section
-          (same underlying `SetClipTransitionCommand`) is still where the duration gets fine-tuned; see
-          `toggleTransitionOnSelected`'s own comment. */}
-      <ToolbarButton
-        title={transitionActive ? "Remove transition" : "Add crossfade transition from previous clip"}
-        disabled={transitionDisabled}
-        active={transitionActive}
-        onClick={toggleTransitionOnSelected}
-      >
-        <Transition size={20} />
-      </ToolbarButton>
+        {/* Quick on/off for the selected clip's crossfade — the Inspector's own "Transition In" section
+            (same underlying `SetClipTransitionCommand`) is still where the duration gets fine-tuned; see
+            `toggleTransitionOnSelected`'s own comment. */}
+        <ToolbarButton
+          title={transitionActive ? "Remove transition" : "Add crossfade transition from previous clip"}
+          disabled={transitionDisabled}
+          active={transitionActive}
+          onClick={toggleTransitionOnSelected}
+        >
+          <Transition size={20} />
+        </ToolbarButton>
+
+        {/* Media/Properties, mobile-only — desktop keeps its permanent side columns (see
+            VStudioApp's grid) and never sets `mobileSheet`, so these stay irrelevant there regardless
+            of `lg:hidden`. Toggling: tapping the already-open one returns to Timeline, matching
+            `active`'s highlighted state always reflecting what's actually showing below. */}
+        <span className="mx-1 h-5 w-px shrink-0 bg-white/10 lg:hidden" />
+        <ToolbarButton
+          title="Media"
+          className="lg:hidden"
+          active={mobileSheet === "media"}
+          onClick={() => setMobileSheet(mobileSheet === "media" ? null : "media")}
+        >
+          <Video size={20} />
+        </ToolbarButton>
+        <ToolbarButton
+          title="Properties"
+          className="lg:hidden"
+          active={mobileSheet === "inspector"}
+          onClick={() => setMobileSheet(mobileSheet === "inspector" ? null : "inspector")}
+        >
+          <Settings size={20} />
+        </ToolbarButton>
+      </div>
 
       {status && (
-        <span className={`min-w-0 flex-1 truncate px-1 ${status.tone === "error" ? "text-rose-300" : "text-white/55"}`}>
+        <span className={`max-w-[40vw] shrink-0 truncate px-1 ${status.tone === "error" ? "text-rose-300" : "text-white/55"}`}>
           {status.message}
         </span>
       )}
 
-      <span className="ml-auto shrink-0 pl-2 text-white/40">
+      <span className="shrink-0 pl-2 text-white/40">
         {saving ? "Saving…" : dirty ? "Unsaved changes" : lastSavedAt ? "All changes saved" : ""}
       </span>
     </footer>
@@ -306,45 +344,43 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   const loadError = useEditorStore((s) => s.loadError);
   const project = useEditorStore((s) => s.project);
   const [exportOpen, setExportOpen] = useState(false);
-  // Below the `lg` breakpoint there isn't room for Media and Inspector as permanent side columns
-  // (240px + 260px alone exceeds a phone's whole width) — they share one slot, switched by tab,
-  // since you're either browsing footage or adjusting a selected clip's properties, never both at
-  // once. Irrelevant at `lg`+, where both are always shown side by side as they always have been.
-  const [mobilePanel, setMobilePanel] = useState<"media" | "inspector">("media");
-  // Separate from WHICH panel is selected — collapsing hands that ~192px slot back to Preview and
-  // Timeline (the things you're actually looking at while playing/scrubbing), without losing track of
-  // which tab to reopen. A dedicated toggle rather than "tap the active tab again to collapse it": an
-  // always-selected-looking tab that sometimes secretly also means "closed" is a worse affordance than
-  // a persistent, explicitly-labeled control for the one thing it does.
-  const [mobilePanelCollapsed, setMobilePanelCollapsed] = useState(false);
+  // Below the `lg` breakpoint there's no permanent Media/Inspector column at all (240px + 260px of
+  // fixed side columns doesn't fit next to a preview that still needs to show a legible frame) —
+  // instead, the toolbar's Media/Properties buttons (see StatusBar) swap the Timeline row's own
+  // content for one of these two, full-width, until toggled back. `null` means "show Timeline",
+  // which is also what this always stays at `lg`+ (those toolbar buttons are `lg:hidden`, so nothing
+  // ever sets it there). Confirmed with the user: the earlier tab-bar-plus-shared-row design (Media
+  // and Properties each getting a permanently docked, always-partially-visible slot below Preview)
+  // read as too busy and too easy to mis-tap on a real phone — this replaces it entirely rather than
+  // adding a third mobile layout mode alongside it.
+  const [mobileSheet, setMobileSheet] = useState<"media" | "inspector" | null>(null);
 
-  // Desktop-only: lets the user trade vertical space between Preview (clearer to look at, bigger) and
-  // Timeline (more clips/tracks visible at once) via a draggable divider — the same tradeoff
-  // `mobilePanelCollapsed` above offers on mobile, just continuously adjustable instead of a fixed
-  // toggle, since desktop has the width for both Preview and Timeline to stay visible simultaneously.
-  // `MIN_TIMELINE_HEIGHT`/`MAX_TIMELINE_HEIGHT` keep either side from being dragged down to uselessness.
-  const [timelineHeight, setTimelineHeight] = useState(320);
-  const [isDesktop, setIsDesktop] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia("(min-width: 1024px)");
-    const update = () => setIsDesktop(mq.matches);
-    update();
-    mq.addEventListener("change", update);
-    return () => mq.removeEventListener("change", update);
-  }, []);
+  // Lets the user trade vertical space between Preview (clearer to look at, bigger) and Timeline
+  // (more clips/tracks visible at once) via a draggable divider, on every breakpoint. Seeded
+  // per-breakpoint, NOT one shared default: desktop's roomy 320px starting point squeezed Preview's
+  // row down to a sliver on a short phone the instant it was reused as mobile's default too —
+  // confirmed live, the transport bar's own real content then overflowed its row. `typeof window`
+  // guard: this file is "use client", but the very first render (SSR/hydration) still runs once
+  // without a real `window`.
+  const [timelineHeight, setTimelineHeight] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches ? 320 : 224
+  );
 
   function beginTimelineResize(startEvent: React.MouseEvent | React.TouchEvent) {
     preventDefaultIfMouse(startEvent);
     const start = clientPoint(startEvent);
-    const startHeight = timelineHeight;
+    const startTimelineHeight = timelineHeight;
     const removeListeners = addDragListeners(
       (moveEvent) => {
         const point = clientPoint(moveEvent);
         // Dragging UP (pointer above the start point) grows the timeline — the divider sits ABOVE it,
         // so moving it toward the top of the screen makes the row below it taller, matching the
-        // direction every other "drag this edge to resize" control in a video editor uses.
+        // direction every other "drag this edge to resize" control in a video editor uses. One shared
+        // formula for every breakpoint now: mobile no longer has a second row (Media/Properties'
+        // shared panel) competing for the same budget, so there's nothing left to jointly clamp
+        // against — Preview is just `minmax(0,1fr)`, same as desktop.
         const dy = start.y - point.y;
-        setTimelineHeight(Math.min(window.innerHeight * MAX_TIMELINE_HEIGHT_RATIO, Math.max(MIN_TIMELINE_HEIGHT, startHeight + dy)));
+        setTimelineHeight(Math.min(window.innerHeight * MAX_TIMELINE_HEIGHT_RATIO, Math.max(MIN_TIMELINE_HEIGHT, startTimelineHeight + dy)));
       },
       () => removeListeners()
     );
@@ -520,12 +556,13 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
       </header>
 
       {/* Three panes at `lg`+ (1024px): media on the left, preview + inspector in the middle,
-          timeline across the bottom — the original desktop layout, unchanged. Below `lg`, 240px +
-          260px of fixed side columns simply doesn't fit next to a preview that still needs to show a
-          legible frame, so it stacks instead: Preview stays always visible (the one thing you always
-          need on screen), Media and Inspector share a single slot behind the tab switcher below, and
-          Timeline keeps its own fixed, independently-scrollable share — it already scrolls both axes
-          (see Timeline.tsx), so a shorter allotment there is "less at a glance," not "unreachable". */}
+          timeline across the bottom — the original desktop layout, unchanged. Below `lg`, there's no
+          room for 240px + 260px of fixed side columns next to a preview that still needs to show a
+          legible frame, so Media and Inspector aren't laid out at all there (both `hidden` below
+          `lg`) — reached instead through the toolbar's Media/Properties buttons, which swap what
+          renders in the SAME row Timeline normally occupies (see `mobileSheet`'s own comment above).
+          The grid shape itself is now identical at every breakpoint — 2 rows (Preview, Timeline) —
+          only the column count differs (`lg:grid-cols-*` adds the two side columns). */}
       {/* min-w-0 on the grid AND every item below: without it, a grid track defaults to
           `min-width: auto`, meaning it grows to fit its widest child's INTRINSIC content width
           instead of the space actually available. Timeline's own content is a wide, horizontally-
@@ -536,113 +573,61 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
           are natively focusable) made the browser auto-scroll that hidden width into view, yanking
           the whole page sideways. That was the actual "still not functional" bug. */}
       <div
-        className={`relative grid min-h-0 min-w-0 flex-1 lg:grid-cols-[240px_minmax(0,1fr)_260px] lg:grid-rows-[minmax(0,1fr)_320px] ${
-          // Below `lg`, Timeline gets more room than its desktop 320px counterpart would suggest at
-          // this size — 14rem (up from an earlier 12rem) is what a track row (56px) plus the ruler
-          // and the persistent horizontal scrollbar actually need to show more than a sliver of clips
-          // at once on a phone/tablet. Collapsing the Media/Properties panel goes further still: the
-          // panel slot's row drops to 0 (rather than the tab content just going `hidden` inside a
-          // still-sized row) so that freed space goes to TIMELINE specifically, not Preview — the
-          // whole point of collapsing the panel on a small screen is almost always "let me see more of
-          // the timeline," not a bigger preview frame it's already sized reasonably for. A Tailwind
-          // utility class swap, not an inline style: an inline `style` would out-specificity the
-          // `lg:grid-rows-[...]` override above and break the desktop layout at that breakpoint.
-          mobilePanelCollapsed
-            ? "grid-rows-[minmax(0,1fr)_auto_0_20rem]"
-            : "grid-rows-[minmax(0,1fr)_auto_12rem_14rem]"
-        }`}
-        // The mobile Tailwind classes above stay in full control below `lg` — this inline override
-        // only ever applies once `isDesktop` is confirmed via the `matchMedia` effect, and even then
-        // starts at the exact same 320px the `lg:grid-rows-[...]` class already specifies, so there's
-        // no visible jump the first time it takes over. `undefined` (not a value) below `lg`: an
-        // inline style is never conditional on a media query the way a class is, so leaving it SET
-        // there would silently override the mobile row template with a desktop one.
-        style={isDesktop ? { gridTemplateRows: `minmax(0,1fr) ${timelineHeight}px` } : undefined}
+        className="relative grid min-h-0 min-w-0 flex-1 grid-rows-[minmax(0,1fr)_224px] lg:grid-cols-[240px_minmax(0,1fr)_260px] lg:grid-rows-[minmax(0,1fr)_320px]"
+        // The Tailwind class above is the PRE-HYDRATION fallback only, matched almost exactly by this
+        // inline style (which takes over the instant `timelineHeight` state exists, i.e. immediately
+        // on the client) — one shared 2-row shape now, not a breakpoint-dependent one.
+        style={{ gridTemplateRows: `minmax(0,1fr) ${timelineHeight}px` }}
       >
-        {/* Every child below gets an EXPLICIT row-start at every breakpoint, mobile included — never
-            left to grid auto-placement. Auto-placement assigns visible items to consecutive rows in
-            DOM order, skipping anything `display:none`; with Media and Inspector sharing one DOM
-            slot and only one of them ever visible, collapsing that slot (`hidden` on BOTH) removed
-            an item from the flow and auto-placement compacted everything after it up by one row —
-            Timeline included, sliding it into the panel's own now-zero-height row 3 instead of its
-            intended row 4. That's why the whole timeline appeared to vanish on collapse. */}
         <div className="row-start-1 min-h-0 min-w-0 lg:order-2 lg:col-start-2 lg:row-start-1">
           <Preview />
         </div>
 
-        <div className="row-start-2 flex shrink-0 items-stretch border-b border-t border-white/10 lg:hidden">
-          <button
-            onClick={() => {
-              setMobilePanel("media");
-              setMobilePanelCollapsed(false);
-            }}
-            className={`flex-1 px-3 py-2 text-xs font-medium transition ${
-              mobilePanel === "media" ? "border-b-2 border-sky-400 text-white" : "text-white/45 hover:text-white/70"
-            }`}
-          >
-            Media
-          </button>
-          <button
-            onClick={() => {
-              setMobilePanel("inspector");
-              setMobilePanelCollapsed(false);
-            }}
-            className={`flex-1 px-3 py-2 text-xs font-medium transition ${
-              mobilePanel === "inspector" ? "border-b-2 border-sky-400 text-white" : "text-white/45 hover:text-white/70"
-            }`}
-          >
-            Properties
-          </button>
-          <button
-            onClick={() => setMobilePanelCollapsed((collapsed) => !collapsed)}
-            aria-label={mobilePanelCollapsed ? "Show panel" : "Hide panel"}
-            aria-expanded={!mobilePanelCollapsed}
-            title={mobilePanelCollapsed ? "Show panel" : "Hide panel"}
-            className="shrink-0 border-l border-white/10 px-3 text-white/45 transition hover:bg-white/10 hover:text-white"
-          >
-            {mobilePanelCollapsed ? "︿" : "﹀"}
-          </button>
-        </div>
-
-        <div
-          className={`row-start-3 min-h-0 min-w-0 lg:col-start-1 lg:row-start-1 lg:block ${
-            !mobilePanelCollapsed && mobilePanel === "media" ? "block" : "hidden"
-          }`}
-        >
+        {/* Permanent side columns, `lg`+ only — below `lg` these render nothing at all (not even
+            hidden-but-mounted for state-preservation reasons; there's no state here that needs to
+            survive being unmounted). Reached on mobile via the toolbar's Media/Properties buttons
+            instead, which swap the Timeline row's content below. */}
+        <div className="hidden min-h-0 min-w-0 lg:col-start-1 lg:row-start-1 lg:block">
           <MediaLibrary />
         </div>
-        <div
-          className={`row-start-3 min-h-0 min-w-0 lg:col-start-3 lg:row-start-1 lg:block ${
-            !mobilePanelCollapsed && mobilePanel === "inspector" ? "block" : "hidden"
-          }`}
-        >
+        <div className="hidden min-h-0 min-w-0 lg:col-start-3 lg:row-start-1 lg:block">
           <Inspector />
         </div>
 
-        <div className="row-start-4 min-h-0 min-w-0 lg:col-span-3 lg:row-start-2">
-          <Timeline />
+        {/* The one row Timeline shares with Media/Properties below `lg` — `mobileSheet` stays `null`
+            at `lg`+ (nothing there ever sets it), so this always renders Timeline once the permanent
+            side columns above are visible. */}
+        <div className="row-start-2 min-h-0 min-w-0 lg:col-span-3 lg:row-start-2">
+          {mobileSheet === "media" ? (
+            <MediaLibrary onAssetAdded={() => setMobileSheet(null)} />
+          ) : mobileSheet === "inspector" ? (
+            <Inspector />
+          ) : (
+            <Timeline />
+          )}
         </div>
 
-        {/* Desktop-only draggable divider — see `timelineHeight`'s own comment. Absolutely positioned
-            (not a real grid row/track) so it never needs its own `row-start`/row-count bookkeeping
-            alongside every other item's explicit placement above; `bottom: timelineHeight` lands it
-            exactly on the row boundary since Timeline's own row is fixed to that same height. No line
-            of its own — Timeline's own `border-t` (its section root, Timeline.tsx) already draws the
-            visible boundary line exactly here, so this stays a purely invisible, taller-than-1px grab
-            area (`h-2.5`) layered on top of it for an actually-grabbable hit target, rather than
-            drawing a second, redundant line right next to Timeline's real one. */}
+        {/* Draggable divider, every breakpoint — see `timelineHeight`'s own comment. Absolutely
+            positioned (not a real grid row/track) so it never needs its own `row-start`/row-count
+            bookkeeping alongside every other item's explicit placement above; `bottom` lands it
+            exactly on the row boundary since that row is fixed to this same height. No line of its
+            own — Timeline's own `border-t` (its section root, Timeline.tsx) already draws the visible
+            boundary line exactly here when Timeline itself is what's showing; MediaLibrary/Inspector
+            draw their own top edge instead when one of THEM is — either way this stays a purely
+            invisible, taller-than-1px grab area (`h-2.5`) layered on top for an actually-grabbable hit
+            target, rather than drawing a second, redundant line. */}
         <div
           onMouseDown={beginTimelineResize}
           onTouchStart={beginTimelineResize}
           role="separator"
           aria-orientation="horizontal"
           aria-label="Resize timeline"
-          className="absolute inset-x-0 z-20 hidden h-2.5 -translate-y-1/2 cursor-row-resize touch-none lg:block"
+          className="absolute inset-x-0 z-20 block h-2.5 -translate-y-1/2 cursor-row-resize touch-none"
           style={{ bottom: timelineHeight }}
         />
       </div>
 
-      <StatusBar />
+      <StatusBar mobileSheet={mobileSheet} setMobileSheet={setMobileSheet} />
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
     </div>
   );

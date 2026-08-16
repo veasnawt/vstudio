@@ -13,6 +13,17 @@ import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerE
 
 type SortKey = "name" | "duration" | "imported";
 
+/** Matches `studios/vstudio/app/api/vstudio/_lib/mediaFormats.ts`'s own list exactly — that file is
+ *  the real authority (it's what actually decides whether an uploaded file gets accepted), this is
+ *  just what the OS file picker is told to show. Extensions, not MIME-wildcard patterns
+ *  (`accept="audio/*"` etc.) — a wildcard's OS-level filter is built from the browser's own
+ *  extension-to-MIME-type table, which is inconsistent across OS/browser combos for AUDIO
+ *  specifically (`.m4a`/`.aac` in particular can end up silently excluded from "Custom Files" in the
+ *  picker, even though the server would happily accept them if selected via "All Files"). Literal
+ *  extensions are matched against the filename directly, with no MIME-database guessing involved. */
+const ACCEPTED_EXTENSIONS =
+  ".mp4,.mov,.webm,.mkv,.avi,.m4v,.wav,.mp3,.aac,.flac,.m4a,.ogg,.png,.jpg,.jpeg,.webp,.gif";
+
 /** Pixels (mouse) the pointer must travel before a press becomes a drag — matches `TimelineClip`'s
  *  own threshold, so a shaky press doesn't register as an accidental drag. */
 const DRAG_THRESHOLD = 4;
@@ -66,7 +77,7 @@ function AssetThumbnail({ asset, projectId }: { asset: Asset; projectId: string 
   return <img src={url} alt="" className="h-full w-full object-cover" draggable={false} />;
 }
 
-export function MediaLibrary() {
+export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {}) {
   const projectId = useEditorStore((s) => s.projectId);
   const project = useEditorStore((s) => s.project);
   const importing = useEditorStore((s) => s.importing);
@@ -196,7 +207,7 @@ export function MediaLibrary() {
           ref={inputRef}
           type="file"
           multiple
-          accept="video/*,audio/*,image/*"
+          accept={ACCEPTED_EXTENSIONS}
           className="hidden"
           onChange={(e) => {
             const files = [...(e.target.files ?? [])];
@@ -249,6 +260,20 @@ export function MediaLibrary() {
                   onMouseDown={(e) => beginAssetDrag(e, asset)}
                   onTouchStart={(e) => beginAssetDrag(e, asset)}
                   onDoubleClick={() => addAssetAtPlayhead(asset.id)}
+                  // Only wired when `onAssetAdded` is passed — i.e. only in the mobile bottom-sheet
+                  // usage (see VStudioApp.tsx), where a plain tap is the ONLY practical way to place a
+                  // clip (the sheet replaces the Timeline entirely while open, so there's nothing to
+                  // drag onto, and touch has no double-tap equivalent to `onDoubleClick` above). Left
+                  // unwired for the desktop persistent column, where a bare click choosing to do
+                  // nothing (only double-click/drag add) is the established, unchanged behavior.
+                  onClick={
+                    onAssetAdded
+                      ? () => {
+                          addAssetAtPlayhead(asset.id);
+                          onAssetAdded();
+                        }
+                      : undefined
+                  }
                   onKeyDown={(e) => {
                     if (e.key === "Enter") addAssetAtPlayhead(asset.id);
                   }}

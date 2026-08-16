@@ -1,11 +1,18 @@
+import { Capacitor } from "@capacitor/core";
 import { deserializeProject } from "../project/serialize.ts";
 import type { Asset, Project } from "../project/types.ts";
+import { nativeDeleteMedia, nativeImportMedia, nativeLoadProject, nativeMediaUrl, nativeSaveProject } from "./nativeStorage.ts";
 
 /** Browser-side client for VStudio's server routes.
  *
  *  All paths are relative, so this works unchanged whether the app is served from `next dev` on
- *  :3001 or from the packaged desktop app's own loopback port. */
+ *  :3001 or from the packaged desktop app's own loopback port. On the native (Capacitor) shell —
+ *  where there is no server at all — each function below branches on `Capacitor.isNativePlatform()`
+ *  and delegates to `nativeStorage.ts` instead, which is the ONE thing this session's mobile-app plan
+ *  documents as needing per-function runtime branches rather than two parallel files (Capacitor
+ *  bundles a single JS build that must also run in a plain dev browser). */
 const BASE = "/api/vstudio";
+const isNative = Capacitor.isNativePlatform();
 
 export class ApiRequestError extends Error {
   code?: string;
@@ -39,6 +46,7 @@ async function unwrap<T>(response: Response): Promise<T> {
  *  host app's title would otherwise never make it past a display-only prop). Ignored entirely for an
  *  already-existing project, which keeps whatever name it was actually given/renamed to. */
 export async function loadProject(projectId: string, projectName?: string): Promise<Project> {
+  if (isNative) return nativeLoadProject(projectId, projectName);
   const nameParam = projectName ? `&projectName=${encodeURIComponent(projectName)}` : "";
   const response = await fetch(`${BASE}/project?projectId=${encodeURIComponent(projectId)}${nameParam}`, { cache: "no-store" });
   const body = await unwrap<{ project: unknown }>(response);
@@ -48,6 +56,7 @@ export async function loadProject(projectId: string, projectName?: string): Prom
 }
 
 export async function saveProject(projectId: string, project: Project): Promise<void> {
+  if (isNative) return nativeSaveProject(projectId, project);
   const response = await fetch(`${BASE}/project?projectId=${encodeURIComponent(projectId)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -57,6 +66,7 @@ export async function saveProject(projectId: string, project: Project): Promise<
 }
 
 export async function importMedia(projectId: string, file: File): Promise<Asset> {
+  if (isNative) return nativeImportMedia(projectId, file);
   const form = new FormData();
   form.append("file", file);
   const response = await fetch(`${BASE}/media?projectId=${encodeURIComponent(projectId)}`, {
@@ -72,6 +82,7 @@ export async function deleteMedia(projectId: string, asset: Asset): Promise<void
   // there's nothing on disk to ask the server to remove. Skipping the request entirely rather than
   // sending an empty relPath avoids a pointless round-trip for the one asset kind that never needs it.
   if (!asset.relPath) return;
+  if (isNative) return nativeDeleteMedia(projectId, asset);
   const params = new URLSearchParams({ projectId, relPath: asset.relPath });
   if (asset.thumbnailRelPath) params.set("thumbnailRelPath", asset.thumbnailRelPath);
   if (asset.waveformRelPath) params.set("waveformRelPath", asset.waveformRelPath);
@@ -79,8 +90,10 @@ export async function deleteMedia(projectId: string, asset: Asset): Promise<void
 }
 
 /** URL for the actual media bytes — what a `<video>`/`<audio>` element's `src` points at. The route
- *  behind it supports HTTP Range, which is what makes seeking possible. */
+ *  behind it supports HTTP Range, which is what makes seeking possible (native uses
+ *  `Capacitor.convertFileSrc`, whose local scheme handler supports Range natively too). */
 export function mediaUrl(projectId: string, relPath: string): string {
+  if (isNative) return nativeMediaUrl(projectId, relPath);
   return `${BASE}/media/raw?projectId=${encodeURIComponent(projectId)}&relPath=${encodeURIComponent(relPath)}`;
 }
 
@@ -126,6 +139,10 @@ export interface ExportProgress {
 }
 
 export async function startExport(projectId: string, project: Project, fileName?: string): Promise<ExportStarted> {
+  // `ExportDialog` gates on `exportAvailable()` (false on native, below) before this can be reached —
+  // export needs the native `ffmpeg-kit` plugin (plan Step 5), not yet built. Thrown rather than
+  // silently attempting a `fetch` to a route that doesn't exist in this shell.
+  if (isNative) throw new ApiRequestError("Export isn't available on this device yet.", 501, "export-unavailable");
   const response = await fetch(`${BASE}/export?projectId=${encodeURIComponent(projectId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -135,6 +152,7 @@ export async function startExport(projectId: string, project: Project, fileName?
 }
 
 export async function cancelExport(jobId: string): Promise<void> {
+  if (isNative) return;
   // A cancel racing the job's own completion is normal, not an error worth surfacing.
   await fetch(`${BASE}/export?jobId=${encodeURIComponent(jobId)}`, { method: "DELETE" }).catch(() => {});
 }
@@ -148,6 +166,10 @@ export function watchExport(
   onUpdate: (progress: ExportProgress) => void,
   onError: (message: string) => void
 ): () => void {
+  if (isNative) {
+    onError("Export isn't available on this device yet.");
+    return () => {};
+  }
   const source = new EventSource(`${BASE}/export?jobId=${encodeURIComponent(jobId)}`);
 
   source.onmessage = (event) => {
@@ -172,8 +194,10 @@ export function watchExport(
   return () => source.close();
 }
 
-/** Whether the server can actually export right now (FFmpeg present and runnable). */
+/** Whether the server can actually export right now (FFmpeg present and runnable) — always `false`
+ *  on native until the on-device `ffmpeg-kit` plugin (plan Step 5) exists. */
 export async function exportAvailable(): Promise<boolean> {
+  if (isNative) return false;
   try {
     const response = await fetch(`${BASE}/export`, { method: "HEAD" });
     return response.status === 204;
