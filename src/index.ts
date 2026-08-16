@@ -70,6 +70,7 @@ export { UndoStack } from "./undo/UndoStack.ts";
 
 export { buildExportPlan, ExportError } from "./export/buildExportPlan.ts";
 export type { ExportPlan, ExportPlanOptions } from "./export/buildExportPlan.ts";
+export { buildFilmstripArgs, buildThumbnailArgs, buildWaveformArgs, FILMSTRIP_FRAME_COUNT } from "./export/ffmpegCommands.ts";
 
 export { flushPendingSave, useEditorStore } from "./store/editorStore.ts";
 export { PlaybackEngine } from "./playback/PlaybackEngine.ts";
