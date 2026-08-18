@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { Delete, Pause, Play, Redo, Save, Settings, Split, Text, Transition, Undo, Video } from "@veasnawt/vicons";
+import { createPortal } from "react-dom";
+import { Delete, Save, Settings, Split, Text, Transition, Video } from "@veasnawt/vicons";
 import { DeleteClipsCommand, SetClipTransitionCommand, SplitClipCommand } from "../commands/index.ts";
 import { findClip } from "../project/createProject.ts";
 import { flushPendingSave, useEditorStore } from "../store/editorStore.ts";
@@ -22,6 +23,24 @@ import { VoiceoverRecorder } from "./VoiceoverRecorder.tsx";
  *  exists at all). */
 const MIN_TIMELINE_HEIGHT = 120;
 const MAX_TIMELINE_HEIGHT_RATIO = 0.75;
+
+/** Approx combined height of the fixed header + footer rows that sit outside the Preview/Timeline
+ *  grid — what's left of `window.innerHeight` after this is the real budget the grid has to split.
+ *  Footer grew from ~44px to ~52px when toolbar buttons gained a label under each icon (h-8→h-10). */
+const CHROME_HEIGHT = 93;
+/** Preview's floor: short of this, a letterboxed frame stops reading as an image at all. Used to
+ *  derive how much Timeline is allowed to claim on a short viewport — see `timelineHeight`'s comment
+ *  in `VStudioApp` for why this replaced an earlier, looser ratio-of-viewport attempt. */
+const MIN_PREVIEW_HEIGHT = 120;
+
+/** Shrinks `height` only as far as needed to guarantee Preview keeps `MIN_PREVIEW_HEIGHT`, given how
+ *  much total vertical space actually exists — never grows it. Shared by the initial seed (so a page
+ *  freshly loaded in landscape never renders the broken state to begin with) and the resize listener
+ *  (so rotating mid-session reaches the same safe result). */
+function clampTimelineHeight(height: number, viewportHeight: number): number {
+  const maxForPreview = viewportHeight - CHROME_HEIGHT - MIN_PREVIEW_HEIGHT;
+  return Math.max(MIN_TIMELINE_HEIGHT, Math.min(height, Math.max(MIN_TIMELINE_HEIGHT, maxForPreview)));
+}
 
 /** Input types that accept typed text. Everything else — file, button, checkbox, radio, range — can
  *  hold focus without swallowing a keystroke, so shortcuts must keep working while they're focused.
@@ -98,15 +117,20 @@ function toggleTransitionOnSelected() {
   state.run(new SetClipTransitionCommand(clip.id, DEFAULT_TRANSITION));
 }
 
-/** One toolbar icon — fixed square, disabled state, an optional highlighted "active" state (used by
- *  toggles like Transition, where the button itself IS the on/off indicator), and a `title` that
- *  doubles as the tooltip AND the keyboard-shortcut hint the old plain-text status bar used to show
- *  permanently. */
+/** One toolbar icon, disabled state, an optional highlighted "active" state (used by toggles like
+ *  Transition, where the button itself IS the on/off indicator), and a `title` that doubles as the
+ *  tooltip AND the keyboard-shortcut hint the old plain-text status bar used to show permanently.
+ *  `label` is a SHORT caption rendered under the icon (not a substitute for `title` — the shortcut
+ *  hint only shows up on hover/long-press, the label is what makes each icon identifiable without
+ *  either) — a phone user can't hover to discover what an icon-only button does the way a mouse user
+ *  can, and even for a mouse this row's icons (Split/Delete/Save/Text/Transition/Media/Properties)
+ *  aren't universally self-explanatory the way Play/Pause are. */
 function ToolbarButton({
   onClick,
   disabled,
   active,
   title,
+  label,
   className = "",
   children,
 }: {
@@ -114,6 +138,7 @@ function ToolbarButton({
   disabled?: boolean;
   active?: boolean;
   title: string;
+  label: string;
   className?: string;
   children: React.ReactNode;
 }) {
@@ -124,13 +149,14 @@ function ToolbarButton({
       title={title}
       aria-label={title}
       aria-pressed={active}
-      className={`flex h-8 w-8 shrink-0 items-center justify-center rounded text-base leading-none transition disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent ${
+      className={`flex h-10 min-w-11 shrink-0 flex-col items-center justify-center gap-0.5 rounded px-1 leading-none transition disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent ${
         active
           ? "bg-sky-500/30 text-white hover:bg-sky-500/40"
           : "text-white/70 hover:bg-white/10 hover:text-white disabled:hover:text-white/70"
       } ${className}`}
     >
       {children}
+      <span className="max-w-full truncate text-[9px] font-medium">{label}</span>
     </button>
   );
 }
@@ -142,30 +168,12 @@ function StatusBar({
   mobileSheet: "media" | "inspector" | null;
   setMobileSheet: (next: "media" | "inspector" | null) => void;
 }) {
-  const status = useEditorStore((s) => s.status);
-  const dirty = useEditorStore((s) => s.dirty);
-  const saving = useEditorStore((s) => s.saving);
-  const lastSavedAt = useEditorStore((s) => s.lastSavedAt);
   const setStatus = useEditorStore((s) => s.setStatus);
-  const playing = useEditorStore((s) => s.playing);
-  const togglePlay = useEditorStore((s) => s.togglePlay);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const run = useEditorStore((s) => s.run);
-  const canUndo = useEditorStore((s) => s.canUndo);
-  const canRedo = useEditorStore((s) => s.canRedo);
-  const undo = useEditorStore((s) => s.undo);
-  const redo = useEditorStore((s) => s.redo);
   const save = useEditorStore((s) => s.save);
   const addTextAtPlayhead = useEditorStore((s) => s.addTextAtPlayhead);
   const project = useEditorStore((s) => s.project);
-
-  // Transient messages clear themselves; errors stay until replaced, since an error the user blinked
-  // and missed is worse than one that lingers.
-  useEffect(() => {
-    if (!status || status.tone === "error") return;
-    const timer = setTimeout(() => setStatus(null), 3000);
-    return () => clearTimeout(timer);
-  }, [status, setStatus]);
 
   // Drives the Transition button's active/disabled look — recomputed on every render from the same
   // store state `toggleTransitionOnSelected` itself reads imperatively, so the two can never disagree
@@ -178,39 +186,36 @@ function StatusBar({
 
   return (
     <footer className="flex shrink-0 items-center gap-1 border-t border-white/10 bg-[#0d0f14] px-2 py-1.5 text-[11px]">
-      {/* Its own scrollable strip — separate from the status/saved text after it, which stays fixed in
-          place rather than scrolling away with the buttons. Below `lg`, Media/Properties have no
-          permanent side column anymore (see VStudioApp's own comment on `mobileSheet`) — this is where
-          they're reached instead, which pushed the button count past what a phone's width can show
-          without scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
+      {/* Icons only now — the status message and save-state text that used to share this row moved to
+          a floating toast (`StatusToast`) and the header (`SaveStatus`) respectively. This row was
+          already the tightest space in the whole editor (up to 11 icons, some already pushed into
+          horizontal overflow scroll on a phone — see the comment below), and neither of those two
+          pieces of text is something a user is trying to TAP; keeping them here only ever cost this
+          row space without adding anything reachable. Below `lg`, Media/Properties have no permanent
+          side column anymore (see VStudioApp's own comment on `mobileSheet`) — this is where they're
+          reached instead, which pushed the button count past what a phone's width can show without
+          scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
       <div className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
-        <ToolbarButton title="Play/Pause (Space)" onClick={togglePlay}>
-          {playing ? <Pause size={20} /> : <Play size={20} />}
-        </ToolbarButton>
-        <ToolbarButton title="Split at playhead (S)" onClick={splitAtPlayhead}>
-          <Split size={20} />
+        <ToolbarButton title="Split at playhead (S)" label="Split" onClick={splitAtPlayhead}>
+          <Split size={18} />
         </ToolbarButton>
         <ToolbarButton
           title="Delete selected (Del)"
+          label="Delete"
           disabled={selectedClipIds.length === 0}
           onClick={() => run(new DeleteClipsCommand(selectedClipIds))}
         >
-          <Delete size={20} />
-        </ToolbarButton>
-        <ToolbarButton title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={undo}>
-          <Undo size={20} />
-        </ToolbarButton>
-        <ToolbarButton title="Redo (Ctrl+Shift+Z)" disabled={!canRedo} onClick={redo}>
-          <Redo size={20} />
+          <Delete size={18} />
         </ToolbarButton>
         <ToolbarButton
           title="Save (Ctrl+S)"
+          label="Save"
           onClick={() => {
             void save();
             setStatus("Project saved");
           }}
         >
-          <Save size={20} />
+          <Save size={18} />
         </ToolbarButton>
 
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
@@ -218,8 +223,8 @@ function StatusBar({
         {/* Text and voiceover recording: moved here from the Media panel so both land straight on the
             timeline (and so in the preview) the instant they're created, rather than sitting as a
             library-only asset waiting for a separate double-click/drag to place. */}
-        <ToolbarButton title="Add text" onClick={addTextAtPlayhead}>
-          <Text size={20} />
+        <ToolbarButton title="Add text" label="Text" onClick={addTextAtPlayhead}>
+          <Text size={18} />
         </ToolbarButton>
         <VoiceoverRecorder />
 
@@ -228,11 +233,12 @@ function StatusBar({
             `toggleTransitionOnSelected`'s own comment. */}
         <ToolbarButton
           title={transitionActive ? "Remove transition" : "Add crossfade transition from previous clip"}
+          label="Transition"
           disabled={transitionDisabled}
           active={transitionActive}
           onClick={toggleTransitionOnSelected}
         >
-          <Transition size={20} />
+          <Transition size={18} />
         </ToolbarButton>
 
         {/* Media/Properties, mobile-only — desktop keeps its permanent side columns (see
@@ -242,32 +248,83 @@ function StatusBar({
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10 lg:hidden" />
         <ToolbarButton
           title="Media"
+          label="Media"
           className="lg:hidden"
           active={mobileSheet === "media"}
           onClick={() => setMobileSheet(mobileSheet === "media" ? null : "media")}
         >
-          <Video size={20} />
+          <Video size={18} />
         </ToolbarButton>
         <ToolbarButton
           title="Properties"
+          label="Properties"
           className="lg:hidden"
           active={mobileSheet === "inspector"}
           onClick={() => setMobileSheet(mobileSheet === "inspector" ? null : "inspector")}
         >
-          <Settings size={20} />
+          <Settings size={18} />
         </ToolbarButton>
       </div>
-
-      {status && (
-        <span className={`max-w-[40vw] shrink-0 truncate px-1 ${status.tone === "error" ? "text-rose-300" : "text-white/55"}`}>
-          {status.message}
-        </span>
-      )}
-
-      <span className="shrink-0 pl-2 text-white/40">
-        {saving ? "Saving…" : dirty ? "Unsaved changes" : lastSavedAt ? "All changes saved" : ""}
-      </span>
     </footer>
+  );
+}
+
+/** Persistent save-state indicator — "Saving…" / "Unsaved changes" / "All changes saved" — moved into
+ *  the header (see VStudioApp's own JSX) out of the toolbar footer, which had no room to spare for
+ *  text that isn't a button. The header has exactly three other things in it (the "VStudio" wordmark,
+ *  the project title, the Export button), so this is genuinely uncrowded space by comparison. */
+function SaveStatus() {
+  const dirty = useEditorStore((s) => s.dirty);
+  const saving = useEditorStore((s) => s.saving);
+  const lastSavedAt = useEditorStore((s) => s.lastSavedAt);
+
+  const text = saving ? "Saving…" : dirty ? "Unsaved changes" : lastSavedAt ? "All changes saved" : "";
+  if (!text) return null;
+
+  return <span className="shrink-0 truncate text-[11px] text-white/40">{text}</span>;
+}
+
+/** Transient status/error messages — used to share the toolbar footer with the icon buttons, where
+ *  they were squeezed to `max-w-[40vw]` and truncated on top of an already-tight row. A floating toast
+ *  instead: full width to breathe, doesn't cost the toolbar a single pixel of its own layout, and (via
+ *  `createPortal`) is immune to the same "an ancestor with `transform` becomes a `position: fixed`
+ *  descendant's containing block" gotcha `ConfirmDialog` already documents its own portal for — nothing
+ *  here currently applies a transform, but nothing guarantees a future ancestor won't either. */
+function StatusToast() {
+  const status = useEditorStore((s) => s.status);
+  const setStatus = useEditorStore((s) => s.setStatus);
+
+  // Transient messages clear themselves; errors stay until replaced, since an error the user blinked
+  // and missed is worse than one that lingers.
+  useEffect(() => {
+    if (!status || status.tone === "error") return;
+    const timer = setTimeout(() => setStatus(null), 3000);
+    return () => clearTimeout(timer);
+  }, [status, setStatus]);
+
+  if (!status) return null;
+
+  return createPortal(
+    <div
+      aria-live="polite"
+      role={status.tone === "error" ? "alert" : "status"}
+      // `bottom-16` clears the footer toolbar (icon+label buttons are 40px tall plus padding, ~52px
+      // total, now that labels were added below each icon) so the toast sits just above it rather than
+      // covering the very buttons a user might want to react with. `pointer-events-none` on the
+      // wrapper + `-auto` on the pill itself: the empty space around the centered pill must stay
+      // click-through (it spans the full width so the pill can center in it), but the pill itself
+      // should still be interactive if it's ever given a dismiss control.
+      className="pointer-events-none fixed inset-x-0 bottom-16 z-40 flex justify-center px-4"
+    >
+      <div
+        className={`pointer-events-auto max-w-[90vw] truncate rounded-md px-3 py-1.5 text-xs shadow-lg ${
+          status.tone === "error" ? "bg-rose-500/95 text-white" : "border border-white/10 bg-[#181b22] text-white/80"
+        }`}
+      >
+        {status.message}
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -362,9 +419,36 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   // confirmed live, the transport bar's own real content then overflowed its row. `typeof window`
   // guard: this file is "use client", but the very first render (SSR/hydration) still runs once
   // without a real `window`.
-  const [timelineHeight, setTimelineHeight] = useState(() =>
-    typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches ? 320 : 224
-  );
+  //
+  // The per-breakpoint preferred value alone isn't enough, though: it's keyed on `min-width`, which
+  // tracks portrait-vs-landscape only by accident. A phone rotated to landscape is still under the
+  // 1024px width breakpoint (so gets mobile's 224px preferred height) but only has ~390px of height
+  // to begin with — 224px of that going to Timeline left Preview a sliver too short to show anything
+  // (confirmed live: the canvas rendered a few px tall, effectively invisible). `clampTimelineHeight`
+  // encodes the actual invariant directly — Preview keeps at least `MIN_PREVIEW_HEIGHT` — rather than
+  // an indirect ratio of the viewport, which is what the first version of this fix used and got
+  // wrong: it reused `MAX_TIMELINE_HEIGHT_RATIO` (a generous 75%, meant for how far a user's own
+  // manual drag is allowed to go) for automatic reflow too, so re-rotating portrait's already-small
+  // 224px default against a 390px-tall landscape viewport passed that loose check and never shrank.
+  const [timelineHeight, setTimelineHeight] = useState(() => {
+    if (typeof window === "undefined") return 224;
+    const preferred = window.matchMedia("(min-width: 1024px)").matches ? 320 : 224;
+    return clampTimelineHeight(preferred, window.innerHeight);
+  });
+
+  // Re-clamps on resize/rotation — the initializer above only runs once at mount, so rotating a
+  // phone mid-session (portrait, where 224px comfortably fits, to landscape, where it doesn't) would
+  // otherwise reproduce the exact same squeeze the initializer fixes for a fresh landscape load. Only
+  // ever clamps DOWN (`clampTimelineHeight` never returns more than its input), so it never overrides
+  // a height the user deliberately chose via `beginTimelineResize` unless the viewport genuinely no
+  // longer fits it.
+  useEffect(() => {
+    function onResize() {
+      setTimelineHeight((h) => clampTimelineHeight(h, window.innerHeight));
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   function beginTimelineResize(startEvent: React.MouseEvent | React.TouchEvent) {
     preventDefaultIfMouse(startEvent);
@@ -547,6 +631,7 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
       <header className="flex min-w-0 shrink-0 items-center gap-2 border-b border-white/10 px-3 py-2">
         <span className="shrink-0 text-sm font-semibold tracking-tight">VStudio</span>
         <EditableProjectTitle />
+        <SaveStatus />
         <button
           onClick={() => setExportOpen(true)}
           className="ml-auto shrink-0 rounded-md bg-sky-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-sky-400"
@@ -628,6 +713,7 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
       </div>
 
       <StatusBar mobileSheet={mobileSheet} setMobileSheet={setMobileSheet} />
+      <StatusToast />
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
     </div>
   );

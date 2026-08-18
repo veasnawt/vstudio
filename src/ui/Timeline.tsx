@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AddTrackCommand, ReorderTrackCommand } from "../commands/index.ts";
 import { sequenceDuration } from "../project/createProject.ts";
+import type { Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { formatTimecode } from "../timeline/time.ts";
 import { addDragListeners, clientPoint } from "./pointerEvents.ts";
@@ -10,6 +11,13 @@ import { TimelineClip } from "./TimelineClip.tsx";
 import { TrackHeader } from "./TrackHeader.tsx";
 
 const TRACK_HEIGHT = 56;
+/** Mobile-only row height for a track with nothing on it — a full-height empty row (same height as
+ *  a busy one, showing nothing) reads as broken/wasteful on a small screen where every row of height
+ *  is precious. Tall enough to still comfortably fit the compact single-row header (drag handle, name,
+ *  import, delete — see TrackHeader.tsx's own `compact` branch) at the same 26px touch-target floor
+ *  used everywhere else in that file. Reverts to `TRACK_HEIGHT` the instant a clip actually lands on
+ *  the track (or a voiceover recording is in progress on it — see `isTrackCompact`'s own comment). */
+const EMPTY_TRACK_HEIGHT = 32;
 const HEADER_WIDTH = 116;
 const RULER_HEIGHT = 26;
 /** Empty space kept past the end of the edit, so there's always somewhere to drop a clip and extend
@@ -22,6 +30,19 @@ function tickInterval(pixelsPerSecond: number): number {
   const targetSeconds = 80 / pixelsPerSecond;
   const steps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
   return steps.find((step) => step >= targetSeconds) ?? 900;
+}
+
+/** Isolated so ONLY this readout re-renders as the playhead advances during playback — not the whole
+ *  Timeline (every track, every clip). Moved here from Preview.tsx, alongside the total-duration
+ *  readout it's now paired with — same "isolate the 30-60×/sec subscription" reasoning as before, see
+ *  that file's own git history for the original comment this one's adapted from. */
+function CurrentTime({ fps }: { fps: number }) {
+  const playhead = useEditorStore((s) => s.playhead);
+  return (
+    <span role="timer" aria-live="off" aria-label="Current time" className="text-white/90">
+      {formatTimecode(playhead, fps)}
+    </span>
+  );
 }
 
 export function Timeline() {
@@ -90,12 +111,63 @@ export function Timeline() {
     return () => observer.disconnect();
   }, []);
 
+  // Same `lg` breakpoint every other mobile/desktop layout branch in this app already uses
+  // (VStudioApp.tsx's own `timelineHeight` seed) — reactive here (not a one-time check) since
+  // rotating a tablet or resizing a desktop window across it mid-session needs to actually flip
+  // between "fixed-center playhead, scroll scrubs" (mobile) and "moving playhead, independent scroll"
+  // (desktop) behavior live, not just at first mount.
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mql = window.matchMedia("(min-width: 1024px)");
+    setIsMobile(!mql.matches);
+    const onChange = () => setIsMobile(!mql.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+  /** True for one frame after THIS component writes `scrollLeft` itself (mobile centering below) —
+   *  lets the scroll handler tell "the user actually scrolled" apart from "scrollLeft changed because
+   *  WE just centered it on a playhead update", so the two mobile-only sync directions (scroll→playhead,
+   *  playhead→scrollLeft) don't feed into each other every frame during playback. Cleared via rAF
+   *  (not the scroll handler's own throttle) so it clears even if the browser skips firing a `scroll`
+   *  event because the value didn't visibly change (e.g. already clamped to the same edge). */
+  const programmaticScrollRef = useRef(false);
+  /** Pending rAF id for the scroll container's own handler below — coalesces `setScrollLeft` to at
+   *  most once per animation frame. See that handler's own comment for why this matters. */
+  const scrollRafRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
+    },
+    []
+  );
+
   // A recording still in progress can push past the committed timeline length before it's a real
   // clip `sequenceDuration` would count — folded in here (mirroring `setPlayhead`'s own same fix) so
   // the lane area/ruler don't stay narrower than the indicator actually growing inside them.
   const total = Math.max(project ? sequenceDuration(project) : 0, recording ? recording.start + recording.elapsedSeconds : 0);
   const contentSeconds = Math.max(total + TRAILING_SECONDS, 30);
   const contentWidth = contentSeconds * pixelsPerSecond;
+  // The lanes viewport's own center IS the screen's center on mobile — unlike desktop, there's no
+  // fixed track-headers sidebar stealing width from it (track headers scroll WITH the clips on mobile
+  // instead, as inline chips — see the per-row header render below), so `scrollRef`'s measured
+  // `viewportWidth` already reflects the true full screen width with nothing to correct for. (This
+  // used to subtract `HEADER_WIDTH / 2` to compensate for that sidebar — removed along with the
+  // sidebar itself; keeping the old correction here would now be actively wrong, not just redundant.)
+  // Only ever read from `isMobile`-gated branches below, so it's harmless that desktop never uses it.
+  const centerOffset = viewportWidth / 2;
+  // Mobile-only empty space kept BEFORE time 0 — the mirror image of TRAILING_SECONDS' own reasoning,
+  // for a problem that only exists in fixed-center-playhead mode: native `scrollLeft` can never go
+  // negative, so without this, the marker (drawn at `scrollLeft + centerOffset`) can't actually reach
+  // screen-center for any playhead time under `centerOffset / pixelsPerSecond` seconds — it visually
+  // sits wherever `scrollLeft` clamps to 0 lands instead, over a LATER time than the readout actually
+  // shows. Sized to exactly `centerOffset` — precisely enough room for `scrollLeft = 0` to correspond
+  // to `playhead = 0` sitting dead center (see `timeFromEvent`'s own comment on how this cancels out of
+  // the playhead↔scrollLeft formulas elsewhere in this file). Implemented as a `marginLeft` on an inner
+  // wrapper (see the JSX below) rather than CSS padding on the scrollable div itself — padding doesn't
+  // shift absolutely-positioned descendants (they're positioned from the padding edge, not the content
+  // edge), so it wouldn't actually move the ruler/clips/markers at all.
+  const leadingPad = isMobile ? centerOffset : 0;
+  const scrollableWidth = contentWidth + leadingPad;
 
   // Sorted/clamped the same way the store's own `exportRange()` getter does (see that method's own
   // comment) — kept in sync by hand rather than calling it, since this needs to be a REACTIVE value
@@ -112,15 +184,19 @@ export function Timeline() {
     return map;
   }, [project?.assets]);
 
-  /** Converts a pointer position anywhere in the scrollable lane area to a timeline time. */
+  /** Converts a pointer position anywhere in the scrollable lane area to a timeline time. `-
+   *  leadingPad`: the ruler/clips/everything-but-the-playhead now sit `leadingPad` px further right
+   *  than their own `X * pixelsPerSecond` position would suggest (see that constant's own comment on
+   *  why), so a raw scroll-container-relative offset overshoots by exactly that much — zero on
+   *  desktop, where `leadingPad` is always 0. */
   const timeFromEvent = useCallback(
     (clientX: number): number => {
       const container = scrollRef.current;
       if (!container) return 0;
       const rect = container.getBoundingClientRect();
-      return (clientX - rect.left + container.scrollLeft) / pixelsPerSecond;
+      return (clientX - rect.left + container.scrollLeft - leadingPad) / pixelsPerSecond;
     },
-    [pixelsPerSecond]
+    [pixelsPerSecond, leadingPad]
   );
 
   /** Zooms by `factor`, keeping the time at `clientX` (defaulting to the center of the visible
@@ -128,17 +204,25 @@ export function Timeline() {
    *  stationary on screen. Recording the anchor and correcting `scrollLeft` in a layout effect AFTER
    *  the new `pixelsPerSecond` has rendered — rather than trying to compute the corrected scroll
    *  position up front — is what avoids a visible flash of the wrong scroll position, since
-   *  `contentWidth` (which `scrollLeft` is clamped against) only exists once the new width is committed. */
+   *  `contentWidth` (which `scrollLeft` is clamped against) only exists once the new width is committed.
+   *
+   *  Below `lg`, `clientX` is IGNORED in favor of the SCREEN's center (`centerOffset`, not the lanes
+   *  viewport's own center — see that constant's own comment) regardless of what a caller passes (e.g.
+   *  a real pinch midpoint) — the playhead is pinned there in mobile mode (see the playhead-follow
+   *  effect below), so zooming around anything else would zoom around a point that isn't actually
+   *  "now," fighting the fixed-playhead model instead of matching it. This also means the layout effect
+   *  below ends up computing the exact same `scrollLeft` the mobile centering effect would anyway, so
+   *  the two never fight each other after a zoom. */
   const zoomAround = useCallback(
     (factor: number, clientX?: number) => {
       const container = scrollRef.current;
       if (!container) return zoomBy(factor);
       const rect = container.getBoundingClientRect();
-      const anchorClientX = clientX ?? rect.left + rect.width / 2;
+      const anchorClientX = isMobile ? rect.left + centerOffset : (clientX ?? rect.left + rect.width / 2);
       zoomAnchorRef.current = { time: timeFromEvent(anchorClientX), clientX: anchorClientX };
       zoomBy(factor);
     },
-    [zoomBy, timeFromEvent]
+    [zoomBy, timeFromEvent, isMobile, centerOffset]
   );
 
   useLayoutEffect(() => {
@@ -147,8 +231,11 @@ export function Timeline() {
     zoomAnchorRef.current = null;
     if (!anchor || !container) return;
     const rect = container.getBoundingClientRect();
-    container.scrollLeft = anchor.time * pixelsPerSecond - (anchor.clientX - rect.left);
-  }, [pixelsPerSecond]);
+    // `+ leadingPad`: the inverse of `timeFromEvent`'s own `- leadingPad` — without it this would
+    // land `leadingPad` px short of where `anchor.time` is actually drawn now that the ruler/clips
+    // sit that far right of their raw `X * pixelsPerSecond` position (zero on desktop).
+    container.scrollLeft = anchor.time * pixelsPerSecond - (anchor.clientX - rect.left) + leadingPad;
+  }, [pixelsPerSecond, leadingPad]);
 
   // Ctrl/⌘+wheel zooms, matching the convention in every timeline tool; a plain wheel keeps its
   // normal scroll behavior. Anchored on the cursor, not the left edge of the view, so the point under
@@ -172,6 +259,57 @@ export function Timeline() {
     return () => container.removeEventListener("wheel", onWheel);
   }, [zoomAround]);
 
+  // Two-finger pinch zooms the timeline, anchored at the midpoint between the fingers — the gesture
+  // every mobile video editor uses for this, and the only zoom
+  // affordance on a phone before this: the header's +/− buttons work but are a poor substitute for
+  // the gesture people actually reach for first on a touchscreen. Reuses `zoomAround`'s existing
+  // anchor mechanism (built for desktop's cursor-anchored Ctrl+wheel) unchanged — a pinch just
+  // supplies its midpoint as the anchor `clientX` instead of the cursor's.
+  //
+  // A NATIVE listener with `{ passive: false }`, same reasoning as the wheel listener above — React's
+  // synthetic touch handlers are passive by default, so `preventDefault()` from a JSX `onTouchMove`
+  // would silently do nothing and let the browser's own page-zoom fire alongside this.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container) return;
+    // Distance between the two touches as of the last processed move — each subsequent move zooms by
+    // the RATIO since then (not since gesture start), the same incremental-per-event shape the wheel
+    // handler above already uses, so it composes naturally with `zoomBy`'s own multiplicative update
+    // and the store's existing [4, 400] clamp rather than needing its own absolute-scale bookkeeping.
+    let lastDistance = 0;
+
+    function distanceAndMidpoint(touches: TouchList): { distance: number; midX: number } {
+      const [a, b] = [touches[0], touches[1]];
+      return { distance: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), midX: (a.clientX + b.clientX) / 2 };
+    }
+
+    function onTouchStart(e: TouchEvent) {
+      if (e.touches.length !== 2) return;
+      lastDistance = distanceAndMidpoint(e.touches).distance;
+    }
+    function onTouchMove(e: TouchEvent) {
+      if (e.touches.length !== 2 || lastDistance === 0) return;
+      e.preventDefault();
+      const { distance, midX } = distanceAndMidpoint(e.touches);
+      zoomAround(distance / lastDistance, midX);
+      lastDistance = distance;
+    }
+    function onTouchEnd(e: TouchEvent) {
+      if (e.touches.length < 2) lastDistance = 0;
+    }
+
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: false });
+    container.addEventListener("touchend", onTouchEnd, { passive: true });
+    container.addEventListener("touchcancel", onTouchEnd, { passive: true });
+    return () => {
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("touchend", onTouchEnd);
+      container.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, [zoomAround]);
+
   // Keyboard shortcuts (Ctrl/⌘ +/-/0) live in VStudioApp's global keydown handler, which has no
   // access to this component's scroll container — it dispatches this event instead of calling the
   // store directly, so a keyboard-triggered zoom gets the same cursor-anchoring treatment (anchored
@@ -186,17 +324,33 @@ export function Timeline() {
     return () => window.removeEventListener("vstudio:zoom", onZoomEvent);
   }, [zoomAround, resetZoom]);
 
-  /** Which track row a vertical pointer position falls on. Track rows are a uniform height in a
-   *  single column, so this is arithmetic rather than a hit-test against every row. */
+  /** Whether `track` should render at `EMPTY_TRACK_HEIGHT` instead of `TRACK_HEIGHT` — mobile only,
+   *  and only truly empty: a track with an in-progress voiceover recording has no COMMITTED clip yet
+   *  (`clips.length === 0`) but very much has something visible that needs the full row to show,
+   *  so that specific case is excluded here rather than shrinking the row out from under it mid-take. */
+  const isTrackCompact = useCallback(
+    (track: Track): boolean => isMobile && track.clips.length === 0 && !(recording && recording.trackId === track.id),
+    [isMobile, recording]
+  );
+
+  /** Which track row a vertical pointer position falls on — a running sum of each track's own height
+   *  rather than a single division, since rows are no longer all `TRACK_HEIGHT` tall below `lg` (an
+   *  empty track is shorter — see `isTrackCompact`). */
   const resolveTrackAt = useCallback(
     (clientY: number): string | null => {
       const lanes = lanesRef.current;
       const tracks = project?.sequence.tracks;
       if (!lanes || !tracks) return null;
-      const index = Math.floor((clientY - lanes.getBoundingClientRect().top) / TRACK_HEIGHT);
-      return index >= 0 && index < tracks.length ? tracks[index].id : null;
+      let y = clientY - lanes.getBoundingClientRect().top;
+      if (y < 0) return null;
+      for (const track of tracks) {
+        const h = isTrackCompact(track) ? EMPTY_TRACK_HEIGHT : TRACK_HEIGHT;
+        if (y < h) return track.id;
+        y -= h;
+      }
+      return null;
     },
-    [project?.sequence.tracks]
+    [project?.sequence.tracks, isTrackCompact]
   );
 
   // Registered into the store so MediaLibrary's own touch drag (native HTML5 drag-and-drop never
@@ -221,17 +375,60 @@ export function Timeline() {
   // value is done by hand.
   useEffect(() => {
     function apply(playhead: number) {
-      if (markerRef.current) markerRef.current.style.left = `${playhead * pixelsPerSecond}px`;
+      const container = scrollRef.current;
       if (rulerRef.current) rulerRef.current.setAttribute("aria-valuenow", String(Math.round(playhead)));
 
-      // Auto-follow: once the playhead scrolls past the right edge of the visible timeline (during
-      // playback, or a big jump like "Go to end"), snap the view forward so it reappears at the LEFT
-      // edge — matching Premiere/Resolve rather than a smooth continuous scroll, which would fight the
-      // viewport's own width by constantly re-centering. Skipped entirely while the user is dragging
-      // the ruler themselves (`isScrubbingRef`): their own cursor position IS the reference point
-      // during a manual scrub, so jumping the view out from under it mid-drag would be actively
-      // disorienting rather than helpful.
-      const container = scrollRef.current;
+      if (isMobile) {
+        // Fixed-center playhead: the marker's on-screen position never depends on `playhead` at all —
+        // it's always the SCREEN's own center (`centerOffset`, not the lanes viewport's own center —
+        // see that constant's own comment) — so the ONLY thing that needs to move is the timeline
+        // underneath it. Unconditional — NOT gated behind `isScrubbingRef` the way desktop's own
+        // auto-follow below is. That gate exists there to avoid fighting a JARRING discrete jump
+        // (snap-to-left-edge) mid-drag; mobile's own re-centering is a smooth continuous follow, not a
+        // jump, so skipping it during a ruler-scrub bought nothing — worse, it left the view stuck
+        // un-scrolled once the scrub released (nothing re-triggers `apply()` when `playhead` stops
+        // changing), which is its own "why hasn't this caught up" bug. Always keeping marker and scroll
+        // in lockstep, scrub included, is both simpler and the more literal reading of "the playhead
+        // never moves" — there's no gap where it's frozen mid-interaction waiting to catch up later.
+        //
+        // Drawn from `target` (the scroll position THIS frame is correcting TOWARD), not the
+        // not-yet-updated `container.scrollLeft` — reading the old value here was a confirmed real bug:
+        // during playback, `apply()` runs on every animation frame, and drawing from the stale
+        // pre-correction `scrollLeft` made the marker's own drawn position lag the scroll correction
+        // below by exactly one frame, every frame — a continuous 1-2px micro-jitter rather than a truly
+        // motionless marker. `target` is what `scrollLeft` already equals or is about to become, so
+        // using it for BOTH the marker draw and the scroll correction keeps them perfectly in sync,
+        // with zero lag, every frame — the marker genuinely never moves once centered.
+        if (container) {
+          // `+ leadingPad`: same inverse-of-`timeFromEvent` adjustment as the zoom-correction effect
+          // above — `playhead * pixelsPerSecond` alone is where `playhead` would sit with NO leading
+          // pad; the ruler/clips actually start `leadingPad` px later than that now, so the scroll
+          // target needs to shift by the same amount to land the marker on the right spot.
+          const target = Math.max(
+            0,
+            Math.min(playhead * pixelsPerSecond - centerOffset + leadingPad, container.scrollWidth - container.clientWidth)
+          );
+          if (markerRef.current) markerRef.current.style.left = `${target + centerOffset}px`;
+          if (Math.abs(container.scrollLeft - target) > 0.5) {
+            programmaticScrollRef.current = true;
+            container.scrollLeft = target;
+            requestAnimationFrame(() => {
+              programmaticScrollRef.current = false;
+            });
+          }
+        }
+        return;
+      }
+
+      markerRef.current && (markerRef.current.style.left = `${playhead * pixelsPerSecond}px`);
+
+      // Auto-follow (desktop only): once the playhead scrolls past the right edge of the visible
+      // timeline (during playback, or a big jump like "Go to end"), snap the view forward so it
+      // reappears at the LEFT edge — matching Premiere/Resolve rather than a smooth continuous scroll,
+      // which would fight the viewport's own width by constantly re-centering. Skipped entirely while
+      // the user is dragging the ruler themselves (`isScrubbingRef`): their own cursor position IS the
+      // reference point during a manual scrub, so jumping the view out from under it mid-drag would be
+      // actively disorienting rather than helpful.
       if (container && !isScrubbingRef.current) {
         const playheadPx = playhead * pixelsPerSecond;
         const rightEdge = container.scrollLeft + container.clientWidth;
@@ -244,7 +441,7 @@ export function Timeline() {
     return useEditorStore.subscribe((state, prev) => {
       if (state.playhead !== prev.playhead) apply(state.playhead);
     });
-  }, [pixelsPerSecond]);
+  }, [pixelsPerSecond, isMobile, viewportWidth]);
 
   /** Press-then-drag anywhere on the ruler scrubs continuously — the interaction people reach for
    *  without being taught it, mouse OR touch (see `pointerEvents.ts`). */
@@ -306,8 +503,9 @@ export function Timeline() {
   // 24px so the thumb never shrinks to an ungrabbable sliver on a long edit at low zoom. When there's
   // nothing to scroll (`contentWidth <= viewportWidth`), the thumb simply fills the track and dragging
   // is a no-op (`scrollableTrack` floors at 1 to keep the ratio math from dividing by zero).
-  const maxScrollLeft = Math.max(0, contentWidth - viewportWidth);
-  const thumbWidth = contentWidth > 0 ? Math.max(24, Math.min(viewportWidth, (viewportWidth / contentWidth) * viewportWidth)) : viewportWidth;
+  const maxScrollLeft = Math.max(0, scrollableWidth - viewportWidth);
+  const thumbWidth =
+    scrollableWidth > 0 ? Math.max(24, Math.min(viewportWidth, (viewportWidth / scrollableWidth) * viewportWidth)) : viewportWidth;
   const scrollableTrack = Math.max(1, viewportWidth - thumbWidth);
   const thumbLeft = maxScrollLeft > 0 ? (scrollLeft / maxScrollLeft) * scrollableTrack : 0;
 
@@ -366,6 +564,17 @@ export function Timeline() {
           own — wrapping to a second line is a plain, no-JS way to guarantee nothing gets cut off. */}
       <header className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-white/10 px-3 py-1.5">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-white/60">Timeline</h2>
+        {/* Current position + total duration — both moved here from Preview's transport bar, which now
+            carries only the playback buttons themselves. This panel is what visualizes the whole
+            project's timespan, so both halves of "where am I / how long is this" read naturally here
+            together, rather than split across two different bars. */}
+        <div className="flex items-baseline gap-1 font-mono text-[11px] tabular-nums">
+          <CurrentTime fps={project.sequence.fps} />
+          <span className="text-white/30">/</span>
+          <span aria-label="Total duration" className="text-white/45">
+            {formatTimecode(total, project.sequence.fps)}
+          </span>
+        </div>
         {hasExportRange && (
           // Same amber as the in/out markers themselves — the visual link makes it obvious this
           // button is what removes THOSE, not some unrelated action. Also reachable via Shift+X (see
@@ -400,11 +609,13 @@ export function Timeline() {
             + Text
           </button>
           <span className="mx-1 h-4 w-px bg-white/10" />
+          {/* min-h/min-w 26px — same touch-target floor as TrackHeader's FlagButton (see its own
+              comment: padding-only sizing measured as small as ~17×19px on a real mobile viewport). */}
           <button
             onClick={() => zoomAround(1 / 1.4)}
             aria-label="Zoom out"
             title="Zoom out (Ctrl/⌘ −)"
-            className="rounded px-2 py-1 text-white/60 transition hover:bg-white/10 hover:text-white"
+            className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white"
           >
             −
           </button>
@@ -412,7 +623,7 @@ export function Timeline() {
             onClick={() => resetZoom()}
             aria-label="Reset zoom"
             title="Reset zoom (Ctrl/⌘ 0)"
-            className="min-w-[3.5ch] rounded px-1 py-1 text-center font-mono text-[11px] tabular-nums text-white/45 transition hover:bg-white/10 hover:text-white"
+            className="min-h-[26px] min-w-[3.5ch] rounded px-1 text-center font-mono text-[11px] tabular-nums text-white/45 transition hover:bg-white/10 hover:text-white"
           >
             {Math.round((pixelsPerSecond / 60) * 100)}%
           </button>
@@ -420,7 +631,7 @@ export function Timeline() {
             onClick={() => zoomAround(1.4)}
             aria-label="Zoom in"
             title="Zoom in (Ctrl/⌘ +)"
-            className="rounded px-2 py-1 text-white/60 transition hover:bg-white/10 hover:text-white"
+            className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white"
           >
             +
           </button>
@@ -429,28 +640,34 @@ export function Timeline() {
 
       <div className="flex min-h-0 flex-1">
         {/* Track headers sit outside the horizontal scroll so they stay visible while scrubbing far
-            along a long edit. */}
-        <div className="flex shrink-0 flex-col" style={{ width: HEADER_WIDTH }}>
-          <div style={{ height: RULER_HEIGHT }} className="border-b border-r border-white/10 bg-[#0d0f14]" />
-          {/* `overflow-hidden` here (no scrollbar of its own) — this column's vertical position is
-              driven by the lanes' own scroll via the transform below, so it always tracks exactly,
-              rather than being a second independently-scrollable area that could drift out of sync. */}
-          <div className="flex-1 overflow-hidden">
-            <div ref={headerListRef}>
-              {project.sequence.tracks.map((track) => (
-                <TrackHeader
-                  key={track.id}
-                  track={track}
-                  height={TRACK_HEIGHT}
-                  dropIndicator={trackDropIndicator?.trackId === track.id ? trackDropIndicator.position : null}
-                  onDragOverRow={(trackId, position) => setTrackDropIndicator({ trackId, position })}
-                  onDropRow={dropTrackOnRow}
-                  onDragEndRow={() => setTrackDropIndicator(null)}
-                />
-              ))}
+            along a long edit — desktop only. On mobile they scroll WITH the clips instead, as inline
+            per-row chips inside the lanes themselves (see that render below); there's no separate
+            fixed column there at all. */}
+        {!isMobile && (
+          <div className="flex shrink-0 flex-col" style={{ width: HEADER_WIDTH }}>
+            <div style={{ height: RULER_HEIGHT }} className="border-b border-r border-white/10 bg-[#0d0f14]" />
+            {/* `overflow-hidden` here (no scrollbar of its own) — this column's vertical position is
+                driven by the lanes' own scroll via the transform below, so it always tracks exactly,
+                rather than being a second independently-scrollable area that could drift out of sync. */}
+            <div className="flex-1 overflow-hidden">
+              <div ref={headerListRef}>
+                {project.sequence.tracks.map((track) => (
+                  <TrackHeader
+                    key={track.id}
+                    track={track}
+                    height={isTrackCompact(track) ? EMPTY_TRACK_HEIGHT : TRACK_HEIGHT}
+                    compact={isTrackCompact(track)}
+                    isMobile={isMobile}
+                    dropIndicator={trackDropIndicator?.trackId === track.id ? trackDropIndicator.position : null}
+                    onDragOverRow={(trackId, position) => setTrackDropIndicator({ trackId, position })}
+                    onDropRow={dropTrackOnRow}
+                    onDragEndRow={() => setTrackDropIndicator(null)}
+                  />
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         <div
           ref={scrollRef}
@@ -466,14 +683,59 @@ export function Timeline() {
           // affordance at all (a plain wheel scrolls vertically here, and Shift+wheel — the native
           // escape hatch — isn't something most people know to reach for).
           className="scrollbar-none relative min-w-0 flex-1 overflow-auto"
+          // `touch-action: pan-x pan-y` (inline, not a Tailwind utility class — combining `touch-pan-x`/
+          // `touch-pan-y` utilities is a real cascade risk: each sets the WHOLE property, so depending
+          // on generated source order one could silently overwrite the other instead of merging).
+          // Explicitly permits native single-finger panning on BOTH axes (unchanged from the default)
+          // while removing `pinch-zoom` from what the default `auto` would otherwise also allow — a
+          // real, confirmed cause of "pinch to zoom doesn't work" on an actual touchscreen: `auto`
+          // leaves the browser's OWN native two-finger zoom gesture live on this element, which can
+          // claim a two-finger touch before the pinch-zoom listener's `touchmove` handler ever gets a
+          // chance to `preventDefault()` it (a race a CDP-simulated pinch never hits, since synthetic
+          // touch events skip the OS/browser gesture recognizer entirely — confirmed by testing this
+          // exact gap: the simulated pinch already worked before this change). `touch-action` is the
+          // standards-track fix for exactly this race, more reliable than `preventDefault()` alone.
+          style={{ touchAction: "pan-x pan-y" }}
           onScroll={() => {
             if (headerListRef.current) {
               headerListRef.current.style.transform = `translateY(${-(scrollRef.current?.scrollTop ?? 0)}px)`;
             }
-            setScrollLeft(scrollRef.current?.scrollLeft ?? 0);
+            // rAF-throttled: a touch-driven fling can fire many `scroll` events per animation frame,
+            // and `setScrollLeft` is React state — every call re-renders this WHOLE component (every
+            // track, every `TimelineClip`), so calling it unthrottled meant a scroll on a slower
+            // device (a real Android WebView, confirmed slower than desktop Chrome here) did several
+            // times the re-render work an on-screen frame could actually use, reading as stuttery/
+            // unresponsive scrolling rather than a genuine input problem. Coalescing to once per frame
+            // costs nothing visually (nothing can paint faster than a frame anyway) and cuts that
+            // re-render volume to the minimum the display can even show.
+            if (scrollRafRef.current === null) {
+              scrollRafRef.current = requestAnimationFrame(() => {
+                scrollRafRef.current = null;
+                const sl = scrollRef.current?.scrollLeft ?? 0;
+                setScrollLeft(sl);
+                // Fixed-center playhead (mobile only): scrolling/panning/flinging IS scrubbing —
+                // derive playhead from wherever the view landed, unless THIS scroll was caused by the
+                // playhead-follow effect centering the view on its own (see `programmaticScrollRef`'s
+                // own comment) — reacting to that would feed the two mobile sync directions into each
+                // other every frame during playback for no purpose, since the value wouldn't change.
+                if (isMobile && !programmaticScrollRef.current) {
+                  // Same `- leadingPad` adjustment as `timeFromEvent` — the marker sits at
+                  // `sl + centerOffset` in scroll-container coordinates, which converts to a TIME the
+                  // same way any other position in this container does.
+                  setPlayhead((sl + centerOffset - leadingPad) / pixelsPerSecond);
+                }
+              });
+            }
           }}
         >
-          <div style={{ width: contentWidth }} className="relative">
+          <div style={{ width: scrollableWidth }} className="relative">
+            {/* Shifts the ruler/clips/export-range markers right by `leadingPad` — everything in this
+                app's timeline coordinate system EXCEPT the playhead marker itself (which stays a
+                direct child of the outer div above, positioned in scroll-container coordinates, not
+                shifted by this). A `marginLeft`, not padding, on a `position: relative` element — see
+                `leadingPad`'s own comment on why padding wouldn't actually move its absolutely
+                positioned children. */}
+            <div style={{ marginLeft: leadingPad }} className="relative">
             <div
               ref={rulerRef}
               role="slider"
@@ -506,7 +768,7 @@ export function Timeline() {
               {project.sequence.tracks.map((track) => (
                 <div
                   key={track.id}
-                  style={{ height: TRACK_HEIGHT }}
+                  style={{ height: isTrackCompact(track) ? EMPTY_TRACK_HEIGHT : TRACK_HEIGHT }}
                   className={`relative border-b border-white/10 ${
                     // Two independent reasons a track can be a drop target: a clip already on the
                     // timeline being dragged onto a DIFFERENT track (`dropTrackId`, reported by
@@ -521,6 +783,32 @@ export function Timeline() {
                         : "bg-white/[0.015] hover:bg-white/[0.03]"
                   }`}
                 >
+                  {/* Inline header chip — mobile only (see the fixed-sidebar block above's own
+                      comment for the desktop equivalent). Positioned in the reserved
+                      leading gutter (`leadingPad`, sized for the fixed-center-playhead work — always
+                      comfortably wider than `HEADER_WIDTH` on any real phone), immediately left of
+                      where this row's clips start, so it scrolls away and reappears with its own row
+                      exactly like a clip would — it's a normal descendant of the same scrolling
+                      content, not a separately-synced overlay. `TrackHeader` itself is reused
+                      completely unchanged; only its position in the DOM differs from the desktop
+                      sidebar's normal-flow usage above. */}
+                  {isMobile && (
+                    <div
+                      style={{ position: "absolute", left: -HEADER_WIDTH - 4, top: 0, bottom: 0, width: HEADER_WIDTH }}
+                      className="z-10"
+                    >
+                      <TrackHeader
+                        track={track}
+                        height={isTrackCompact(track) ? EMPTY_TRACK_HEIGHT : TRACK_HEIGHT}
+                        compact={isTrackCompact(track)}
+                        isMobile={isMobile}
+                        dropIndicator={trackDropIndicator?.trackId === track.id ? trackDropIndicator.position : null}
+                        onDragOverRow={(trackId, position) => setTrackDropIndicator({ trackId, position })}
+                        onDropRow={dropTrackOnRow}
+                        onDragEndRow={() => setTrackDropIndicator(null)}
+                      />
+                    </div>
+                  )}
                   {track.clips.map((clip) => (
                     <TimelineClip
                       key={clip.id}
@@ -619,12 +907,20 @@ export function Timeline() {
                 />
               </div>
             )}
+            </div>
 
             {/* Drawn last and made non-interactive so it's always visible above the clips without
-                intercepting the drags that happen underneath it. */}
+                intercepting the drags that happen underneath it — a direct child of the OUTER div
+                (sibling of the `marginLeft: leadingPad` wrapper above, not inside it), since its own
+                position is expressed in scroll-container coordinates already, not shifted by the
+                same amount as everything else. */}
             <div
               ref={markerRef}
-              style={{ left: useEditorStore.getState().playhead * pixelsPerSecond }}
+              style={{
+                left: isMobile
+                  ? (scrollRef.current?.scrollLeft ?? 0) + centerOffset
+                  : useEditorStore.getState().playhead * pixelsPerSecond,
+              }}
               className="pointer-events-none absolute top-0 bottom-0 z-30 w-px bg-rose-400"
             >
               <div className="absolute -left-[5px] top-0 h-2.5 w-2.5 rounded-b-sm bg-rose-400" />
@@ -636,9 +932,10 @@ export function Timeline() {
       {/* Persistent horizontal scrollbar — see the scroll container's own comment on why this exists
           instead of relying on the browser's native (hidden, gesture-only) one. Offset by
           `HEADER_WIDTH` so it lines up under the scrollable content, not the fixed track-headers
-          column beside it. */}
+          column beside it — desktop only; mobile has no such column to offset for (headers scroll
+          with the clips there instead), so the scrollbar spans the full width. */}
       <div className="flex shrink-0 border-t border-white/5 bg-[#0b0d12] py-1 pr-2">
-        <div style={{ width: HEADER_WIDTH }} className="shrink-0" />
+        <div style={{ width: isMobile ? 0 : HEADER_WIDTH }} className="shrink-0" />
         <div
           role="scrollbar"
           aria-controls="vstudio-timeline-lanes"

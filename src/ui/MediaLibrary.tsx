@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo, useRef, useState } from "react";
-import { Close } from "@veasnawt/vicons";
+import { Close, Image as ImageIcon, Music, Text as TextIcon, Video } from "@veasnawt/vicons";
 import { thumbnailUrl } from "../api/client.ts";
 import { AddClipCommand } from "../commands/index.ts";
 import { fontById } from "../project/fonts.ts";
@@ -10,6 +10,19 @@ import { useEditorStore } from "../store/editorStore.ts";
 import { formatDuration } from "../timeline/time.ts";
 import { Dropdown } from "./Dropdown.tsx";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
+
+/** Small kind badge shown on every tile in the mobile grid (see the grid's own comment) — the desktop
+ *  list already has room for a text label (`describe()` below) to say "Audio"/"Image"/etc., but a
+ *  compact grid tile doesn't, so a color-coded icon carries that same "what kind of thing is this" cue
+ *  at a glance. Same color convention `TrackHeader.tsx` already uses for track kinds, extended with
+ *  violet for images (which have no TRACK kind of their own — they live on video tracks — but very much
+ *  need their own distinct color here, where video/image are two different asset kinds side by side). */
+const KIND_BADGE: Record<Asset["kind"], { Icon: typeof Video; className: string }> = {
+  video: { Icon: Video, className: "text-sky-300" },
+  audio: { Icon: Music, className: "text-emerald-300" },
+  image: { Icon: ImageIcon, className: "text-violet-300" },
+  text: { Icon: TextIcon, className: "text-amber-300" },
+};
 
 type SortKey = "name" | "duration" | "imported";
 
@@ -251,7 +264,13 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
             {project?.assets.some((a) => !a.hiddenFromLibrary) ? "Nothing matches that search." : "Drop video, audio, or images here — or use Import."}
           </p>
         ) : (
-          <ul className="flex flex-col gap-1">
+          // Grid on mobile (2 columns, bigger tiles), the existing single-column list back at `lg`+ —
+          // a compact 44×64px thumbnail in a narrow row was hard to tell apart at a glance and left a
+          // lot of the touch target as bare text; a proper grid gives thumbnails room to actually be
+          // useful for recognizing a clip on a phone, matching how every mobile photo/video picker
+          // presents a media library. Desktop's list stays exactly as it was — that column is narrow
+          // enough that a 2-up grid there would make the thumbnails smaller, not bigger.
+          <ul className="grid grid-cols-2 gap-2 lg:flex lg:flex-col lg:gap-1">
             {assets.map((asset) => (
               <li key={asset.id}>
                 <div
@@ -278,17 +297,42 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                     if (e.key === "Enter") addAssetAtPlayhead(asset.id);
                   }}
                   title={`${asset.name}\n${formatSize(asset.sizeBytes)}\nDouble-click to add at the playhead, or drag onto the timeline (press and hold, then drag, on touch)`}
-                  className="group flex w-full cursor-grab items-center gap-2.5 rounded-lg p-1.5 text-left transition hover:bg-white/10 focus:bg-white/10 focus:outline-none active:cursor-grabbing"
+                  className="group flex w-full cursor-grab flex-col gap-1.5 rounded-lg p-1.5 text-left transition hover:bg-white/10 focus:bg-white/10 focus:outline-none active:cursor-grabbing lg:flex-row lg:items-center lg:gap-2.5"
                 >
-                  <div className="relative h-11 w-16 shrink-0 overflow-hidden rounded bg-black">
+                  <div className="relative aspect-video w-full shrink-0 overflow-hidden rounded bg-black lg:h-11 lg:w-16">
                     <AssetThumbnail asset={asset} projectId={projectId} />
+                    {/* Kind badge — mobile-grid only. Desktop's thumbnail is too small (44×64) for this
+                        to read cleanly there, and its row already spells the kind out via `describe()`
+                        next to the name; the grid has no equivalent text label at a glance, so the icon
+                        carries that job instead. */}
+                    <span className="absolute left-1 top-1 flex h-5 w-5 items-center justify-center rounded bg-black/70 lg:hidden">
+                      {(() => {
+                        const { Icon, className } = KIND_BADGE[asset.kind];
+                        return <Icon size={12} className={className} />;
+                      })()}
+                    </span>
                     {asset.kind !== "image" && asset.kind !== "text" && (
                       <span className="absolute bottom-0 right-0 bg-black/75 px-1 text-[10px] tabular-nums text-white/90">
                         {formatDuration(asset.duration)}
                       </span>
                     )}
+                    {/* Mobile-grid remove button — overlaid on the thumbnail (top-right) since a grid
+                        tile has no separate inline slot for it the way the desktop row does. Always
+                        visible (not hover-revealed) for the same reason the desktop button already
+                        makes an exception below `lg`: touch has no `:hover` to reveal it from. */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void removeAsset(asset);
+                      }}
+                      title="Remove from project"
+                      aria-label={`Remove ${asset.name} from project`}
+                      className="absolute right-1 top-1 flex items-center rounded bg-black/70 p-1 text-white/70 transition hover:bg-black/90 hover:text-white lg:hidden"
+                    >
+                      <Close size={12} />
+                    </button>
                   </div>
-                  <div className="min-w-0 flex-1">
+                  <div className="min-w-0 w-full lg:flex-1">
                     <p className="truncate text-xs font-medium text-white/90">{asset.name}</p>
                     <p className="truncate text-[11px] text-white/45">{describe(asset)}</p>
                     {asset.offline && <p className="text-[11px] font-medium text-amber-400">Media Offline</p>}
@@ -300,11 +344,9 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                     }}
                     title="Remove from project"
                     aria-label={`Remove ${asset.name} from project`}
-                    // Hover-reveal only makes sense where a mouse actually exists — below `lg` (where
-                    // touch is the primary input) it stays permanently visible, since `:hover` never
-                    // fires on a touchscreen and a button that only appears on hover is a button that
-                    // literally cannot be reached at all on a phone or tablet.
-                    className="flex shrink-0 items-center rounded px-1.5 py-1 text-white/30 opacity-100 transition hover:bg-white/10 hover:text-white/80 lg:opacity-0 lg:focus:opacity-100 lg:group-hover:opacity-100"
+                    // Desktop-row-only (see the mobile-grid overlay button above) — hover-reveal only
+                    // makes sense where a mouse actually exists.
+                    className="hidden shrink-0 items-center rounded px-1.5 py-1 text-white/30 transition hover:bg-white/10 hover:text-white/80 lg:flex lg:opacity-0 lg:focus:opacity-100 lg:group-hover:opacity-100"
                   >
                     <Close size={12} />
                   </button>

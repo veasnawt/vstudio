@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import * as api from "../api/client.ts";
+import type { SourceRect } from "../api/client.ts";
 import type { Command } from "../commands/index.ts";
 import { AddClipCommand, AddTrackCommand } from "../commands/index.ts";
 import { createTextAsset, sequenceDuration } from "../project/createProject.ts";
@@ -129,6 +130,19 @@ export interface EditorState {
    *  native dragover/drop. Null when nothing is being dragged. */
   assetDrag: { assetId: string; clientX: number; clientY: number } | null;
   setAssetDrag: (drag: EditorState["assetDrag"]) => void;
+
+  /** "Remove Object" tool state — session-only, never part of `project`, same category as
+   *  `livePreviewOverrides`/`assetDrag` above. `removeObjectArmedClipId` is set by the Inspector's
+   *  "Draw region" button and read by `RemoveObjectOverlay` to know it should start accepting a
+   *  drag-to-draw gesture on the Preview canvas for that specific clip; it's cleared the moment a
+   *  rect is committed (or the drawing gesture is abandoned). `removeObjectRect` is the committed
+   *  rectangle (in the SOURCE asset's own pixel space, not screen space — see `maskGeometry.ts`),
+   *  kept per-clip so switching selection away and back doesn't lose it. */
+  removeObjectArmedClipId: string | null;
+  removeObjectRect: (SourceRect & { clipId: string }) | null;
+  armRemoveObject: (clipId: string) => void;
+  setRemoveObjectRect: (clipId: string, rect: SourceRect) => void;
+  clearRemoveObject: () => void;
   /** Registered imperatively by `Timeline` (the only component that knows its own scroll offset and
    *  track-row geometry) so `MediaLibrary`'s pointer drag can hit-test an arbitrary screen point
    *  against timeline tracks on release, without either component reaching into the other's DOM
@@ -166,6 +180,12 @@ export interface EditorState {
    *  surprising thing for the undo stack to track. Falls back to "Untitled" for an empty/whitespace-
    *  only name, matching `createProject`'s own default. */
   renameProject: (name: string) => void;
+  /** Lands a "Remove Object" job's finished result into the Media Library — same "not undo-able, an
+   *  asset creation is more like an import than an edit" reasoning as `importFiles`/`addTextAsset`,
+   *  and the same `applyProject` call they both use. Does NOT place it on the timeline; the user
+   *  drags it in themselves, same as any freshly-imported asset (a deliberate v1 scope cut — there's
+   *  no single obviously-correct "replace this clip" behavior to automate yet). */
+  landInpaintedAsset: (asset: Asset) => void;
 
   setStatus: (message: string | null, tone?: StatusTone) => void;
   duration: () => number;
@@ -206,6 +226,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
       project,
       playhead: Math.min(state.playhead, Math.max(0, total)),
       selectedClipIds: state.selectedClipIds.filter((id) => alive.has(id)),
+      // Same reasoning as selections above: a "Remove Object" rect drawn on a clip that's since been
+      // deleted has nothing left to apply to — drop it rather than leave it pointing at a dead id.
+      removeObjectRect: state.removeObjectRect && !alive.has(state.removeObjectRect.clipId) ? null : state.removeObjectRect,
     }));
     markDirtyAndScheduleSave();
   }
@@ -227,6 +250,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
     recording: null,
     assetDrag: null,
     resolveTimelineDropTarget: null,
+    removeObjectArmedClipId: null,
+    removeObjectRect: null,
 
     dirty: false,
     saving: false,
@@ -411,6 +436,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
       set({ resolveTimelineDropTarget: resolver });
     },
 
+    armRemoveObject(clipId) {
+      set({ removeObjectArmedClipId: clipId });
+    },
+
+    setRemoveObjectRect(clipId, rect) {
+      set({ removeObjectArmedClipId: null, removeObjectRect: { clipId, ...rect } });
+    },
+
+    clearRemoveObject() {
+      set({ removeObjectArmedClipId: null, removeObjectRect: null });
+    },
+
     async importFiles(files, options) {
       const { projectId, project } = get();
       if (!projectId || !project || files.length === 0) return [];
@@ -463,6 +500,14 @@ export const useEditorStore = create<EditorState>((set, get) => {
       if (next === current.name) return;
       applyProject({ ...current, name: next });
       get().setStatus("Renamed project");
+    },
+
+    landInpaintedAsset(asset) {
+      const current = get().project;
+      if (!current) return;
+      applyProject({ ...current, assets: [...current.assets, asset] });
+      get().clearRemoveObject();
+      get().setStatus(`Added "${asset.name}" to the Media Library`);
     },
 
     async removeAsset(asset) {

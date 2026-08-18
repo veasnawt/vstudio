@@ -1,6 +1,7 @@
 import { Capacitor } from "@capacitor/core";
 import { deserializeProject } from "../project/serialize.ts";
 import type { Asset, Project } from "../project/types.ts";
+import { nativeCancelExport, nativeExportAvailable, nativeStartExport, nativeWatchExport } from "./nativeExport.ts";
 import { nativeDeleteMedia, nativeImportMedia, nativeLoadProject, nativeMediaUrl, nativeSaveProject } from "./nativeStorage.ts";
 
 /** Browser-side client for VStudio's server routes.
@@ -139,10 +140,7 @@ export interface ExportProgress {
 }
 
 export async function startExport(projectId: string, project: Project, fileName?: string): Promise<ExportStarted> {
-  // `ExportDialog` gates on `exportAvailable()` (false on native, below) before this can be reached —
-  // export needs the native `ffmpeg-kit` plugin (plan Step 5), not yet built. Thrown rather than
-  // silently attempting a `fetch` to a route that doesn't exist in this shell.
-  if (isNative) throw new ApiRequestError("Export isn't available on this device yet.", 501, "export-unavailable");
+  if (isNative) return nativeStartExport(projectId, project, fileName);
   const response = await fetch(`${BASE}/export?projectId=${encodeURIComponent(projectId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -152,7 +150,7 @@ export async function startExport(projectId: string, project: Project, fileName?
 }
 
 export async function cancelExport(jobId: string): Promise<void> {
-  if (isNative) return;
+  if (isNative) return nativeCancelExport(jobId);
   // A cancel racing the job's own completion is normal, not an error worth surfacing.
   await fetch(`${BASE}/export?jobId=${encodeURIComponent(jobId)}`, { method: "DELETE" }).catch(() => {});
 }
@@ -166,10 +164,7 @@ export function watchExport(
   onUpdate: (progress: ExportProgress) => void,
   onError: (message: string) => void
 ): () => void {
-  if (isNative) {
-    onError("Export isn't available on this device yet.");
-    return () => {};
-  }
+  if (isNative) return nativeWatchExport(jobId, onUpdate, onError);
   const source = new EventSource(`${BASE}/export?jobId=${encodeURIComponent(jobId)}`);
 
   source.onmessage = (event) => {
@@ -194,14 +189,215 @@ export function watchExport(
   return () => source.close();
 }
 
-/** Whether the server can actually export right now (FFmpeg present and runnable) — always `false`
- *  on native until the on-device `ffmpeg-kit` plugin (plan Step 5) exists. */
+/** Whether export can actually work right now — on native, whether the `Ffmpeg` plugin registered
+ *  (see `FfmpegPlugin.kt`); on the server, whether FFmpeg is present and runnable. */
 export async function exportAvailable(): Promise<boolean> {
-  if (isNative) return false;
+  if (isNative) return nativeExportAvailable();
   try {
     const response = await fetch(`${BASE}/export`, { method: "HEAD" });
     return response.status === 204;
   } catch {
     return false;
   }
+}
+
+export interface SourceRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface InpaintStarted {
+  jobId: string;
+}
+
+export interface InpaintProgress {
+  status: "running" | "done" | "failed" | "cancelled";
+  stage: "extracting" | "masking" | "uploading" | "predicting" | "downloading" | "importing";
+  progress: number;
+  error?: string;
+  /** Present once `status === "done"` — the client lands this directly via `landInpaintedAsset`,
+   *  no second round-trip needed. */
+  asset?: Asset;
+}
+
+/** Starts a "Remove Object" job for one clip — desktop/browser-server-backed only for v1, same as
+ *  export (no native branch: this needs the same not-yet-built on-device FFmpeg plugin export does,
+ *  plus network access for the cloud model itself). `backgroundPrompt` only matters for the fal.ai
+ *  provider (its VOID model requires a description of what should fill the removed region); the
+ *  server ignores it harmlessly when Replicate is active. */
+export async function startInpaint(
+  projectId: string,
+  clipId: string,
+  rect: SourceRect,
+  backgroundPrompt?: string
+): Promise<InpaintStarted> {
+  if (isNative) throw new ApiRequestError("Remove Object isn't available on this device yet.", 501, "inpaint-unavailable");
+  const response = await fetch(`${BASE}/inpaint?projectId=${encodeURIComponent(projectId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clipId, rect, ...(backgroundPrompt ? { backgroundPrompt } : null) }),
+  });
+  return unwrap<InpaintStarted>(response);
+}
+
+export async function cancelInpaint(jobId: string): Promise<void> {
+  if (isNative) return;
+  // A cancel racing the job's own completion is normal, not an error worth surfacing — same
+  // reasoning as `cancelExport`.
+  await fetch(`${BASE}/inpaint?jobId=${encodeURIComponent(jobId)}`, { method: "DELETE" }).catch(() => {});
+}
+
+/** Subscribes to a "Remove Object" job's progress. Identical shape to `watchExport` — see its own
+ *  comment for why `EventSource` over polling. */
+export function watchInpaint(
+  jobId: string,
+  onUpdate: (progress: InpaintProgress) => void,
+  onError: (message: string) => void
+): () => void {
+  if (isNative) {
+    onError("Remove Object isn't available on this device yet.");
+    return () => {};
+  }
+  const source = new EventSource(`${BASE}/inpaint?jobId=${encodeURIComponent(jobId)}`);
+
+  source.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data) as InpaintProgress;
+      onUpdate(payload);
+      if (payload.status !== "running") source.close();
+    } catch {
+      /* a malformed frame is not worth tearing the stream down over */
+    }
+  };
+
+  source.onerror = () => {
+    if (source.readyState !== EventSource.CLOSED) {
+      onError("Lost contact with the job. It may still be running.");
+    }
+    source.close();
+  };
+
+  return () => source.close();
+}
+
+/** Whether "Remove Object" is usable right now — FFmpeg present AND the active provider has a key
+ *  saved. */
+export async function inpaintAvailable(): Promise<boolean> {
+  if (isNative) return false;
+  try {
+    const response = await fetch(`${BASE}/inpaint`, { method: "HEAD" });
+    return response.status === 204;
+  } catch {
+    return false;
+  }
+}
+
+/** "local" runs entirely on this machine (self-hosted ProPainter, see `getLocalSetupStatus`/
+ *  `startLocalSetup` below) — no key/token concept, unlike the two cloud providers. */
+export type InpaintProvider = "replicate" | "fal" | "local";
+type CloudInpaintProvider = "replicate" | "fal";
+
+export interface InpaintKeyStatus {
+  activeProvider: InpaintProvider;
+  configured: Record<InpaintProvider, boolean>;
+}
+
+export async function getInpaintKeyStatus(): Promise<InpaintKeyStatus | null> {
+  if (isNative) return null;
+  try {
+    const response = await fetch(`${BASE}/inpaint/settings`);
+    return unwrap<InpaintKeyStatus>(response);
+  } catch {
+    return null;
+  }
+}
+
+/** Saves a cloud provider's API key. Saving also activates that provider — same "one action does
+ *  both" behavior Rixie's own `setApiKey` uses. Never called with `"local"` — it has no key. */
+export async function setInpaintApiKey(provider: CloudInpaintProvider, apiKey: string): Promise<void> {
+  if (isNative) throw new ApiRequestError("Not available on this device yet.", 501, "inpaint-unavailable");
+  const response = await fetch(`${BASE}/inpaint/settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider, apiKey }),
+  });
+  await unwrap<{ ok: true }>(response);
+}
+
+/** Switches the active provider without touching any saved key — for a provider that already has
+ *  one configured (or, for `"local"`, one that's already set up). */
+export async function setActiveInpaintProvider(provider: InpaintProvider): Promise<void> {
+  if (isNative) throw new ApiRequestError("Not available on this device yet.", 501, "inpaint-unavailable");
+  const response = await fetch(`${BASE}/inpaint/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
+  });
+  await unwrap<{ ok: true }>(response);
+}
+
+export interface LocalSetupProgress {
+  status: "running" | "done" | "failed" | "cancelled";
+  stage: "cloning" | "venv" | "installing" | "finalizing";
+  progress: number;
+  error?: string;
+}
+
+/** Whether the local ProPainter runtime (Python venv + cloned repo) is provisioned — the Inspector
+ *  calls this to decide between offering "Set up local model" and the normal ready-to-use flow. */
+export async function getLocalSetupStatus(): Promise<{ ready: boolean } | null> {
+  if (isNative) return null;
+  try {
+    const response = await fetch(`${BASE}/inpaint/local-setup`);
+    return unwrap<{ ready: boolean }>(response);
+  } catch {
+    return null;
+  }
+}
+
+/** Starts provisioning the local Python runtime — long-running (several minutes, network + disk
+ *  heavy), same fire-and-track-via-SSE shape as `startInpaint`/`watchInpaint`. */
+export async function startLocalSetup(): Promise<{ jobId: string }> {
+  if (isNative) throw new ApiRequestError("Not available on this device yet.", 501, "inpaint-unavailable");
+  const response = await fetch(`${BASE}/inpaint/local-setup`, { method: "POST" });
+  return unwrap<{ jobId: string }>(response);
+}
+
+export async function cancelLocalSetup(jobId: string): Promise<void> {
+  if (isNative) return;
+  await fetch(`${BASE}/inpaint/local-setup?jobId=${encodeURIComponent(jobId)}`, { method: "DELETE" }).catch(() => {});
+}
+
+/** Subscribes to a local-setup job's progress. Identical shape to `watchInpaint`. */
+export function watchLocalSetup(
+  jobId: string,
+  onUpdate: (progress: LocalSetupProgress) => void,
+  onError: (message: string) => void
+): () => void {
+  if (isNative) {
+    onError("Not available on this device yet.");
+    return () => {};
+  }
+  const source = new EventSource(`${BASE}/inpaint/local-setup?jobId=${encodeURIComponent(jobId)}`);
+
+  source.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data) as LocalSetupProgress;
+      onUpdate(payload);
+      if (payload.status !== "running") source.close();
+    } catch {
+      /* a malformed frame is not worth tearing the stream down over */
+    }
+  };
+
+  source.onerror = () => {
+    if (source.readyState !== EventSource.CLOSED) {
+      onError("Lost contact with the setup job. It may still be running.");
+    }
+    source.close();
+  };
+
+  return () => source.close();
 }

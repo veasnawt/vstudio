@@ -1,11 +1,32 @@
 "use client";
 
-import React, { useState } from "react";
-import { Delete, Lock, Unlock, Visibility, VisibilityOff } from "@veasnawt/vicons";
+import React, { useRef, useState } from "react";
+import { Delete, Lock, Music, Text as TextIcon, Unlock, Video, Visibility, VisibilityOff } from "@veasnawt/vicons";
 import { RemoveTrackCommand, SetTrackFlagCommand } from "../commands/index.ts";
 import type { Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { ConfirmDialog } from "./ConfirmDialog.tsx";
+
+/** Icon + accent color standing in for the track's own name/controls when collapsed (mobile,
+ *  inactive — see `iconOnly` below) — same color convention `TimelineClip.tsx` already uses to tell
+ *  video/audio clips apart at a glance (sky/emerald), extended to text tracks with amber so all three
+ *  kinds read distinctly even reduced to a single glyph. */
+const KIND_ICON: Record<Track["kind"], { Icon: typeof Video; className: string }> = {
+  video: { Icon: Video, className: "text-sky-300" },
+  audio: { Icon: Music, className: "text-emerald-300" },
+  text: { Icon: TextIcon, className: "text-amber-300" },
+};
+
+/** Per-kind subset of MediaLibrary.tsx's own `ACCEPTED_EXTENSIONS` — a video track takes video OR
+ *  image files (images live on a video track alongside real video, see `trackKindForAsset`'s own
+ *  comment in timeline/operations.ts), an audio track takes only audio. Not imported from
+ *  MediaLibrary.tsx since that file keeps one flat unsplit list; duplicated here rather than
+ *  restructuring that file just for this. Text tracks get no import button at all — a text track's
+ *  content is typed, not a file. */
+const ACCEPTED_EXTENSIONS_BY_KIND: Record<"video" | "audio", string> = {
+  video: ".mp4,.mov,.webm,.mkv,.avi,.m4v,.png,.jpg,.jpeg,.webp,.gif",
+  audio: ".wav,.mp3,.aac,.flac,.m4a,.ogg",
+};
 
 /** Carries the dragged track's id, readable only at drop time (browsers restrict `getData` during
  *  `dragover` for security). A SECOND, per-kind type — `${TRACK_DRAG_MIME}-kind-${kind}` — carries no
@@ -34,7 +55,12 @@ function FlagButton({
       title={label}
       aria-label={label}
       aria-pressed={active}
-      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+      // Fixed min dimensions rather than padding-driven sizing: the worst case (an audio track's
+      // Lock+Mute+Solo, 3 buttons in one row) still comfortably fits HEADER_WIDTH's ~100px of usable
+      // width at 26px each, but the previous padding-only sizing (px-1.5 py-0.5 around a 13px icon or
+      // single letter) measured as small as ~17×19px on a real mobile viewport — too small to
+      // reliably tap for a control used mid-playback (mute/solo while previewing).
+      className={`inline-flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-[11px] font-semibold transition ${
         active ? activeClass : "text-white/35 hover:bg-white/10 hover:text-white/70"
       }`}
     >
@@ -46,6 +72,8 @@ function FlagButton({
 export function TrackHeader({
   track,
   height,
+  compact,
+  isMobile,
   dropIndicator,
   onDragOverRow,
   onDropRow,
@@ -53,6 +81,16 @@ export function TrackHeader({
 }: {
   track: Track;
   height: number;
+  /** True for an empty track on mobile (see Timeline.tsx's own `isTrackCompact`) — drops the
+   *  lock/visibility/mute/solo row entirely rather than trying to squeeze it into a shorter row.
+   *  Those controls govern EXISTING content, which a compact row by definition doesn't have yet; they
+   *  reappear automatically the moment a clip lands (the row grows back to full height at the same
+   *  time, in Timeline.tsx). */
+  compact: boolean;
+  /** Drives `iconOnly` below (mobile + not the active track) — same `lg` breakpoint every other
+   *  mobile/desktop split in this app uses, passed down rather than each header running its own
+   *  `matchMedia` listener (cheap, but no reason for N redundant listeners over one shared value). */
+  isMobile: boolean;
   /** "before"/"after" if THIS row is the current drag target, else null — Timeline owns the single
    *  shared piece of state this derives from, since only one row can be a drop target at a time. */
   dropIndicator: "before" | "after" | null;
@@ -63,17 +101,62 @@ export function TrackHeader({
   const run = useEditorStore((s) => s.run);
   const activeTrackId = useEditorStore((s) => s.activeTrackId);
   const setActiveTrack = useEditorStore((s) => s.setActiveTrack);
+  const importFiles = useEditorStore((s) => s.importFiles);
+  const addAssetAtPlayhead = useEditorStore((s) => s.addAssetAtPlayhead);
+  const importing = useEditorStore((s) => s.importing);
 
   const isActive = activeTrackId === track.id;
+  // Collapsed to a single color-coded kind icon until tapped — a narrow phone doesn't have room to
+  // show every track's full name/controls at once, and most of the time you only need to see/act on
+  // ONE track anyway (whichever you just tapped, which `isActive` already tracks — no new state).
+  // Desktop keeps the full header always, at every breakpoint it's always had room for.
+  const iconOnly = isMobile && !isActive;
   // Confirmation state lives here rather than lifted up to Timeline — each header is independent and
   // only ever removes ITSELF, so there's nothing to coordinate across tracks.
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   /** Top half of the row means "drop before me", bottom half means "drop after me" — the standard
    *  reorder-list convention, and simple arithmetic since rows are a uniform height. */
   function positionInRow(e: React.DragEvent): "before" | "after" {
     const rect = e.currentTarget.getBoundingClientRect();
     return e.clientY - rect.top < rect.height / 2 ? "before" : "after";
+  }
+
+  if (iconOnly) {
+    const { Icon, className } = KIND_ICON[track.kind];
+    return (
+      <div
+        style={{ height }}
+        onClick={() => setActiveTrack(track.id)}
+        title={`${track.name} — tap to expand`}
+        aria-label={`${track.name} track, collapsed — tap to expand`}
+        // Drag-TO-reorder-onto still works (another track's own expanded drag handle can target this
+        // row) — only the reorder-FROM affordance (the "⋮⋮" handle) is dropped, along with everything
+        // else, in favor of a single glanceable icon.
+        onDragOver={(e) => {
+          if (!e.dataTransfer.types.includes(`${TRACK_DRAG_MIME}-kind-${track.kind}`)) return;
+          e.preventDefault();
+          onDragOverRow(track.id, positionInRow(e));
+        }}
+        onDrop={(e) => {
+          if (!e.dataTransfer.types.includes(`${TRACK_DRAG_MIME}-kind-${track.kind}`)) return;
+          e.preventDefault();
+          const sourceId = e.dataTransfer.getData(TRACK_DRAG_MIME);
+          if (sourceId && sourceId !== track.id) onDropRow(sourceId, track.id, positionInRow(e));
+        }}
+        className="relative flex shrink-0 cursor-pointer items-center justify-center border-b border-r border-white/10 bg-[#0d0f14] transition hover:bg-white/[0.04]"
+      >
+        {dropIndicator && (
+          <div
+            className={`pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-sky-400 ${
+              dropIndicator === "before" ? "top-0" : "bottom-0"
+            }`}
+          />
+        )}
+        <Icon size={16} className={className} />
+      </div>
+    );
   }
 
   return (
@@ -126,6 +209,47 @@ export function TrackHeader({
             visible at a glance rather than something the user has to remember. */}
         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isActive ? "bg-sky-400" : "bg-transparent"}`} />
         <span className="truncate text-[11px] font-semibold text-white/80">{track.name}</span>
+        {/* Imports a file straight onto THIS track, at the playhead — the direct alternative to
+            dragging an asset in from the Media Library, which is a fiddly gesture on a touchscreen
+            (long-press to arm the drag, then hit a specific track row) compared to a plain tap here.
+            `ml-auto` pushes this AND the delete button after it to the row's right edge together;
+            text tracks get neither an import button nor anything to import (their content is typed). */}
+        {track.kind !== "text" && (
+          <>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                importInputRef.current?.click();
+              }}
+              disabled={importing}
+              title={`Import ${track.kind} onto ${track.name}`}
+              aria-label={`Import ${track.kind} onto ${track.name}`}
+              className="ml-auto inline-flex min-h-[26px] min-w-[26px] shrink-0 items-center justify-center rounded text-[15px] font-semibold leading-none text-white/35 transition hover:bg-white/10 hover:text-white/70 disabled:cursor-default disabled:opacity-40"
+            >
+              +
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              multiple
+              accept={ACCEPTED_EXTENSIONS_BY_KIND[track.kind]}
+              className="hidden"
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                const files = [...(e.target.files ?? [])];
+                // Cleared so re-picking the same file still fires a change event.
+                e.target.value = "";
+                if (files.length === 0) return;
+                void importFiles(files).then((assets) => {
+                  // Sequential, non-overlapping placement — same option addAssetAtPlayhead already
+                  // supports for exactly this "landed several at once" case, so importing 3 clips here
+                  // doesn't stack them all on top of each other at the playhead.
+                  for (const asset of assets) addAssetAtPlayhead(asset.id, track.id, { avoidOverlap: true });
+                });
+              }}
+            />
+          </>
+        )}
         {/* Faded in on hover/focus at `lg`+ rather than always visible — a permanent delete icon next
             to every track invites a stray click far more than the same control does when it only
             appears once you're already pointing at that row. Below `lg` there's no hover to fade it
@@ -144,48 +268,50 @@ export function TrackHeader({
         </button>
       </div>
 
-      <div className="flex items-center gap-0.5">
-        <FlagButton
-          active={track.locked}
-          onClick={() => run(new SetTrackFlagCommand(track.id, "locked", !track.locked))}
-          label={track.locked ? "Unlock track" : "Lock track"}
-          activeClass="bg-amber-500/25 text-amber-300"
-        >
-          {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
-        </FlagButton>
-
-        {track.kind !== "audio" ? (
-          // Video and text tracks both have a visible on-canvas result, so both get the same
-          // show/hide toggle; only audio has nothing to show and gets mute/solo instead.
+      {!compact && (
+        <div className="flex items-center gap-0.5">
           <FlagButton
-            active={!track.visible}
-            onClick={() => run(new SetTrackFlagCommand(track.id, "visible", !track.visible))}
-            label={track.visible ? "Hide track" : "Show track"}
-            activeClass="bg-white/15 text-white/80"
+            active={track.locked}
+            onClick={() => run(new SetTrackFlagCommand(track.id, "locked", !track.locked))}
+            label={track.locked ? "Unlock track" : "Lock track"}
+            activeClass="bg-amber-500/25 text-amber-300"
           >
-            {track.visible ? <Visibility size={13} /> : <VisibilityOff size={13} />}
+            {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
           </FlagButton>
-        ) : (
-          <>
+
+          {track.kind !== "audio" ? (
+            // Video and text tracks both have a visible on-canvas result, so both get the same
+            // show/hide toggle; only audio has nothing to show and gets mute/solo instead.
             <FlagButton
-              active={track.muted}
-              onClick={() => run(new SetTrackFlagCommand(track.id, "muted", !track.muted))}
-              label={track.muted ? "Unmute track" : "Mute track"}
-              activeClass="bg-rose-500/25 text-rose-300"
+              active={!track.visible}
+              onClick={() => run(new SetTrackFlagCommand(track.id, "visible", !track.visible))}
+              label={track.visible ? "Hide track" : "Show track"}
+              activeClass="bg-white/15 text-white/80"
             >
-              M
+              {track.visible ? <Visibility size={13} /> : <VisibilityOff size={13} />}
             </FlagButton>
-            <FlagButton
-              active={track.solo}
-              onClick={() => run(new SetTrackFlagCommand(track.id, "solo", !track.solo))}
-              label={track.solo ? "Unsolo track" : "Solo track"}
-              activeClass="bg-emerald-500/25 text-emerald-300"
-            >
-              S
-            </FlagButton>
-          </>
-        )}
-      </div>
+          ) : (
+            <>
+              <FlagButton
+                active={track.muted}
+                onClick={() => run(new SetTrackFlagCommand(track.id, "muted", !track.muted))}
+                label={track.muted ? "Unmute track" : "Mute track"}
+                activeClass="bg-rose-500/25 text-rose-300"
+              >
+                M
+              </FlagButton>
+              <FlagButton
+                active={track.solo}
+                onClick={() => run(new SetTrackFlagCommand(track.id, "solo", !track.solo))}
+                label={track.solo ? "Unsolo track" : "Solo track"}
+                activeClass="bg-emerald-500/25 text-emerald-300"
+              >
+                S
+              </FlagButton>
+            </>
+          )}
+        </div>
+      )}
 
       {confirmOpen && (
         <ConfirmDialog

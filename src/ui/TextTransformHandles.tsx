@@ -27,7 +27,9 @@ const ALIGN_SNAP_PIXELS = 8;
 // block's "size" IS `fontSize` (no separate scale multiplier, no crop), and its box comes from
 // measuring rendered glyphs (`computeTextBlock`) rather than a source asset's own width/height.
 const DRAG_THRESHOLD = 3;
-const HANDLE_SIZE = 16;
+// Kept in sync with TransformHandles.tsx's own identical constant and its comment: 16px was too
+// small to reliably hit on a touch device, 24px roughly doubles the actual hit area.
+const HANDLE_SIZE = 24;
 const ROTATE_HANDLE_OFFSET = 28;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 600;

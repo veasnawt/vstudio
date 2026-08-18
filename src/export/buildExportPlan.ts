@@ -44,6 +44,14 @@ export interface ExportPlanOptions {
    *  of them meaningful to FFmpeg's OWN filter-string grammar, and a text FILE sidesteps that whole
    *  class of injection/escaping bugs by never putting the content in the filter string at all. */
   textFilePathFor: (clip: Clip, content: string) => string;
+  /** The video encoder + its own rate-control flags, as one pre-built arg fragment — defaults to
+   *  libx264 (desktop/server behavior, unchanged) when omitted. Injected rather than hardcoded because
+   *  the encoder NAME alone isn't swappable in isolation: `-preset`/`-crf` are libx264-specific flags,
+   *  meaningless (or rejected outright) by another encoder, so a caller needing a different one has to
+   *  supply its complete matching fragment, not just a different `-c:v` value. `nativeExport.ts` passes
+   *  one — the FFmpeg engine bundled for on-device mobile export doesn't include libx264 at all (a real
+   *  gap discovered testing on a physical device, not a hypothetical). */
+  videoEncoderArgs?: string[];
 }
 
 export interface ExportPlan {
@@ -666,12 +674,7 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
       videoOut,
       "-map",
       audioOut,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "medium",
-      "-crf",
-      String(crf),
+      ...(options.videoEncoderArgs ?? ["-c:v", "libx264", "-preset", "medium", "-crf", String(crf)]),
       "-pix_fmt",
       "yuv420p",
       "-c:a",

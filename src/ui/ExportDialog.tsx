@@ -1,7 +1,10 @@
 "use client";
 
+import { Capacitor } from "@capacitor/core";
+import { Share } from "@capacitor/share";
 import { useEffect, useRef, useState } from "react";
 import { cancelExport, exportAvailable, exportUrl, startExport, watchExport } from "../api/client.ts";
+import { nativeExportUrl, nativeSaveExportToGallery } from "../api/nativeExport.ts";
 import { trimProjectToRange } from "../export/trimForExport.ts";
 import { sequenceDuration } from "../project/createProject.ts";
 import { FPS_PRESETS, RESOLUTION_PRESETS } from "../project/types.ts";
@@ -32,6 +35,14 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [available, setAvailable] = useState<boolean | null>(null);
+  const [sharing, setSharing] = useState(false);
+  // Native only — an export left sitting only in the app's own private storage is easy to lose track
+  // of, so a finished render is copied into the device's Gallery automatically (see
+  // `nativeSaveExportToGallery`) rather than requiring a manual "Save / Share" tap just to keep a
+  // copy. That button stays for picking a specific app to send it to.
+  const [gallerySave, setGallerySave] = useState<"idle" | "saving" | "done" | "failed">("idle");
+
+  const isNative = Capacitor.isNativePlatform();
 
   const jobIdRef = useRef<string | null>(null);
   const unwatchRef = useRef<(() => void) | null>(null);
@@ -44,11 +55,25 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
   useEffect(() => () => unwatchRef.current?.(), []);
 
+  async function autoSaveToGallery(name: string) {
+    if (!projectId) return;
+    setGallerySave("saving");
+    try {
+      await nativeSaveExportToGallery(projectId, name);
+      setGallerySave("done");
+    } catch {
+      // Not surfaced as a full export failure — the render itself succeeded, this is just the
+      // automatic copy-to-gallery step; the "Save / Share" button below still works as a fallback.
+      setGallerySave("failed");
+    }
+  }
+
   async function begin() {
     if (!project || !projectId) return;
     setError(null);
     setProgress(0);
     setPhase("running");
+    setGallerySave("idle");
 
     // The export renders whatever the SERVER has, so an unsaved edit would silently export a stale
     // timeline. Saving first makes what's exported match what's on screen.
@@ -72,8 +97,10 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
         started.jobId,
         (update) => {
           setProgress(update.progress);
-          if (update.status === "done") setPhase("done");
-          else if (update.status === "failed") {
+          if (update.status === "done") {
+            setPhase("done");
+            if (isNative) void autoSaveToGallery(started.fileName);
+          } else if (update.status === "failed") {
             setPhase("failed");
             setError(update.error ?? "Export failed");
           } else if (update.status === "cancelled") setPhase("cancelled");
@@ -91,6 +118,24 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
   async function stop() {
     if (jobIdRef.current) await cancelExport(jobIdRef.current);
+  }
+
+  // Native has no browser download — a `download` anchor is meaningless in a WebView. The OS share
+  // sheet (save to Files, send to another app, etc.) is the native equivalent of "here's your file."
+  async function shareNative() {
+    if (!projectId || !fileName) return;
+    setSharing(true);
+    try {
+      const url = await nativeExportUrl(projectId, fileName);
+      // `files` (a real attachment another app can read), not `url` — `url` is for sharing a WEB
+      // link/text, and silently degrades to just the `title` text when handed a local file:// path
+      // instead, which is exactly what looked like "sharing only copies the text, not the video."
+      await Share.share({ files: [url], title: fileName, dialogTitle: "Save or share video" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSharing(false);
+    }
   }
 
   const busy = phase === "running";
@@ -206,18 +251,37 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                   {phase === "cancelled" && "Export cancelled"}
                   {phase === "failed" && <span className="text-rose-300">{error}</span>}
                 </p>
+                {phase === "done" && isNative && (
+                  <p className="mt-1 text-[11px] text-white/40">
+                    {gallerySave === "saving" && "Saving to Gallery…"}
+                    {gallerySave === "done" && "Saved to Gallery"}
+                    {gallerySave === "failed" && (
+                      <span className="text-amber-300">Couldn&apos;t auto-save — use Save / Share below</span>
+                    )}
+                  </p>
+                )}
               </div>
             )}
 
             <div className="mt-5 flex items-center justify-end gap-2">
               {phase === "done" && fileName && projectId && (
-                <a
-                  href={exportUrl(projectId, fileName)}
-                  download={fileName}
-                  className="mr-auto rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30"
-                >
-                  Save video
-                </a>
+                isNative ? (
+                  <button
+                    onClick={() => void shareNative()}
+                    disabled={sharing}
+                    className="mr-auto rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30 disabled:opacity-50"
+                  >
+                    {sharing ? "Sharing…" : "Save / Share"}
+                  </button>
+                ) : (
+                  <a
+                    href={exportUrl(projectId, fileName)}
+                    download={fileName}
+                    className="mr-auto rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30"
+                  >
+                    Save video
+                  </a>
+                )
               )}
 
               {busy ? (

@@ -172,16 +172,17 @@ export function VoiceoverRecorder() {
     useEditorStore.getState().finalizeRecordingIndicator();
   }
 
-  // Sized to match ToolbarButton (VStudioApp.tsx's h-8 icon buttons) while recording, but wider —
-  // the elapsed-time readout needs the room, and a growing/shrinking control is a fine trade for
-  // showing the one piece of info (how long you've been talking) that actually matters mid-recording.
+  // Sized to match ToolbarButton (VStudioApp.tsx's h-10 icon+label buttons) while recording, but
+  // wider — the elapsed-time readout needs the room, and a growing/shrinking control is a fine trade
+  // for showing the one piece of info (how long you've been talking) that actually matters
+  // mid-recording; the timer text already IS this button's label while it's showing.
   if (recording) {
     return (
       <button
         onClick={stop}
         aria-label="Stop recording"
         title="Stop recording"
-        className="flex h-8 shrink-0 items-center gap-1.5 rounded px-2 text-xs font-medium tabular-nums text-rose-300 transition hover:bg-rose-500/20"
+        className="flex h-10 shrink-0 items-center gap-1.5 rounded px-2 text-xs font-medium tabular-nums text-rose-300 transition hover:bg-rose-500/20"
       >
         <span aria-hidden className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-400" />
         {pad2(Math.floor(elapsed / 60))}:{pad2(elapsed % 60)}
@@ -194,9 +195,10 @@ export function VoiceoverRecorder() {
       onClick={start}
       aria-label="Record voiceover"
       title="Record a voiceover from your microphone"
-      className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-white/70 transition hover:bg-white/10 hover:text-white"
+      className="flex h-10 min-w-11 shrink-0 flex-col items-center justify-center gap-0.5 rounded px-1 leading-none text-white/70 transition hover:bg-white/10 hover:text-white"
     >
-      <Microphone size={20} />
+      <Microphone size={18} />
+      <span className="max-w-full truncate text-[9px] font-medium">Voice</span>
     </button>
   );
 }

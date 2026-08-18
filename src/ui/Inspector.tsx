@@ -1,6 +1,20 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { ChevronDown } from "@veasnawt/vicons";
+import {
+  cancelInpaint,
+  cancelLocalSetup,
+  getInpaintKeyStatus,
+  inpaintAvailable,
+  setActiveInpaintProvider,
+  setInpaintApiKey,
+  startInpaint,
+  startLocalSetup,
+  watchInpaint,
+  watchLocalSetup,
+} from "../api/client.ts";
+import type { InpaintKeyStatus, InpaintProgress, InpaintProvider, LocalSetupProgress } from "../api/client.ts";
 import {
   SetClipEffectsCommand,
   SetClipGainCommand,
@@ -16,7 +30,7 @@ import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../pro
 import { useEditorStore } from "../store/editorStore.ts";
 import { formatTimecode } from "../timeline/time.ts";
 import { DEFAULT_TRANSITION, findTransitionCandidate } from "../timeline/transitions.ts";
-import { Dropdown } from "./Dropdown.tsx";
+import { Dropdown, type DropdownOption } from "./Dropdown.tsx";
 import { NumberField } from "./NumberField.tsx";
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -28,15 +42,40 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** A section header — a small colored dot as a scannable per-section accent (Transform/Effects/etc.
- *  each get a distinct hue) plus the label, at a size that actually reads as a heading rather than
- *  blending into the field labels beneath it. */
-function SectionHeader({ children, accent = "bg-sky-400" }: { children: React.ReactNode; accent?: string }) {
+/** A collapsible section — a small colored dot as a scannable per-section accent (Transform/Effects/
+ *  etc. each get a distinct hue), the label, and a chevron, at a size that actually reads as a heading
+ *  rather than blending into the field labels beneath it. Replaces what used to be a plain non-
+ *  interactive `SectionHeader`: a video/image clip has Transform + Effects + Transition + Audio +
+ *  Timeline + Source + Media, and a text clip's own Text section alone is a dozen-plus fields — all
+ *  permanently expanded meant reaching, say, Rotation meant scrolling past everything above it every
+ *  single time, worst on mobile where this panel is a full-height sheet rather than a side column with
+ *  room to spare. Collapsing what you're not using now is a tap on the header, not a re-navigation. */
+function CollapsibleSection({
+  title,
+  accent = "bg-sky-400",
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  accent?: string;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
   return (
-    <h3 className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-white/45">
-      <span aria-hidden className={`h-1.5 w-1.5 shrink-0 rounded-full ${accent}`} />
-      {children}
-    </h3>
+    <div className="border-t border-white/10 pt-3">
+      <button
+        onClick={onToggle}
+        aria-expanded={open}
+        className="-mx-1 mb-2 flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-[11px] font-semibold uppercase tracking-wide text-white/45 transition hover:text-white/80"
+      >
+        <span aria-hidden className={`h-1.5 w-1.5 shrink-0 rounded-full ${accent}`} />
+        <span className="flex-1">{title}</span>
+        <ChevronDown size={13} className={`shrink-0 text-white/30 transition-transform ${open ? "" : "-rotate-90"}`} />
+      </button>
+      {open && children}
+    </div>
   );
 }
 
@@ -85,6 +124,404 @@ function AlignButton({ active, onClick, children }: { active: boolean; onClick: 
   );
 }
 
+type InpaintPhase = "idle" | "running" | "done" | "failed" | "cancelled";
+
+const INPAINT_PROVIDER_LABELS: Record<InpaintProvider, string> = {
+  replicate: "Replicate",
+  fal: "fal.ai",
+  local: "Local (CPU)",
+};
+
+type LocalSetupPhase = "idle" | "running" | "done" | "failed" | "cancelled";
+
+/** The "Remove Object" tool's Inspector content — a v1 AI object/watermark-removal prototype, now
+ *  able to run against either of two cloud providers (Replicate or fal.ai) — see
+ *  `_lib/inpaintEnvFile.ts`'s own header for why a runtime choice, not a fixed one, is needed here.
+ *  The provider dropdown/status-sentence/key-input interaction below is a direct port of Universe's
+ *  `RixieApiKeySection` (packages/universe/src/components/SettingsPanel.tsx) — same "switching to an
+ *  already-configured provider activates it immediately, a new one just reveals its key field" rule —
+ *  adapted to VStudio's own flat-function API client and Tailwind styling instead of Universe's
+ *  bridge-object pattern and `--os-*` CSS variables.
+ *
+ *  Job phase state is LOCAL to this component (not the store), exactly like `ExportDialog` keeps its
+ *  own `Phase` state rather than putting it in `editorStore` — it's view-only and single-consumer, the
+ *  same reasoning that keeps it out of the store there. `removeObjectRect`/`removeObjectArmedClipId`
+ *  DO live in the store (see its own comment) since `RemoveObjectOverlay`, a completely different
+ *  component mounted over the Preview canvas, needs to read/drive the same drawn rectangle. */
+function RemoveObjectSection({ clipId, assetName, projectId }: { clipId: string; assetName: string; projectId: string | null }) {
+  const armRemoveObject = useEditorStore((s) => s.armRemoveObject);
+  const clearRemoveObject = useEditorStore((s) => s.clearRemoveObject);
+  const removeObjectArmedClipId = useEditorStore((s) => s.removeObjectArmedClipId);
+  const removeObjectRect = useEditorStore((s) => s.removeObjectRect);
+  const save = useEditorStore((s) => s.save);
+  const landInpaintedAsset = useEditorStore((s) => s.landInpaintedAsset);
+
+  const [available, setAvailable] = useState<boolean | null>(null);
+  const [status, setStatus] = useState<InpaintKeyStatus | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<InpaintProvider>("replicate");
+  const [keyInput, setKeyInput] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const [backgroundPrompt, setBackgroundPrompt] = useState("");
+
+  const [phase, setPhase] = useState<InpaintPhase>("idle");
+  const [stage, setStage] = useState<string>("");
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const jobIdRef = useRef<string | null>(null);
+  const unwatchRef = useRef<(() => void) | null>(null);
+
+  // Separate from the inpaint-job state above — "provisioning the local Python runtime" and "running
+  // a removal job" are different concerns that could otherwise be confused sharing one state shape.
+  const [setupPhase, setSetupPhase] = useState<LocalSetupPhase>("idle");
+  const [setupStage, setSetupStage] = useState<string>("");
+  const [setupProgress, setSetupProgress] = useState(0);
+  const setupJobIdRef = useRef<string | null>(null);
+  const setupUnwatchRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    // Checked separately from `inpaintAvailable()` (a combined FFmpeg+active-provider-key check,
+    // matching `exportAvailable`'s own single-precondition shape) so this section can tell the two
+    // "not ready" reasons apart and show the right one — a bare HEAD response can't distinguish them
+    // without a body, and "reinstall FFmpeg" is not an actionable message for a missing API key.
+    void inpaintAvailable().then(setAvailable);
+    void getInpaintKeyStatus().then((s) => {
+      if (s) setSelectedProvider(s.activeProvider);
+      setStatus(s);
+    });
+  }, []);
+
+  useEffect(() => () => unwatchRef.current?.(), []);
+  useEffect(() => () => setupUnwatchRef.current?.(), []);
+
+  const armed = removeObjectArmedClipId === clipId;
+  const rect = removeObjectRect?.clipId === clipId ? removeObjectRect : null;
+
+  async function handleProviderChange(next: InpaintProvider) {
+    setSelectedProvider(next);
+    setKeyInput("");
+    setError(null);
+    // Already has a key on file — switch straight to it, no re-entry needed. A provider with no
+    // saved key just updates the local selection; handleSaveKey below is what actually persists
+    // anything for it.
+    if (status?.configured[next] && next !== status.activeProvider) {
+      try {
+        await setActiveInpaintProvider(next);
+        setStatus((prev) => (prev ? { ...prev, activeProvider: next } : prev));
+        setAvailable(await inpaintAvailable());
+      } catch {
+        setError("Couldn't switch providers");
+      }
+    }
+  }
+
+  async function handleSaveKey() {
+    // Never reachable for "local" (the UI renders a setup button, not a key field, for it — see
+    // `credentialsBlock` below) — guarded here too since `setInpaintApiKey` has no key concept for it.
+    if (selectedProvider === "local" || !keyInput.trim()) return;
+    setSavingKey(true);
+    try {
+      await setInpaintApiKey(selectedProvider, keyInput);
+      setKeyInput("");
+      setStatus((prev) => ({
+        activeProvider: selectedProvider,
+        configured: { ...(prev?.configured ?? { replicate: false, fal: false, local: false }), [selectedProvider]: true },
+      }));
+      setAvailable(await inpaintAvailable());
+    } catch {
+      setError("Couldn't save that API key");
+    } finally {
+      setSavingKey(false);
+    }
+  }
+
+  async function handleStartLocalSetup() {
+    setError(null);
+    setSetupProgress(0);
+    setSetupStage("");
+    setSetupPhase("running");
+    try {
+      const started = await startLocalSetup();
+      setupJobIdRef.current = started.jobId;
+      setupUnwatchRef.current = watchLocalSetup(
+        started.jobId,
+        (update: LocalSetupProgress) => {
+          setSetupStage(update.stage);
+          setSetupProgress(update.progress);
+          setSetupPhase(update.status);
+          if (update.status === "done") {
+            // Also ACTIVATES local, not just marks it configured — the user explicitly set this up
+            // while it was selected, the same clear intent signal `handleSaveKey` already treats as
+            // "activate immediately" for the cloud providers. Without this, the real backend
+            // provider would stay whatever it was before, silently — the exact mismatch that let a
+            // job run against Replicate while the dropdown showed Local (CPU) selected.
+            setStatus((prev) => (prev ? { ...prev, activeProvider: "local", configured: { ...prev.configured, local: true } } : prev));
+            void setActiveInpaintProvider("local").catch(() => {});
+            void inpaintAvailable().then(setAvailable);
+          }
+          if (update.status === "failed" && update.error) setError(update.error);
+        },
+        (message) => setError(message)
+      );
+    } catch (err) {
+      setSetupPhase("failed");
+      setError(err instanceof Error ? err.message : "Could not start setup");
+    }
+  }
+
+  function stopLocalSetup() {
+    if (setupJobIdRef.current) void cancelLocalSetup(setupJobIdRef.current);
+    setSetupPhase("cancelled");
+  }
+
+  async function begin() {
+    if (!rect || !projectId) return;
+    setError(null);
+    setProgress(0);
+    setStage("");
+    setPhase("running");
+    // Same reasoning as ExportDialog's own `await save()` first: the server resolves this clip's
+    // sourceIn/sourceOut and the asset's relPath from the SAVED project file, so an unsaved trim
+    // would otherwise be silently ignored.
+    await save();
+    try {
+      const started = await startInpaint(projectId, clipId, rect, selectedProvider === "fal" ? backgroundPrompt : undefined);
+      jobIdRef.current = started.jobId;
+      unwatchRef.current = watchInpaint(
+        started.jobId,
+        (update: InpaintProgress) => {
+          setStage(update.stage);
+          setProgress(update.progress);
+          setPhase(update.status);
+          if (update.status === "done" && update.asset) landInpaintedAsset(update.asset);
+          if (update.status === "failed" && update.error) setError(update.error);
+        },
+        (message) => setError(message)
+      );
+    } catch (err) {
+      setPhase("failed");
+      setError(err instanceof Error ? err.message : "Could not start the job");
+    }
+  }
+
+  function stop() {
+    if (jobIdRef.current) void cancelInpaint(jobIdRef.current);
+    setPhase("cancelled");
+  }
+
+  function startOver() {
+    setPhase("idle");
+    setError(null);
+    clearRemoveObject();
+  }
+
+  if (available === null || status === null) {
+    return <p className="text-[12px] text-white/35">Checking…</p>;
+  }
+
+  const isActive = selectedProvider === status.activeProvider;
+  const isConfigured = status.configured[selectedProvider];
+  // Whether the SELECTED provider (what the dropdown shows) is actually the one that will run —
+  // both that it's ready AND that it's genuinely the active one server-side, not just
+  // `status.configured[status.activeProvider]` (the real active provider's own readiness). Using
+  // only the latter let a user select an unconfigured provider (e.g. Local before setup) while the
+  // REAL backend provider silently stayed whatever it was before — the dropdown showed the new
+  // selection, but "Remove Object" ran against the old, unswitched provider with no warning.
+  const ready = isActive && isConfigured;
+  const providerOptions: DropdownOption<InpaintProvider>[] = (Object.keys(INPAINT_PROVIDER_LABELS) as InpaintProvider[]).map((p) => ({
+    value: p,
+    label: `${INPAINT_PROVIDER_LABELS[p]}${status.configured[p] ? " ✓" : ""}`,
+  }));
+
+  // Provider switcher + key entry — always visible (not gated behind "unconfigured"), so a saved key
+  // can be replaced later too, not just entered for the first time. Uses the app's own `Dropdown`
+  // (NOT a native `<select>`) — see that component's own header comment: a native `<select>`'s open
+  // popup is unstyled OS chrome on Windows Chromium and does not honor this app's dark theme, which is
+  // exactly the bug a plain `<select>` here originally had. Mirrors `RixieApiKeySection`'s own
+  // interaction (packages/universe/src/components/SettingsPanel.tsx): picking an already-configured
+  // provider switches to it immediately; picking a fresh one just reveals its own empty key field.
+  const credentialsBlock = (
+    <div className="mb-3 space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wide text-white/40">Provider</span>
+        <Dropdown
+          value={selectedProvider}
+          options={providerOptions}
+          onChange={(v) => void handleProviderChange(v)}
+          ariaLabel="Remove Object provider"
+          disabled={phase === "running"}
+          className="w-32 text-[11px]"
+        />
+      </div>
+      <p className="text-[11px] text-white/35">
+        {selectedProvider === "local"
+          ? isConfigured
+            ? isActive
+              ? "Using Local (CPU)."
+              : "Switching to Local (CPU) — it's already set up."
+            : "Not set up yet."
+          : isActive
+            ? isConfigured
+              ? `Using ${INPAINT_PROVIDER_LABELS[selectedProvider]}.`
+              : `Set to ${INPAINT_PROVIDER_LABELS[selectedProvider]}, but no key is saved for it yet.`
+            : isConfigured
+              ? `Switching to ${INPAINT_PROVIDER_LABELS[selectedProvider]} — it already has a saved key.`
+              : `No key saved for ${INPAINT_PROVIDER_LABELS[selectedProvider]} yet.`}
+      </p>
+      {selectedProvider === "local" ? (
+        <>
+          <p className="text-[11px] leading-relaxed text-amber-300/80">
+            Runs ProPainter locally via Python — free, but{" "}
+            <span className="font-medium">non-commercial use only</span>. CPU inference is slow: expect
+            minutes per clip, and the very first run also downloads ~1-2GB of model weights.
+          </p>
+          {!isConfigured &&
+            (setupPhase === "running" ? (
+              <>
+                <p className="text-[11px] text-white/50 capitalize">{setupStage || "Starting…"}</p>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                  <div className="h-full rounded-full bg-sky-400 transition-all" style={{ width: `${Math.round(setupProgress * 100)}%` }} />
+                </div>
+                <button
+                  onClick={stopLocalSetup}
+                  className="rounded bg-white/5 px-2.5 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
+                >
+                  Cancel setup
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => void handleStartLocalSetup()}
+                className="w-full rounded bg-sky-500 py-1.5 text-[12px] font-medium text-white transition hover:bg-sky-400"
+              >
+                Set up local model
+              </button>
+            ))}
+        </>
+      ) : (
+        <div className="flex gap-2">
+          <input
+            type="password"
+            value={keyInput}
+            onChange={(e) => setKeyInput(e.target.value)}
+            placeholder={
+              isConfigured
+                ? "Paste a new key to replace the saved one"
+                : selectedProvider === "fal"
+                  ? "fal.ai API key"
+                  : "Replicate API token"
+            }
+            className="min-w-0 flex-1 rounded bg-white/5 px-2.5 py-1.5 text-[12px] text-white placeholder:text-white/30 focus:outline-none focus:ring-1 focus:ring-sky-400/60"
+          />
+          <button
+            onClick={() => void handleSaveKey()}
+            disabled={savingKey || !keyInput.trim()}
+            className="shrink-0 rounded bg-sky-500 px-3 py-1.5 text-[12px] font-medium text-white transition hover:bg-sky-400 disabled:opacity-50"
+          >
+            {savingKey ? "Saving…" : isConfigured ? "Replace" : "Save"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  if (!ready) {
+    return (
+      <>
+        <p className="mb-2 text-[12px] leading-relaxed text-white/50">
+          {selectedProvider === "local"
+            ? "Erases an object or watermark from this clip using a locally-run AI model — free, but slower than a cloud provider."
+            : "Erases an object or watermark from this clip using a cloud AI model. Needs an API key — the clip is sent there for processing."}
+        </p>
+        {credentialsBlock}
+        {error && <p className="text-[12px] text-rose-300">{error}</p>}
+      </>
+    );
+  }
+
+  if (!available) {
+    return (
+      <>
+        {credentialsBlock}
+        <p className="text-[12px] leading-relaxed text-rose-300">FFmpeg isn't available — reinstall dependencies to use this.</p>
+      </>
+    );
+  }
+
+  if (phase === "running") {
+    return (
+      <>
+        {credentialsBlock}
+        <p className="text-[12px] text-white/60 capitalize">{stage || "Starting…"}</p>
+        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+          <div className="h-full rounded-full bg-sky-400 transition-all" style={{ width: `${Math.round(progress * 100)}%` }} />
+        </div>
+        <button onClick={stop} className="mt-2 rounded bg-white/5 px-2.5 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white">
+          Cancel
+        </button>
+      </>
+    );
+  }
+
+  if (phase === "done") {
+    return (
+      <>
+        {credentialsBlock}
+        <p className="text-[12px] text-emerald-300">Added to the Media Library.</p>
+        <button onClick={startOver} className="mt-2 rounded bg-white/5 px-2.5 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white">
+          Start over
+        </button>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {credentialsBlock}
+      {error && <p className="mb-2 text-[12px] text-rose-300">{error}</p>}
+      {!rect ? (
+        <>
+          <p className="text-[12px] leading-relaxed text-white/50">
+            Draw a box over the object or watermark on the preview. Works best for a mostly-static
+            background — the same region is erased across the whole clip.
+          </p>
+          <button
+            onClick={() => armRemoveObject(clipId)}
+            className={`mt-2 w-full rounded py-1.5 text-[12px] font-medium transition ${
+              armed ? "bg-rose-500/30 text-white" : "bg-white/5 text-white/70 hover:bg-white/10 hover:text-white"
+            }`}
+          >
+            {armed ? "Drawing… click and drag on the preview" : "Draw region"}
+          </button>
+        </>
+      ) : (
+        <>
+          <p className="text-[12px] text-white/50">
+            Region: {Math.round(rect.width)}×{Math.round(rect.height)} px
+          </p>
+          <p className="mt-1 text-[11px] text-white/35">Result has no audio — "{assetName}"'s own audio isn't affected either way.</p>
+          {selectedProvider === "fal" && (
+            <input
+              type="text"
+              value={backgroundPrompt}
+              onChange={(e) => setBackgroundPrompt(e.target.value)}
+              placeholder="Describe the background that should appear (optional)"
+              className="mt-2 w-full rounded bg-white/5 px-2.5 py-1.5 text-[12px] text-white placeholder:text-white/30 focus:outline-none focus:ring-1 focus:ring-sky-400/60"
+            />
+          )}
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => void begin()} className="flex-1 rounded bg-sky-500 py-1.5 text-[12px] font-semibold text-white transition hover:bg-sky-400">
+              Remove Object
+            </button>
+            <button onClick={clearRemoveObject} className="rounded bg-white/5 px-3 py-1.5 text-[12px] text-white/60 transition hover:bg-white/10 hover:text-white">
+              Clear
+            </button>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 /** Properties for the current selection — timeline/source facts are read-only (renaming a clip's
  *  position happens by dragging it, not typing here), while Position/Scale/Rotation/Crop and
  *  Brightness/Contrast/Saturation/Blur/Opacity are real, wired-up, undo-able controls. Keyframes are
@@ -92,12 +529,36 @@ function AlignButton({ active, onClick, children }: { active: boolean; onClick: 
  *  that can animate over the clip's duration. */
 export function Inspector() {
   const project = useEditorStore((s) => s.project);
+  const projectId = useEditorStore((s) => s.projectId);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const run = useEditorStore((s) => s.run);
 
-  const selectedId = selectedClipIds[0];
+  // Exactly one clip, not just "at least one" — `selectedClipIds[0]` alone would still resolve to a
+  // real clip during a genuine multi-select (both/all of them normally still exist in the project), so
+  // checking that on its own silently showed clip[0]'s properties while a second, third, etc. clip was
+  // ALSO selected — editing a value then only affected that one clip, with nothing on screen to say a
+  // bigger selection existed. Requiring the selection to be a single clip is what actually reaches the
+  // "N clips selected" messaging below for a real multi-select, instead of that branch being live only
+  // for the edge case of a stale id.
+  const selectedId = selectedClipIds.length === 1 ? selectedClipIds[0] : undefined;
   const found = project && selectedId ? findClip(project, selectedId) : undefined;
   const fps = project?.sequence.fps ?? 30;
+
+  /** Which sections are collapsed — shared across every clip selected in this session (collapse
+   *  "Details" once, it stays collapsed switching to the next clip too, which is what makes
+   *  collapsing worth doing at all rather than just a per-clip toggle that resets itself away the
+   *  moment you select something else). "Details" (Timeline/Source/Media — all read-only reference
+   *  values, never what someone opens this panel TO edit) starts collapsed; every actually-editable
+   *  section starts open, preserving today's "everything visible" behavior for the common case. */
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(["Details"]));
+  function toggleSection(name: string) {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
 
   /** Reads the clip's current transform (defaulting to identity), patches ONE field, and dispatches
    *  it as a single command — this is the one place every transform field commits through, so
@@ -135,11 +596,18 @@ export function Inspector() {
 
       <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto p-3.5">
         {!found ? (
-          <p className="text-center text-[12px] leading-relaxed text-white/35">
-            {selectedClipIds.length > 1
-              ? `${selectedClipIds.length} clips selected`
-              : "Select a clip to see its properties"}
-          </p>
+          <div className="flex h-full flex-col items-center justify-center gap-1.5 px-2 text-center">
+            {selectedClipIds.length > 1 ? (
+              <>
+                <p className="text-[13px] font-medium text-white/60">{selectedClipIds.length} clips selected</p>
+                <p className="max-w-[200px] text-[11px] leading-relaxed text-white/35">
+                  Properties are shown one clip at a time — select just one to edit it.
+                </p>
+              </>
+            ) : (
+              <p className="text-[12px] leading-relaxed text-white/35">Select a clip to see its properties</p>
+            )}
+          </div>
         ) : (
           (() => {
             const { clip, track } = found;
@@ -156,8 +624,12 @@ export function Inspector() {
                     living on the asset's own style, not the video/image ClipTransform system — see
                     TextStyle's own doc comment for why). */}
                 {asset?.kind === "text" && (
-                  <div className="border-t border-white/10 pt-2">
-                    <SectionHeader accent="bg-violet-400">Text</SectionHeader>
+                  <CollapsibleSection
+                    title="Text"
+                    accent="bg-violet-400"
+                    open={!collapsed.has("Text")}
+                    onToggle={() => toggleSection("Text")}
+                  >
                     <TextContentField
                       value={asset.textContent ?? ""}
                       onCommit={(content) => run(new SetTextCommand(asset.id, content, asset.textStyle ?? DEFAULT_TEXT_STYLE))}
@@ -374,14 +846,18 @@ export function Inspector() {
                         </>
                       );
                     })()}
-                  </div>
+                  </CollapsibleSection>
                 )}
 
                 {/* Audio has nothing visual to position/scale/rotate/crop — the section simply isn't
                     shown for a clip on an audio track, rather than showing controls with no effect. */}
                 {track.kind === "video" && (
-                  <div className="border-t border-white/10 pt-3">
-                    <SectionHeader accent="bg-sky-400">Transform</SectionHeader>
+                  <CollapsibleSection
+                    title="Transform"
+                    accent="bg-sky-400"
+                    open={!collapsed.has("Transform")}
+                    onToggle={() => toggleSection("Transform")}
+                  >
                     {(() => {
                       const transform = clip.transform ?? IDENTITY_TRANSFORM;
                       return (
@@ -481,50 +957,71 @@ export function Inspector() {
                           <p className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wide text-white/30">
                             Crop
                           </p>
-                          <NumberField
-                            label="Top"
-                            value={transform.crop.top}
-                            suffix="%"
-                            step={1}
-                            min={0}
-                            max={100}
-                            toDisplay={(v) => v * 100}
-                            fromDisplay={(v) => v / 100}
-                            onCommit={(v) => patchCrop(clip.id, { top: v })}
-                          />
-                          <NumberField
-                            label="Right"
-                            value={transform.crop.right}
-                            suffix="%"
-                            step={1}
-                            min={0}
-                            max={100}
-                            toDisplay={(v) => v * 100}
-                            fromDisplay={(v) => v / 100}
-                            onCommit={(v) => patchCrop(clip.id, { right: v })}
-                          />
-                          <NumberField
-                            label="Bottom"
-                            value={transform.crop.bottom}
-                            suffix="%"
-                            step={1}
-                            min={0}
-                            max={100}
-                            toDisplay={(v) => v * 100}
-                            fromDisplay={(v) => v / 100}
-                            onCommit={(v) => patchCrop(clip.id, { bottom: v })}
-                          />
-                          <NumberField
-                            label="Left"
-                            value={transform.crop.left}
-                            suffix="%"
-                            step={1}
-                            min={0}
-                            max={100}
-                            toDisplay={(v) => v * 100}
-                            fromDisplay={(v) => v / 100}
-                            onCommit={(v) => patchCrop(clip.id, { left: v })}
-                          />
+                          {/* Paired by axis (Top/Bottom, then Left/Right) — same "reads as one concept,
+                              not two unrelated rows" reasoning Position's X/Y pairing above already
+                              uses, and it halves how much this section adds to the scroll a phone-sized
+                              Properties sheet already has plenty of. Each field keeps its own slider
+                              (narrower now, but still a full drag target within its own half). */}
+                          <div className="flex gap-3">
+                            <div className="flex-1">
+                              <NumberField
+                                label="Top"
+                                value={transform.crop.top}
+                                suffix="%"
+                                step={1}
+                                min={0}
+                                max={100}
+                                compact
+                                toDisplay={(v) => v * 100}
+                                fromDisplay={(v) => v / 100}
+                                onCommit={(v) => patchCrop(clip.id, { top: v })}
+                              />
+                            </div>
+                            <div className="flex-1">
+                              <NumberField
+                                label="Bottom"
+                                value={transform.crop.bottom}
+                                suffix="%"
+                                step={1}
+                                min={0}
+                                max={100}
+                                compact
+                                toDisplay={(v) => v * 100}
+                                fromDisplay={(v) => v / 100}
+                                onCommit={(v) => patchCrop(clip.id, { bottom: v })}
+                              />
+                            </div>
+                          </div>
+                          <div className="flex gap-3">
+                            <div className="flex-1">
+                              <NumberField
+                                label="Left"
+                                value={transform.crop.left}
+                                suffix="%"
+                                step={1}
+                                min={0}
+                                max={100}
+                                compact
+                                toDisplay={(v) => v * 100}
+                                fromDisplay={(v) => v / 100}
+                                onCommit={(v) => patchCrop(clip.id, { left: v })}
+                              />
+                            </div>
+                            <div className="flex-1">
+                              <NumberField
+                                label="Right"
+                                value={transform.crop.right}
+                                suffix="%"
+                                step={1}
+                                min={0}
+                                max={100}
+                                compact
+                                toDisplay={(v) => v * 100}
+                                fromDisplay={(v) => v / 100}
+                                onCommit={(v) => patchCrop(clip.id, { right: v })}
+                              />
+                            </div>
+                          </div>
                           {clip.transform && (
                             <button
                               onClick={() => run(new SetClipTransformCommand(clip.id, IDENTITY_TRANSFORM))}
@@ -536,7 +1033,22 @@ export function Inspector() {
                         </>
                       );
                     })()}
-                  </div>
+                  </CollapsibleSection>
+                )}
+
+                {/* Video only, stricter than Transform's own "video track" gate above — a video track
+                    can hold an IMAGE clip too, but ProPainter (the model behind this tool) is a video-
+                    inpainting model with no still-image mode, so an image clip has nothing for it to
+                    do. `RemoveObjectOverlay`'s own resolved-clip lookup uses this identical check. */}
+                {track.kind === "video" && asset?.kind === "video" && (
+                  <CollapsibleSection
+                    title="Remove Object"
+                    accent="bg-teal-400"
+                    open={!collapsed.has("Remove Object")}
+                    onToggle={() => toggleSection("Remove Object")}
+                  >
+                    <RemoveObjectSection clipId={clip.id} assetName={asset.name} projectId={projectId} />
+                  </CollapsibleSection>
                 )}
 
                 {/* Same video/image-only scope as Transform above (audio has nothing to color-adjust,
@@ -544,8 +1056,12 @@ export function Inspector() {
                     animatable over the clip's duration (see ClipEffects's own doc comment for the
                     preview/export approximation notes on brightness/blur specifically). */}
                 {track.kind === "video" && (
-                  <div className="border-t border-white/10 pt-3">
-                    <SectionHeader accent="bg-amber-400">Effects</SectionHeader>
+                  <CollapsibleSection
+                    title="Effects"
+                    accent="bg-amber-400"
+                    open={!collapsed.has("Effects")}
+                    onToggle={() => toggleSection("Effects")}
+                  >
                     {(() => {
                       const effects = clip.effects ?? IDENTITY_EFFECTS;
                       return (
@@ -614,7 +1130,7 @@ export function Inspector() {
                         </>
                       );
                     })()}
-                  </div>
+                  </CollapsibleSection>
                 )}
 
                 {/* Shown only when there's genuinely a preceding, zero-gap clip on this track to
@@ -627,8 +1143,12 @@ export function Inspector() {
                     if (!candidate) return null;
                     const transitionIn = clip.transitionIn;
                     return (
-                      <div className="border-t border-white/10 pt-3">
-                        <SectionHeader accent="bg-fuchsia-400">Transition In</SectionHeader>
+                      <CollapsibleSection
+                        title="Transition In"
+                        accent="bg-fuchsia-400"
+                        open={!collapsed.has("Transition In")}
+                        onToggle={() => toggleSection("Transition In")}
+                      >
                         <label className="flex items-center justify-between gap-2 py-1.5 text-[12px] text-white/70">
                           <span>Crossfade from previous clip</span>
                           <input
@@ -649,7 +1169,7 @@ export function Inspector() {
                             onCommit={(v) => run(new SetClipTransitionCommand(clip.id, { ...transitionIn, duration: v }))}
                           />
                         )}
-                      </div>
+                      </CollapsibleSection>
                     );
                   })()}
 
@@ -657,8 +1177,12 @@ export function Inspector() {
                     audio track — a video clip's own embedded sound and a music/voiceover clip are the
                     same kind of toggle, just living on different track kinds. */}
                 {asset?.hasAudio && (
-                  <div className="border-t border-white/10 pt-3">
-                    <SectionHeader accent="bg-rose-400">Audio</SectionHeader>
+                  <CollapsibleSection
+                    title="Audio"
+                    accent="bg-rose-400"
+                    open={!collapsed.has("Audio")}
+                    onToggle={() => toggleSection("Audio")}
+                  >
                     <label className="flex items-center justify-between gap-2 py-1.5 text-[12px] text-white/70">
                       <span>Mute clip</span>
                       <input
@@ -683,31 +1207,41 @@ export function Inspector() {
                       fromDisplay={(v) => v / 100}
                       onCommit={(v) => run(new SetClipGainCommand(clip.id, v))}
                     />
-                  </div>
+                  </CollapsibleSection>
                 )}
 
-                <div className="border-t border-white/10 pt-3">
-                  <SectionHeader accent="bg-white/30">Timeline</SectionHeader>
+                {/* Timeline/Source/Media merged into one "Details" section, collapsed by default (see
+                    `collapsed`'s own initializer) — all three are pure read-only reference facts, never
+                    what opening this panel is FOR, so folding them under one closed-by-default toggle
+                    is what actually shortens the common "adjust a clip's properties" scroll instead of
+                    just rearranging the same always-visible length into fewer headers. Sub-groups keep
+                    their own small caption (same style Transform's Position/Scale/Rotation/Crop already
+                    use) so the three kinds of fact stay visually distinct within the one section. */}
+                <CollapsibleSection
+                  title="Details"
+                  accent="bg-white/30"
+                  open={!collapsed.has("Details")}
+                  onToggle={() => toggleSection("Details")}
+                >
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-white/30">Timeline</p>
                   <Row label="Start" value={formatTimecode(clip.timelineStart, fps)} />
                   <Row label="End" value={formatTimecode(clip.timelineStart + clipDuration(clip), fps)} />
                   <Row label="Duration" value={formatTimecode(clipDuration(clip), fps)} />
-                </div>
 
-                <div className="border-t border-white/10 pt-3">
-                  <SectionHeader accent="bg-white/30">Source</SectionHeader>
+                  <p className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wide text-white/30">Source</p>
                   <Row label="In" value={formatTimecode(clip.sourceIn, fps)} />
                   <Row label="Out" value={formatTimecode(clip.sourceOut, fps)} />
                   {asset && <Row label="Full length" value={formatTimecode(asset.duration, fps)} />}
-                </div>
 
-                {asset && (asset.width || asset.fps) && (
-                  <div className="border-t border-white/10 pt-3">
-                    <SectionHeader accent="bg-white/30">Media</SectionHeader>
-                    {asset.width && asset.height && <Row label="Size" value={`${asset.width}×${asset.height}`} />}
-                    {asset.fps && <Row label="Rate" value={`${Math.round(asset.fps)} fps`} />}
-                    <Row label="Audio" value={asset.hasAudio ? "Yes" : "No"} />
-                  </div>
-                )}
+                  {asset && (asset.width || asset.fps) && (
+                    <>
+                      <p className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wide text-white/30">Media</p>
+                      {asset.width && asset.height && <Row label="Size" value={`${asset.width}×${asset.height}`} />}
+                      {asset.fps && <Row label="Rate" value={`${Math.round(asset.fps)} fps`} />}
+                      <Row label="Audio" value={asset.hasAudio ? "Yes" : "No"} />
+                    </>
+                  )}
+                </CollapsibleSection>
               </div>
             );
           })()

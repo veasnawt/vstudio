@@ -1,28 +1,14 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { Maximize, Pause, Play, SkipBack, SkipForward, StepBack, StepForward } from "@veasnawt/vicons";
+import { Maximize, Pause, Play, Redo, SkipBack, SkipForward, StepBack, StepForward, Undo } from "@veasnawt/vicons";
 import { mediaUrl } from "../api/client.ts";
 import { sequenceDuration } from "../project/createProject.ts";
 import { PlaybackEngine } from "../playback/PlaybackEngine.ts";
 import { useEditorStore } from "../store/editorStore.ts";
-import { formatTimecode } from "../timeline/time.ts";
 import { TransformHandles } from "./TransformHandles.tsx";
 import { TextTransformHandles } from "./TextTransformHandles.tsx";
-
-/** Isolated so ONLY this readout re-renders as the playhead advances during playback — not the whole
- *  toolbar and canvas wrapper around it. `PlaybackEngine` updates the store's `playhead` on every
- *  animation frame while playing; subscribing to it any higher up the tree than necessary means
- *  React reconciles that entire subtree 30-60 times a second, competing with the canvas draw for
- *  main-thread time and being the actual cause of a choppy-looking preview. */
-function CurrentTime({ fps }: { fps: number }) {
-  const playhead = useEditorStore((s) => s.playhead);
-  return (
-    <span role="timer" aria-live="off" aria-label="Current time" className="text-white/90">
-      {formatTimecode(playhead, fps)}
-    </span>
-  );
-}
+import { RemoveObjectOverlay } from "./RemoveObjectOverlay.tsx";
 
 function ControlButton({
   onClick,
@@ -106,6 +92,10 @@ export function Preview() {
   const togglePlay = useEditorStore((s) => s.togglePlay);
   const stepFrames = useEditorStore((s) => s.stepFrames);
   const setPlayhead = useEditorStore((s) => s.setPlayhead);
+  const canUndo = useEditorStore((s) => s.canUndo);
+  const canRedo = useEditorStore((s) => s.canRedo);
+  const undo = useEditorStore((s) => s.undo);
+  const redo = useEditorStore((s) => s.redo);
 
   // The engine is created once and reads live state through getters rather than taking props. If it
   // were re-created whenever the project changed, every edit would tear down and rebuild the media
@@ -163,7 +153,6 @@ export function Preview() {
   }, [project?.sequence.width, project?.sequence.height]);
 
   const total = project ? sequenceDuration(project) : 0;
-  const fps = project?.sequence.fps ?? 30;
   const empty = total <= 0;
 
   return (
@@ -190,6 +179,7 @@ export function Preview() {
           />
           <TransformHandles canvas={canvas} />
           <TextTransformHandles canvas={canvas} />
+          <RemoveObjectOverlay canvas={canvas} />
           {empty && (
             <p className="pointer-events-none absolute text-xs text-white/35">
               Add a clip to the timeline to see it here
@@ -209,9 +199,19 @@ export function Preview() {
           middle (Preview) column and reachable only under Media/Inspector where nothing else overlaps
           it — exactly the bug this replaced. */}
       <div className="pointer-events-none relative flex items-center border-t border-white/10 px-3 py-2">
-        {/* Absolutely positioned and centered on the BAR, not just on the leftover space next to the
-            resolution readout — a plain flex row with `ml-auto` on that readout leaves this cluster
-            sitting wherever its own width happens to land, which is the left-hugging look this fixes. */}
+        {/* Undo/redo bookend this row (far left/right) around the centered playback cluster — moved
+            here from the bottom toolbar so they sit directly next to the controls they most often
+            follow (undo a trim, immediately hit play to check it), and so that already-crowded
+            icon-only row (see its own comment on running out of phone width) has two fewer buttons. */}
+        <div className="pointer-events-auto z-30 flex items-center">
+          <ControlButton onClick={undo} label="Undo (Ctrl+Z)" disabled={!canUndo}>
+            <Undo size={16} />
+          </ControlButton>
+        </div>
+
+        {/* Absolutely positioned and centered on the BAR, not just on the leftover space between the
+            undo/redo buttons — a plain flex row would only visually center if both sides happened to
+            be the same width, which is the left/right-hugging look this fixes. */}
         <div className="pointer-events-auto absolute left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
           <ControlButton onClick={() => setPlayhead(0)} label="Go to start" disabled={empty}>
             <SkipBack size={16} />
@@ -228,19 +228,9 @@ export function Preview() {
           <ControlButton onClick={() => setPlayhead(total)} label="Go to end" disabled={empty}>
             <SkipForward size={16} />
           </ControlButton>
-
-          <div className="ml-3 flex items-baseline gap-1.5 font-mono text-xs tabular-nums">
-            {/* role="timer" + aria-live announces the position to a screen reader as it changes,
-                rather than leaving the most important readout in the app silent. */}
-            <CurrentTime fps={fps} />
-            <span className="text-white/30">/</span>
-            <span aria-label="Total duration" className="text-white/45">
-              {formatTimecode(total, fps)}
-            </span>
-          </div>
         </div>
 
-        {/* `ml-auto` on this WRAPPER (not the resolution readout itself) so the fullscreen button stays
+        {/* `ml-auto` on this WRAPPER (not the resolution readout itself) so the fullscreen/redo stay
             pushed to the right and reachable at every width, even below `xl` where the readout goes
             `hidden` — see that span's own comment for why it specifically is hidden there. */}
         <div className="pointer-events-auto z-30 ml-auto flex items-center gap-2">
@@ -265,6 +255,9 @@ export function Preview() {
               <Maximize size={16} />
             </ControlButton>
           )}
+          <ControlButton onClick={redo} label="Redo (Ctrl+Shift+Z)" disabled={!canRedo}>
+            <Redo size={16} />
+          </ControlButton>
         </div>
       </div>
     </section>

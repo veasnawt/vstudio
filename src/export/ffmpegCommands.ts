@@ -99,3 +99,88 @@ export function buildWaveformArgs(input: string, output: string): string[] {
     "-y", output,
   ];
 }
+
+/** Builds args for extracting one clip's trimmed source range to a standalone file — the first step
+ *  of the "Remove Object" inpainting pipeline, which needs a plain video file to send to the cloud
+ *  model, not a reference into a larger source the model has no notion of trimming.
+ *
+ *  `-ss` BEFORE `-i` (fast input-side seeking, snapped to the nearest keyframe at or before the
+ *  target) rather than after `-i` (frame-accurate but slow, decodes from the start every time) — a
+ *  few frames of imprecision at the head doesn't matter here the way it would for the main timeline's
+ *  own export, because the very next pipeline step probes THIS file's own actual resulting duration
+ *  (not `end - start`) before building the matching mask video, so the two always agree with each
+ *  other regardless of exactly where the seek landed. Re-encodes (`-c:v libx264`, not `-c copy`)
+ *  since `start`/`end` are arbitrary trim points, not necessarily keyframe-aligned — a stream copy can
+ *  only cut on keyframes. `-an`: the inpainting model needs no audio, and the result won't carry any
+ *  either (a v1 scope cut, not an oversight). */
+export function buildExtractClipArgs(input: string, output: string, startSeconds: number, endSeconds: number): string[] {
+  const start = Math.max(0, startSeconds);
+  // Clamped against the ALREADY-clamped start, not the raw one — otherwise a negative `endSeconds`
+  // (e.g. both start and end negative) could clamp to a value below the real `-ss`, producing an
+  // inverted (and ffmpeg-rejected) range instead of the empty-but-valid one intended.
+  const end = Math.max(start, endSeconds);
+  return [
+    "-ss", String(start),
+    "-to", String(end),
+    "-i", input,
+    "-c:v", "libx264",
+    "-an",
+    "-y", output,
+  ];
+}
+
+/** Builds args for a black/white mask video for the "Remove Object" inpainting feature — solid black
+ *  everywhere except a solid white rectangle over the region to erase, matching the video-inpainting
+ *  convention (white = inpaint this, black = keep) the ProPainter model expects. A single synthetic
+ *  `color` lavfi source (the same trick `buildWaveformArgs` above already uses for its transparent
+ *  backdrop) plus one `drawbox` filter — no real video input needed at all, just the extracted clip's
+ *  own already-probed dimensions/duration, since the mask has to match that file frame-for-frame.
+ *
+ *  `-pix_fmt yuv420p` matters here specifically: a raw black/white `drawbox` output can otherwise land
+ *  in a pixel format an inpainting model's ingestion misreads as non-binary, so it's pinned explicitly
+ *  rather than left to ffmpeg's own default for a `lavfi` source. */
+export function buildMaskVideoArgs(
+  output: string,
+  width: number,
+  height: number,
+  fps: number,
+  durationSeconds: number,
+  rect: { x: number; y: number; width: number; height: number }
+): string[] {
+  const safeDuration = Math.max(0.1, durationSeconds);
+  const x = Math.max(0, Math.round(rect.x));
+  const y = Math.max(0, Math.round(rect.y));
+  const w = Math.max(1, Math.round(rect.width));
+  const h = Math.max(1, Math.round(rect.height));
+  return [
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${width}x${height}:r=${fps}:d=${safeDuration}`,
+    "-vf", `drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=white:t=fill`,
+    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    "-y", output,
+  ];
+}
+
+/** Builds args for a black/white mask IMAGE (single still frame, not a video) — the local ProPainter
+ *  CLI's `--mask` flag only accepts a static image or a folder of per-frame images, never a video file
+ *  (unlike the cloud providers' input schemas, which take a mask video). Since VStudio's "Remove
+ *  Object" already applies ONE rectangle across a clip's whole duration, a single static image is both
+ *  sufficient and simpler than `buildMaskVideoArgs` above — no duration/fps/video-codec concerns. */
+export function buildMaskImageArgs(
+  output: string,
+  width: number,
+  height: number,
+  rect: { x: number; y: number; width: number; height: number }
+): string[] {
+  const x = Math.max(0, Math.round(rect.x));
+  const y = Math.max(0, Math.round(rect.y));
+  const w = Math.max(1, Math.round(rect.width));
+  const h = Math.max(1, Math.round(rect.height));
+  return [
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${width}x${height}`,
+    "-vf", `drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=white:t=fill`,
+    "-frames:v", "1",
+    "-y", output,
+  ];
+}

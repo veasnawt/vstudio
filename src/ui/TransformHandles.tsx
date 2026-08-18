@@ -28,7 +28,10 @@ const ALIGN_SNAP_PIXELS = 8;
 const DRAG_THRESHOLD = 3;
 // 16px, not the tighter 12px a mouse cursor could still land precisely — this is a real touch target
 // now (see beginDrag's touch support below), and 12px is close to ungrabbable with a fingertip.
-const HANDLE_SIZE = 16;
+// 16px read as too small to reliably hit on a touch device (confirmed dragging these one-handed on a
+// phone-sized viewport during a mobile UX pass) — 24px keeps the dots visually unobtrusive against a
+// full preview frame while roughly doubling the actual hit area (scales with the square of the size).
+const HANDLE_SIZE = 24;
 const ROTATE_HANDLE_OFFSET = 28;
 
 type DragMode = "move" | "scale" | "rotate";
