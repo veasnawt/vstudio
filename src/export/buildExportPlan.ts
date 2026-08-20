@@ -219,7 +219,20 @@ function buildTransformFilters(params: {
   // eq's own defaults (brightness=0, contrast=1, saturation=1) are genuine no-ops, so — unlike
   // gblur/colorchannelmixer below — it's always safe to include unconditionally, no identity check
   // needed for this one fragment.
-  const eqFilter = `eq=brightness=${n(effects.brightness)}:contrast=${n(effects.contrast)}:saturation=${n(effects.saturation)}`;
+  //
+  // NOT actually `eq=brightness=...:contrast=...:saturation=...` — `eq` is one of FFmpeg's own
+  // GPL-only filters (see FFmpeg's "GPL Licensed Filters" list), so it doesn't exist in the LGPL
+  // build the mobile app ships (see apps/mobile/ios/App/FFmpegKitLGPL's own comment on why that
+  // build was chosen over a GPL one). This reproduces eq's exact per-plane math instead — from
+  // FFmpeg's own vf_eq.c: luma gets `contrast*(v-0.5)+0.5+brightness` (v normalized to 0..1), chroma
+  // gets the identical formula with `saturation` standing in for `contrast` and brightness pinned at
+  // 0 — via `lutyuv`, which isn't GPL-gated. Same visual result, not an approximation; written
+  // directly in the 0..255 pixel domain (127.5 standing in for eq's 0.5 midpoint) rather than
+  // normalizing to 0..1 and back, since lutyuv's `val` is already the raw 8-bit sample.
+  const eqFilter =
+    `lutyuv=y='clip((val-127.5)*${n(effects.contrast)}+127.5+${n(effects.brightness * 255)},0,255)'` +
+    `:u='clip((val-127.5)*${n(effects.saturation)}+127.5,0,255)'` +
+    `:v='clip((val-127.5)*${n(effects.saturation)}+127.5,0,255)'`;
   // Applied AFTER scale, not before — so `blur`'s sigma corresponds to the clip's FINAL on-screen
   // pixel size, matching both the "pixels" unit the Inspector's slider promises and how Canvas2D's
   // own `context.filter` blurs the already-scaled draw, not the source's native resolution. Only
