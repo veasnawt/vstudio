@@ -3,7 +3,7 @@ import type { ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorGrading,
 import { isIdentityColorGrading, isIdentityEffects, isIdentityTextCrop } from "../project/types.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
 import { applyColorGrading, buildCurveLut, composeLuts } from "../timeline/colorCurves.ts";
-import { resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextStyle } from "../timeline/keyframes.ts";
+import { resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextCrop, resolveTextStyle } from "../timeline/keyframes.ts";
 import { audibleClips, clipAtTime } from "../timeline/queries.ts";
 import {
   activeWordIndex,
@@ -1157,11 +1157,13 @@ export class PlaybackEngine {
       // A frame-space mask, independent of the text's own position/animation — see `TextCrop`'s own
       // doc comment. Established here, BEFORE any of the transition/animation draws below, so the
       // window stays fixed in place regardless of what `drawAnimatedText`'s bounce/pulse/wiggle
-      // transforms or the transition compositors do to the content drawn inside it. Only THIS clip's
-      // own `textCrop` gates a transition blend — a differently-cropped partner clip's own crop isn't
-      // independently respected mid-blend, a deliberate v1 simplification (crop isn't keyframed and
-      // transitions are transient, so this is a narrow, rare edge).
-      const textCrop = overrides.find((o) => o.clipId === clip.id)?.textCrop ?? clip.textCrop;
+      // transforms or the transition compositors do to the content drawn inside it. Falls through to
+      // `resolveTextCrop` (a keyframed clip's interpolated crop at THIS instant) rather than the clip's
+      // raw static `textCrop` directly — same "live override wins outright, otherwise resolve
+      // keyframes" order `style` just above already uses. Only THIS clip's own crop gates a transition
+      // blend — a differently-cropped partner clip's own crop isn't independently respected mid-blend,
+      // a deliberate v1 simplification (transitions are transient, so this is a narrow, rare edge).
+      const textCrop = overrides.find((o) => o.clipId === clip.id)?.textCrop ?? resolveTextCrop(clip, elapsed);
       const cropRect =
         textCrop && !isIdentityTextCrop(textCrop)
           ? {

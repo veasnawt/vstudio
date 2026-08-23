@@ -14,6 +14,7 @@ import {
   setClipMuted,
   setClipTextAnimation,
   setClipTextCrop,
+  setClipTextCropKeyframes,
   setClipTextStyleKeyframes,
   setClipTransform,
   setClipTransformKeyframes,
@@ -1573,6 +1574,175 @@ describe("buildExportPlan with keyframed text style", () => {
   });
 });
 
+describe("buildExportPlan with keyframed text crop", () => {
+  it("a non-keyframed clip's filter graph is byte-for-byte unchanged, no split= for crop (regression)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCrop(project, textClip.id, { top: 0.1, right: 0, bottom: 0, left: 0 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("split="), "a static crop must never go through the slicing machinery");
+    assert.equal((graph.match(/crop=w=/g) ?? []).length, 1);
+  });
+
+  it("a single crop keyframe (a short clip, one slice) collapses to the plain crop/pad/overlay path, no split=", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    // Short enough (< the 0.15s slicing interval) that even the ADAPTIVE recompute lands on exactly
+    // one slice — the case that must collapse to the same shape a static crop already uses.
+    project = trimClip(project, textClip.id, "out", 0.1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCropKeyframes(project, textClip.id, [{ id: "kf1", time: 0, value: { top: 0.1, right: 0, bottom: 0, left: 0 } }]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("split="), "a single crop slice must not pay for an untested split=1 construct");
+    assert.equal((graph.match(/crop=w=/g) ?? []).length, 1);
+    assert.match(graph, /\[txt0_iso\]crop=w=1080\.000000:h=1728\.000000:x=0\.000000:y=192\.000000/);
+  });
+
+  it("slices into the expected number of chained crop/pad/overlay stages for a known keyframe gap", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    // Trim to exactly 1 second so the keyframe pair spans the clip's ENTIRE duration (no extra tail
+    // segment past the last keyframe to also subdivide) — one 1s gap -> ceil(1/0.15) = 7 slices, the
+    // same arithmetic the keyframed-text-style tests above already establish.
+    project = trimClip(project, textClip.id, "out", 1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCropKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "kf2", time: 1, value: { top: 0, right: 0, bottom: 0.5, left: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[txt0_iso\]split=7\[/);
+    assert.equal((graph.match(/crop=w=/g) ?? []).length, 7);
+    assert.equal((graph.match(/overlay=/g) ?? []).length, 7);
+  });
+
+  it("chains slices with telescoping, gap-free enable= windows, from t=0 to the clip's own end", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCropKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "kf2", time: 1, value: { top: 0, right: 0, bottom: 0.5, left: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    const windows = [...graph.matchAll(/overlay=format=auto:enable='between\(t\\,([\d.]+)\\,([\d.]+)\)'/g)].map((m) => [
+      Number(m[1]),
+      Number(m[2]),
+    ]);
+    assert.equal(windows.length, 7);
+    assert.equal(windows[0][0], 0, "the first slice's own window starts at the clip's own timeline start");
+    assert.equal(windows[windows.length - 1][1], 1, "the last slice's own window ends at the clip's own end (no fade here)");
+    for (let i = 1; i < windows.length; i++) {
+      assert.equal(windows[i][0], windows[i - 1][1], "consecutive slices telescope with no gap or overlap");
+    }
+  });
+
+  it("two slices produce genuinely different crop rectangles, proving real interpolation reached the filter string", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCropKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "kf2", time: 5, value: { top: 0, right: 0, bottom: 0.5, left: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+    const heights = [...graph.matchAll(/crop=w=1080\.000000:h=(\d+\.\d+)/g)].map((m) => Number(m[1]));
+
+    assert.ok(heights.length >= 2, "expected multiple slices, each with their own crop height");
+    assert.notEqual(heights[0], heights[heights.length - 1], "first and last slice must resolve to different crop rectangles");
+    // First slice should be close to the identity keyframe's full height, last close to the halved one.
+    assert.ok(heights[0] > 1800, `first slice should be nearly uncropped, got height=${heights[0]}`);
+    assert.ok(heights[heights.length - 1] < 1100, `last slice should be nearly halved, got height=${heights[heights.length - 1]}`);
+  });
+
+  it("composes with textStyleKeyframes: crop's own split= reads from the FULLY-rendered style output, both animate independently", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "s1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "s2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+    project = setClipTextCropKeyframes(project, textClip.id, [
+      { id: "c1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "c2", time: 0.5, value: { top: 0, right: 0, bottom: 0.3, left: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok((graph.match(/drawtext=/g) ?? []).length > 1, "style keyframes still slice the drawtext chain");
+    assert.match(graph, /\[txt0_iso\]split=\d+\[/, "crop's own split= reads from the isolated buffer style keyframing renders into, not [cv0] or an intermediate drawtext step");
+    assert.ok((graph.match(/crop=w=/g) ?? []).length > 1, "crop keyframes independently slice too");
+  });
+
+  it("composes with rotation: crop still wraps the rotated per-slice text result", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Spin")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Spin", { ...DEFAULT_TEXT_STYLE, rotationDeg: 45 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCropKeyframes(project, textClip.id, [
+      { id: "c1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "c2", time: 1, value: { top: 0.2, right: 0, bottom: 0, left: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /rotate=a=45\.000000\*PI\/180.*\[txt0_iso\]/, "the rotated path's own final overlay still targets the isolated buffer");
+    assert.match(graph, /\[txt0_iso\]split=7\[/, "crop picks up the ALREADY-rotated result, same isolated-buffer redirect the static-crop rotated test uses");
+    assert.equal((graph.match(/crop=w=/g) ?? []).length, 7);
+  });
+
+  it("a crop-less clip with textStyleKeyframes is unaffected — no split= for crop at all (regression)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "s1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "s2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("_iso"), "no crop means no isolated-buffer redirect at all");
+    assert.ok(!graph.includes("split="), "no crop means no crop-slicing split=");
+    assert.ok(!graph.includes("crop="));
+  });
+});
+
 describe("buildExportPlan wordHighlight with ASS/libass capability", () => {
   // A tiny fake `AssFontMetrics` resolver — real font-byte parsing is `readAssFontMetrics`'s own job
   // (see fonts.test.ts), tested separately; this only needs to exercise buildExportPlan's OWN wiring.
@@ -1635,6 +1805,33 @@ describe("buildExportPlan wordHighlight with ASS/libass capability", () => {
     assert.equal(end0, start1, "each event's end is exactly the next one's start — no gap, no overlap");
     assert.equal(end1, start2);
     assert.equal(end2, "0:00:" + clipEnd(clip).toFixed(2).padStart(5, "0"), "the LAST event extends to the clip's own end, not just one more word-width");
+  });
+
+  it("\\pos()'s own comma is NOT backslash-escaped — regression: an escaped comma makes libass silently fail to parse \\pos and fall back to default margin placement", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Left Aligned")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Left Aligned", { ...DEFAULT_TEXT_STYLE, align: "left", offsetX: 60, offsetY: -300 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const ass = written.content!;
+
+    // Confirmed against the real bundled libass: `\pos(100.00\,660.00)` (escaped comma) silently fails
+    // to parse and the text falls back to the Style's own MarginL/Alignment-based position instead —
+    // no error, no warning, just a wrong on-screen position. `\pos`'s comma is the override TAG's own
+    // argument separator, not a Dialogue-line CSV field separator, so it must never be escaped — unlike
+    // this file's pervasive FFmpeg-expression convention (`between(t\,x\,y)`) an earlier version of
+    // this line was apparently copied from.
+    assert.ok(!ass.includes("\\pos(") || !/\\pos\([\d.]+\\,/.test(ass), "\\pos()'s comma must not be backslash-escaped");
+    // 1080-wide frame, align:"left" -> anchorX = TEXT_MARGIN_PX(40) + offsetX(60) = 100; anchorY =
+    // frameHeight/2(960) + offsetY(-300) = 660 — the exact same anchor `buildDrawTextFilter`'s own
+    // `x`/`y` formulas resolve to for the same style, so a wordHighlight clip lands where a plain text
+    // clip with identical style would.
+    assert.match(ass, /\{\\pos\(100\.00,660\.00\)\}/);
   });
 
   it("wraps exactly the active word's run in the highlight color, leaving the others in the base color", () => {
@@ -1955,6 +2152,136 @@ describe("buildExportPlan with transitions", () => {
       graph,
       /lutyuv=y='clip\(\(val-127\.5\)\*1\.000000\+127\.5\+0\.000000,0,255\)':u='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)':v='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)'/
     );
+  });
+});
+
+describe("buildExportPlan's two different text fade-out timings: solo vs. a real crossfade", () => {
+  // Regression coverage for a real, confirmed pair of bugs. A text clip's own fade-out is either a
+  // SOLO fade to nothing (`setClipTransitionOut`, nothing follows) or a REAL crossfade into whatever
+  // clip follows it directly (`setClipTransitionIn` on the next clip) — these need DIFFERENT timing.
+  // Originally BOTH were rendered identically (extending the visible window PAST the clip's own nominal
+  // end, from `end` to `end+duration`), which is only correct for the real-crossfade case (it needs to
+  // stay visible past its own end to genuinely overlap the incoming clip's own fade-in). For a SOLO
+  // fade, that meant the clip stayed fully opaque for its ENTIRE nominal duration, then kept lingering
+  // fading out for `duration` MORE seconds past where its own clip bar visually ends in the editor —
+  // and since nothing else in the project necessarily ran that long, the exported video would often
+  // just END mid-ramp, at full opacity, before the fade ever became visible at all ("the out transition
+  // isn't applied" as reported). Fixed on two fronts: a solo fade now ramps DURING the clip's own
+  // existing tail (`[end-duration, end]`, reaching fully invisible EXACTLY at `end`), matching
+  // `PlaybackEngine`'s own solo-reveal preview timing exactly and needing no extra export duration at
+  // all; a real crossfade keeps the original `[end, end+duration]` extended timing, which DOES still
+  // need the overall export duration to cover it (`computeTextFadeOutExtendedDuration`).
+
+  it("a solo transitionOut (nothing follows) needs NO extra duration — it fades within its own existing tail", () => {
+    const base = emptyProject([videoAsset("asset1", 2), textAsset("text1", "Fade")]);
+    let project = addTrack(base, "text");
+    project = addClip(project, videoTrackId(project), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 2);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTransitionOut(project, textClip.id, { duration: 1, type: "crossfade" });
+
+    const { duration } = plan(project);
+
+    assert.ok(closeTo(duration, 2), `a solo fade-out must not extend the export past the clip's own nominal end, got ${duration}`);
+  });
+
+  it("a solo transitionOut's own alpha ramp lands in [end-duration, end], reaching 0 exactly at the clip's own end", () => {
+    const base = emptyProject([videoAsset("asset1", 2), textAsset("text1", "Fade")]);
+    let project = addTrack(base, "text");
+    project = addClip(project, videoTrackId(project), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 2);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTransitionOut(project, textClip.id, { duration: 1, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    // The ramp term is `(end-t)/duration` — reaches 1 at t=end-duration=1, 0 at t=end=2 — and the
+    // `enable` window's own end stays at the clip's plain `end` (2), never extended.
+    assert.match(graph, /alpha='min\(1\\,\(2\.000000-t\)\/1\.000000\)'/);
+    assert.match(graph, /enable='between\(t\\,0\.000000\\,2\.000000\)'/);
+  });
+
+  it("a real crossfade into the next text clip extends duration by the outgoing clip's own fade-out", () => {
+    let base = emptyProject([videoAsset("asset1", 3), textAsset("text1", "One"), textAsset("text2", "Two")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [clipA] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipA.id, "out", 2);
+    [clipA] = clipsOf(project, textTrackId(project));
+    // Adjacent, no gap, so this resolves to a REAL blend (fadeOutByClipId), not a solo fade.
+    project = addClip(project, textTrackId(project), "text2", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipB.id, "out", clipEnd(clipA) + 1);
+    project = setClipTransitionIn(project, clipB.id, { duration: 0.5, type: "crossfade" });
+
+    const { duration } = plan(project);
+
+    // clipA's own extended end (2 + 0.5 = 2.5) exceeds clipB's own plain end (2 + 1 = 3)? No — clipB
+    // ends at 3, which is already the larger of the two here, so this asserts the OVERALL duration is
+    // at least clipA's own extended point, not that it's the binding constraint — see the next test for
+    // a case where the text fade-out extension IS the binding constraint.
+    assert.ok(duration >= 2.5, `expected duration to cover at least clipA's own fade-extended end (2.5s), got ${duration}`);
+  });
+
+  it("the real-crossfade extension is the BINDING constraint when nothing else in the project runs that long", () => {
+    // The exact shape of the real, reported bug for the CROSSFADE case: a background clip sized to fit
+    // the text exactly, no slack at all — without this fix, `duration` would be exactly 2 here,
+    // silently truncating the entire crossfade tail.
+    let base = emptyProject([videoAsset("asset1", 2), textAsset("text1", "One"), textAsset("text2", "Two")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [clipA] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipA.id, "out", 2);
+    [clipA] = clipsOf(project, textTrackId(project));
+    project = addClip(project, textTrackId(project), "text2", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipB.id, "out", clipEnd(clipA) + 1);
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const { duration } = plan(project);
+
+    assert.ok(!closeTo(duration, 2), "must not silently truncate the crossfade at clipA's own nominal end");
+    assert.ok(closeTo(duration, 3));
+  });
+
+  it("a real crossfade's alpha ramp lands in [end, end+duration], staying fully visible right up to the clip's own end", () => {
+    let base = emptyProject([videoAsset("asset1", 3), textAsset("text1", "One"), textAsset("text2", "Two")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [clipA] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipA.id, "out", 2);
+    [clipA] = clipsOf(project, textTrackId(project));
+    project = addClip(project, textTrackId(project), "text2", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, clipB.id, "out", clipEnd(clipA) + 1);
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    // clipA's own ramp: `(end+duration-t)/duration` = `(3.000000-t)/1.000000` — 1 (fully visible) at
+    // t=2 (clipA's own nominal end), 0 at t=3.
+    assert.match(graph, /alpha='min\(1\\,\(3\.000000-t\)\/1\.000000\)'/);
+    assert.match(graph, /enable='between\(t\\,0\.000000\\,3\.000000\)'/);
+  });
+
+  it("a text clip with no fade-out at all doesn't change the duration (regression)", () => {
+    const base = emptyProject([videoAsset("asset1", 2), textAsset("text1", "Plain")]);
+    let project = addTrack(base, "text");
+    project = addClip(project, videoTrackId(project), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    project = trimClip(project, textClip.id, "out", 2);
+
+    const { duration } = plan(project);
+
+    assert.ok(closeTo(duration, 2));
   });
 });
 

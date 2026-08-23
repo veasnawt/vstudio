@@ -9,6 +9,8 @@ import {
   SetClipColorGradingKeyframesCommand,
   SetClipEffectsCommand,
   SetClipEffectsKeyframesCommand,
+  SetClipTextCropCommand,
+  SetClipTextCropKeyframesCommand,
   SetClipTransformCommand,
   SetClipTransformKeyframesCommand,
   SetClipTextStyleKeyframesCommand,
@@ -16,17 +18,19 @@ import {
 } from "../commands/index.ts";
 import { clipDuration, newId } from "../project/createProject.ts";
 import type { Clip, TextStyle } from "../project/types.ts";
-import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../project/types.ts";
+import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { useTranslation } from "../i18n/useTranslation.ts";
 import {
   hasColorGradingKeyframes,
   hasEffectsKeyframes,
+  hasTextCropKeyframes,
   hasTextStyleKeyframes,
   hasTransformKeyframes,
   resolveClipColorGrading,
   resolveClipEffects,
   resolveClipTransform,
+  resolveTextCrop,
   resolveTextStyle,
   upsertKeyframe,
 } from "../timeline/keyframes.ts";
@@ -34,7 +38,7 @@ import { frameDuration, snapToFrame } from "../timeline/time.ts";
 
 interface Props {
   clip: Clip;
-  property: "transform" | "effects" | "colorGrading" | "textStyle";
+  property: "transform" | "effects" | "colorGrading" | "textStyle" | "textCrop";
   /** The CURRENT playhead position, in the SAME absolute-timeline seconds `clip.timelineStart` is —
    *  converted to clip-window-relative time internally, matching every other consumer of `Keyframe.time`. */
   playhead: number;
@@ -68,6 +72,8 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
       ? clip.effectsKeyframes
       : property === "colorGrading"
       ? clip.colorGradingKeyframes
+      : property === "textCrop"
+      ? clip.textCropKeyframes
       : clip.textStyleKeyframes;
   const armed =
     property === "transform"
@@ -76,6 +82,8 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
       ? hasEffectsKeyframes(clip)
       : property === "colorGrading"
       ? hasColorGradingKeyframes(clip)
+      : property === "textCrop"
+      ? hasTextCropKeyframes(clip)
       : hasTextStyleKeyframes(clip);
   const elapsed = playhead - clip.timelineStart;
   const playheadInRange = elapsed >= -1e-6 && elapsed <= duration + 1e-6;
@@ -91,6 +99,8 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
       run(new SetClipEffectsKeyframesCommand(clip.id, next as Clip["effectsKeyframes"]));
     } else if (property === "colorGrading") {
       run(new SetClipColorGradingKeyframesCommand(clip.id, next as Clip["colorGradingKeyframes"]));
+    } else if (property === "textCrop") {
+      run(new SetClipTextCropKeyframesCommand(clip.id, next as Clip["textCropKeyframes"]));
     } else {
       run(new SetClipTextStyleKeyframesCommand(clip.id, next as Clip["textStyleKeyframes"]));
     }
@@ -115,6 +125,14 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
             new SetClipColorGradingCommand(clip.id, baked),
           ])
         );
+      } else if (property === "textCrop") {
+        const baked = resolveTextCrop(clip, clampedElapsed);
+        run(
+          new BatchCommand(t("Disable Text Crop Keyframes"), [
+            new SetClipTextCropKeyframesCommand(clip.id, null),
+            new SetClipTextCropCommand(clip.id, baked),
+          ])
+        );
       } else if (textAsset) {
         const baked = resolveTextStyle(clip, clampedElapsed, textAsset.style);
         run(
@@ -135,6 +153,8 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
         dispatchKeyframes([{ id, time, value: clip.effects ?? IDENTITY_EFFECTS }]);
       } else if (property === "colorGrading") {
         dispatchKeyframes([{ id, time, value: clip.colorGrading ?? IDENTITY_COLOR_GRADING }]);
+      } else if (property === "textCrop") {
+        dispatchKeyframes([{ id, time, value: clip.textCrop ?? IDENTITY_TEXT_CROP }]);
       } else if (textAsset) {
         dispatchKeyframes([{ id, time, value: textAsset.style }]);
       }
@@ -153,6 +173,8 @@ export function KeyframeTrack({ clip, property, playhead, fps, run, textAsset }:
         ? resolveClipEffects(clip, clampedElapsed)
         : property === "colorGrading"
         ? resolveClipColorGrading(clip, clampedElapsed)
+        : property === "textCrop"
+        ? resolveTextCrop(clip, clampedElapsed)
         : resolveTextStyle(clip, clampedElapsed, textAsset!.style);
     dispatchKeyframes(upsertKeyframe(keyframes as { id: string; time: number; value: unknown }[], clampedElapsed, current, fps));
   }

@@ -12,8 +12,12 @@ VStudio via `<iframe>` for that last-but-one stage rather than owning the editor
 same projects, two doors in.
 
 <p align="center">
-  <img src="assets/screenshots/editor.png" width="49%" alt="The editor mid-edit — video, audio waveform, and a text title card composited on a multi-track timeline" />
-  <img src="assets/screenshots/export.png" width="49%" alt="The Export dialog, showing an in/out range and themed dropdowns" />
+  <img src="assets/screenshots/editor.png" width="49%" alt="The editor mid-edit — a text clip with an animated crop-reveal keyframe, on-canvas transform handles, and a multi-track timeline with a crossfade transition" />
+  <img src="assets/screenshots/export.png" width="49%" alt="The Export dialog, showing resolution, frame rate, and quality dropdowns" />
+</p>
+<p align="center">
+  <img src="assets/screenshots/color-grading.png" width="49%" alt="The Color Grading panel, showing a lifted-shadow RGB curve applied to a clip" />
+  <img src="assets/screenshots/mixer.png" width="49%" alt="The Audio Mixer panel, with per-track and master gain faders" />
 </p>
 
 ---
@@ -58,13 +62,30 @@ applied, numerically in the Inspector — the same "one pipeline, computed once,
 approach Transform uses, extended with a matching stage in both the canvas preview and the FFmpeg
 export graph.
 
-**Text.** Text clips (add, edit content, style — font, color, stroke, shadow, line-height, position/
-rotation) are a real track kind, rendered in preview and export alike.
+**Color grading.** Per-clip RGB curves — an all-channels curve plus independent Red/Green/Blue
+curves, edited by dragging control points on a real curve editor — for lifts, contrast shaping, and
+color casts that a single brightness/contrast/saturation slider can't express. A "Chroma key" toggle
+on the same panel keys out a color (green-screen style). Rendered identically in preview and export.
 
-**Transitions.** A clip can crossfade in from whatever clip immediately precedes it on the same
-track — toggle it on and set the duration in the Inspector's "Transition In" section. Clips never
-overlap in storage; the blend is purely a render-time synthesis, kept in sync between the canvas
-preview and the FFmpeg export graph (`xfade`/`acrossfade`) the same way Transform and Effects are.
+**Text.** Text clips (add, edit content, style — font, color, stroke, shadow, line-height, position/
+rotation/crop) are a real track kind, rendered in preview and export alike. Text also supports a
+**word-highlight** animation (each word emphasized in turn as playback reaches it) and a **crop**
+control for revealing/wiping text into view, independent of Position/Scale.
+
+**Keyframes.** Transform, Effects, Color Grading, Text Style, and Text Crop are each keyframeable — a
+stopwatch toggle in their own Inspector section, linear interpolation between however many points you
+set (Color Grading holds its curve shape at each keyframe rather than interpolating pointwise, since
+curves of different shapes have no natural in-between). Export renders every keyframe track via
+segment-slicing, so scale/crop/curves/position all animate correctly, not just fade.
+
+**Transitions.** A clip can transition in from whatever clip immediately precedes it on the same
+track — crossfade, wipe, slide, or a circular reveal, picked and timed in the Inspector's "Transition
+In" section. Clips never overlap in storage; the blend is purely a render-time synthesis, kept in sync
+between the canvas preview and the FFmpeg export graph (`xfade`/`acrossfade`) the same way Transform
+and Effects are.
+
+**Audio Mixer.** A dedicated Mixer panel with a fader per audio-bearing track plus a Master fader,
+for balancing voiceover against music/ambience without hunting through per-clip gain fields.
 
 **Multi-layer video compositing.** Every visible video track composites, in track order — later
 tracks drawn on top of earlier ones — in both the canvas preview and the exported file. A clip's own
@@ -95,6 +116,10 @@ one-click reset back to the full timeline.
 **Fullscreen preview**, and the **playhead automatically follows** playback once it scrolls past the
 right edge of the visible timeline.
 
+**Runs natively on mobile**, too — VStudio ships inside the Capacitor-wrapped mobile app
+([apps/mobile](../../apps/mobile)) with its own on-device FFmpeg plugin (iOS and Android), so import,
+preview, and export all work without a server round-trip.
+
 ## What is deliberately NOT here yet
 
 Stated plainly, because a polished UI hiding missing features is worse than an honest gap:
@@ -102,12 +127,10 @@ Stated plainly, because a polished UI hiding missing features is worse than an h
 - **Caption import/export** — no SRT/VTT import or export. Auto-transcription IS implemented (the
   toolbar's Captions button, Whisper-based) and lands real, editable text clips; SRT/VTT specifically
   is the gap.
-- **Keyframes** — Transform and Effects are each keyframeable (a stopwatch toggle in their own
-  Inspector section, linear interpolation between however many points you set — export renders it via
-  segment-slicing so scale/crop animate correctly too), but only the whole property-group at once, not
-  independent per-field tracks, and not yet on text clips.
-- **On-canvas crop handles** — crop is numeric-only in the Inspector; only Position/Scale/Rotation have
-  draggable handles in the preview.
+- **Per-field keyframe tracks** — keyframing animates a whole property group at once (all of Transform,
+  or all of Text Crop, etc.), not independent tracks per individual field.
+- **On-canvas crop handles** — crop (both the video/image Transform crop and the text Crop) is
+  numeric-only in the Inspector; only Position/Scale/Rotation have draggable handles in the preview.
 - **Blend modes** — a video track's own clip opacity is the only cross-track compositing control;
   there's no multiply/screen/etc. blend mode selector.
 - **Proxy media** — 4K/8K sources are edited directly. There is no proxy generation step.

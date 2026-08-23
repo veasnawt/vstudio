@@ -17,6 +17,7 @@ import {
   setClipGain,
   setClipMuted,
   setClipTextCrop,
+  setClipTextCropKeyframes,
   setClipTransform,
   setClipTransformKeyframes,
   setClipTextStyleKeyframes,
@@ -610,6 +611,35 @@ export class SetClipColorGradingKeyframesCommand implements Command {
   revert(project: Project): Project {
     if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
     return setClipColorGradingKeyframes(project, this.clipId, this.previous);
+  }
+}
+
+/** `SetClipTransformKeyframesCommand`'s own counterpart for a text clip's `TextCrop` — identical
+ *  shape (applied-flag pattern, absent/empty keyframes IS the meaningful "not keyframed" state). */
+export class SetClipTextCropKeyframesCommand implements Command {
+  label = "Set Text Crop Keyframes";
+  private applied = false;
+  private previous: Clip["textCropKeyframes"] | null = null;
+
+  private clipId: string;
+  private keyframes: Clip["textCropKeyframes"] | null;
+
+  constructor(clipId: string, keyframes: Clip["textCropKeyframes"] | null) {
+    this.clipId = clipId;
+    this.keyframes = keyframes;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.textCropKeyframes ?? null;
+    this.applied = true;
+    return setClipTextCropKeyframes(project, this.clipId, this.keyframes);
+  }
+
+  revert(project: Project): Project {
+    if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipTextCropKeyframes(project, this.clipId, this.previous);
   }
 }
 

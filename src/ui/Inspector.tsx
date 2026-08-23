@@ -31,6 +31,7 @@ import {
   SetClipMutedCommand,
   SetClipTextAnimationCommand,
   SetClipTextCropCommand,
+  SetClipTextCropKeyframesCommand,
   SetClipTextStyleKeyframesCommand,
   SetClipTransformCommand,
   SetClipTransformKeyframesCommand,
@@ -50,11 +51,13 @@ import { DEFAULT_WORD_HIGHLIGHT_COLOR, TEXT_ANIMATION_TYPE_LABEL, TEXT_ANIMATION
 import {
   hasColorGradingKeyframes,
   hasEffectsKeyframes,
+  hasTextCropKeyframes,
   hasTextStyleKeyframes,
   hasTransformKeyframes,
   resolveClipColorGrading,
   resolveClipEffects,
   resolveClipTransform,
+  resolveTextCrop,
   resolveTextStyle,
   upsertKeyframe,
 } from "../timeline/keyframes.ts";
@@ -926,18 +929,25 @@ export function Inspector() {
     setLivePreviewOverrides([{ clipId, textStyle: { ...current, ...patch } }]);
   }
 
-  /** Same shape as `patchTransform`'s own crop handling, for a text clip's `TextCrop` — simpler than
-   *  `patchTextStyle`: `textCrop` isn't keyframed (see its own doc comment), so there's no auto-key
-   *  branch to choose between. */
+  /** Same shape as `patchTransform`'s own auto-key branch, for a text clip's `TextCrop`. */
   function patchTextCrop(clipId: string, patch: Partial<TextCrop>) {
-    const current = found?.clip.textCrop ?? IDENTITY_TEXT_CROP;
-    run(new SetClipTextCropCommand(clipId, { ...current, ...patch }));
+    const clip = found?.clip;
+    if (clip && hasTextCropKeyframes(clip)) {
+      const elapsed = playhead - clip.timelineStart;
+      const next = { ...resolveTextCrop(clip, elapsed), ...patch };
+      run(new SetClipTextCropKeyframesCommand(clipId, upsertKeyframe(clip.textCropKeyframes!, elapsed, next, fps)));
+    } else {
+      const current = clip?.textCrop ?? IDENTITY_TEXT_CROP;
+      run(new SetClipTextCropCommand(clipId, { ...current, ...patch }));
+    }
     clearPreview();
   }
 
-  /** Same pattern as `previewCrop`, for `TextCrop` instead. */
+  /** Same pattern as `previewTransform`, for `TextCrop` instead — the live override wins outright over
+   *  a keyframed value at draw time, so this needs no keyframe branch either. */
   function previewTextCrop(clipId: string, patch: Partial<TextCrop>) {
-    const current = found?.clip.textCrop ?? IDENTITY_TEXT_CROP;
+    const clip = found?.clip;
+    const current = clip ? resolveTextCrop(clip, playhead - clip.timelineStart) : IDENTITY_TEXT_CROP;
     setLivePreviewOverrides([{ clipId, textCrop: { ...current, ...patch } }]);
   }
 
@@ -1052,6 +1062,8 @@ export function Inspector() {
                       const style = hasTextStyleKeyframes(clip) ? resolveTextStyle(clip, playhead - clip.timelineStart, baseStyle) : baseStyle;
                       const content = asset.textContent ?? "";
                       const font = fontById(style.fontFamily);
+                      // Same interpolated-at-the-playhead resolution as `style` above, for `TextCrop`.
+                      const crop = resolveTextCrop(clip, playhead - clip.timelineStart);
                       return (
                         <>
                           <KeyframeTrack
@@ -1297,13 +1309,15 @@ export function Inspector() {
                           {/* A frame-space mask (CSS overflow:hidden), independent of the text's own
                               position above — see `TextCrop`'s own doc comment. Same 2-row-paired
                               layout as the video Transform tab's own Crop subsection (Top/Bottom, then
-                              Left/Right). */}
+                              Left/Right), and the same `KeyframeTrack` stopwatch-arming pattern the
+                              Transform/Effects/Color-Grading sections already use. */}
                           <p className="mb-1 mt-3 text-[11px] font-semibold uppercase tracking-wide text-white/30">{t("Crop")}</p>
+                          <KeyframeTrack clip={clip} property="textCrop" playhead={playhead} fps={fps} run={run} />
                           <div className="flex gap-3">
                             <div className="flex-1">
                               <NumberField
                                 label={t("Top")}
-                                value={clip.textCrop?.top ?? 0}
+                                value={crop.top}
                                 suffix="%"
                                 step={1}
                                 min={0}
@@ -1318,7 +1332,7 @@ export function Inspector() {
                             <div className="flex-1">
                               <NumberField
                                 label={t("Bottom")}
-                                value={clip.textCrop?.bottom ?? 0}
+                                value={crop.bottom}
                                 suffix="%"
                                 step={1}
                                 min={0}
@@ -1335,7 +1349,7 @@ export function Inspector() {
                             <div className="flex-1">
                               <NumberField
                                 label={t("Left")}
-                                value={clip.textCrop?.left ?? 0}
+                                value={crop.left}
                                 suffix="%"
                                 step={1}
                                 min={0}
@@ -1350,7 +1364,7 @@ export function Inspector() {
                             <div className="flex-1">
                               <NumberField
                                 label={t("Right")}
-                                value={clip.textCrop?.right ?? 0}
+                                value={crop.right}
                                 suffix="%"
                                 step={1}
                                 min={0}

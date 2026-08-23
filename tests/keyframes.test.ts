@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createClip } from "../src/project/createProject.ts";
-import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
-import type { Clip, ClipTransform, ColorGradingKeyframe, EffectsKeyframe, TransformKeyframe } from "../src/project/types.ts";
-import { hasColorGradingKeyframes, hasEffectsKeyframes, hasTransformKeyframes, resolveClipColorGrading, resolveClipEffects, resolveClipTransform, upsertKeyframe } from "../src/timeline/keyframes.ts";
+import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import type { Clip, ClipTransform, ColorGradingKeyframe, EffectsKeyframe, TextCropKeyframe, TransformKeyframe } from "../src/project/types.ts";
+import { hasColorGradingKeyframes, hasEffectsKeyframes, hasTextCropKeyframes, hasTransformKeyframes, resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextCrop, upsertKeyframe } from "../src/timeline/keyframes.ts";
 
 function clip(overrides: Partial<Clip> = {}): Clip {
   return { ...createClip({ assetId: "asset1", sourceIn: 0, sourceOut: 10, timelineStart: 0 }), ...overrides };
@@ -127,7 +127,43 @@ describe("resolveClipColorGrading", () => {
   });
 });
 
-describe("hasTransformKeyframes / hasEffectsKeyframes / hasColorGradingKeyframes", () => {
+describe("resolveTextCrop", () => {
+  it("falls back to clip.textCrop, then IDENTITY_TEXT_CROP, when no keyframes exist", () => {
+    const crop = { ...IDENTITY_TEXT_CROP, top: 0.2 };
+    assert.deepEqual(resolveTextCrop(clip({ textCrop: crop }), 3), crop);
+    assert.deepEqual(resolveTextCrop(clip(), 3), IDENTITY_TEXT_CROP);
+  });
+
+  it("a single keyframe holds constant across the whole clip", () => {
+    const kfs: TextCropKeyframe[] = [{ id: "kf1", time: 2, value: { ...IDENTITY_TEXT_CROP, top: 0.3 } }];
+    const c = clip({ textCropKeyframes: kfs });
+    assert.deepEqual(resolveTextCrop(c, 0), { ...IDENTITY_TEXT_CROP, top: 0.3 });
+    assert.deepEqual(resolveTextCrop(c, 9), { ...IDENTITY_TEXT_CROP, top: 0.3 });
+  });
+
+  it("LERPs every field linearly at the exact midpoint — unlike ColorGrading, crop has no hold-not-blend problem", () => {
+    const kfs: TextCropKeyframe[] = [
+      { id: "kf1", time: 0, value: { top: 0, right: 0, bottom: 0, left: 0 } },
+      { id: "kf2", time: 4, value: { top: 0.2, right: 0.4, bottom: 0.6, left: 0.8 } },
+    ];
+    const c = clip({ textCropKeyframes: kfs });
+    assert.deepEqual(resolveTextCrop(c, 2), { top: 0.1, right: 0.2, bottom: 0.3, left: 0.4 });
+    // A non-midpoint sample too, to confirm this isn't just an average.
+    assert.deepEqual(resolveTextCrop(c, 1), { top: 0.05, right: 0.1, bottom: 0.15, left: 0.2 });
+  });
+
+  it("holds the first/last keyframe's value outside the keyframed range, never extrapolates", () => {
+    const kfs: TextCropKeyframe[] = [
+      { id: "kf1", time: 2, value: { ...IDENTITY_TEXT_CROP, top: 0.1 } },
+      { id: "kf2", time: 5, value: { ...IDENTITY_TEXT_CROP, top: 0.4 } },
+    ];
+    const c = clip({ textCropKeyframes: kfs });
+    assert.deepEqual(resolveTextCrop(c, 0), { ...IDENTITY_TEXT_CROP, top: 0.1 });
+    assert.deepEqual(resolveTextCrop(c, 9), { ...IDENTITY_TEXT_CROP, top: 0.4 });
+  });
+});
+
+describe("hasTransformKeyframes / hasEffectsKeyframes / hasColorGradingKeyframes / hasTextCropKeyframes", () => {
   it("false for absent or empty, true once at least one keyframe exists", () => {
     assert.equal(hasTransformKeyframes(clip()), false);
     assert.equal(hasTransformKeyframes(clip({ transformKeyframes: [] })), false);
@@ -137,6 +173,9 @@ describe("hasTransformKeyframes / hasEffectsKeyframes / hasColorGradingKeyframes
     assert.equal(hasColorGradingKeyframes(clip()), false);
     assert.equal(hasColorGradingKeyframes(clip({ colorGradingKeyframes: [] })), false);
     assert.equal(hasColorGradingKeyframes(clip({ colorGradingKeyframes: [{ id: "kf1", time: 0, value: IDENTITY_COLOR_GRADING }] })), true);
+    assert.equal(hasTextCropKeyframes(clip()), false);
+    assert.equal(hasTextCropKeyframes(clip({ textCropKeyframes: [] })), false);
+    assert.equal(hasTextCropKeyframes(clip({ textCropKeyframes: [{ id: "kf1", time: 0, value: IDENTITY_TEXT_CROP }] })), true);
   });
 });
 

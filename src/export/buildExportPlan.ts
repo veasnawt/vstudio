@@ -17,7 +17,7 @@ import {
   WIGGLE_AMPLITUDE_DEG,
   WIGGLE_PERIOD_SECONDS,
 } from "../timeline/textAnimation.ts";
-import { hasColorGradingKeyframes, hasEffectsKeyframes, hasTextStyleKeyframes, hasTransformKeyframes, resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextStyle } from "../timeline/keyframes.ts";
+import { hasColorGradingKeyframes, hasEffectsKeyframes, hasTextCropKeyframes, hasTextStyleKeyframes, hasTransformKeyframes, resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextCrop, resolveTextStyle } from "../timeline/keyframes.ts";
 import { snapToFrame } from "../timeline/time.ts";
 import { findTransitionOut, findTransitionPartner } from "../timeline/transitions.ts";
 import { buildCurvesFilterFragment } from "./curvesFilter.ts";
@@ -538,6 +538,50 @@ function computeTextStyleKeyframeSlices(clip: Clip, baseStyle: TextStyle, fps: n
   return slices;
 }
 
+/** `computeTextStyleKeyframeSlices`'s own counterpart for a text clip's `textCropKeyframes` — same
+ *  "always the clip's own full duration, elapsedAtSegmentStart always 0" shape (text has no segment
+ *  concept), just sampling `resolveTextCrop` instead. A SEPARATE slicer from the style one, not a
+ *  shared/merged boundary set: crop and style keyframes are independent arrays a clip can carry either,
+ *  both, or neither of, and the crop stage runs as its OWN downstream filter step (after whatever
+ *  produced the fully-rendered text stream, keyframed or not) rather than inside the drawtext chain
+ *  itself, so there's no reason its own slice boundaries need to line up with style's. */
+function computeTextCropKeyframeSlices(clip: Clip, fps: number): { offset: number; duration: number; crop: TextCrop }[] {
+  const sliceDuration = clipDuration(clip);
+  const keyframeTimes = (clip.textCropKeyframes ?? []).map((k) => k.time);
+  const snapped = computeSliceBoundaries(keyframeTimes, 0, sliceDuration, fps);
+
+  const slices: { offset: number; duration: number; crop: TextCrop }[] = [];
+  for (let i = 1; i < snapped.length; i++) {
+    const offset = snapped[i - 1];
+    const sliceLength = snapped[i] - offset;
+    if (sliceLength <= 1e-9) continue;
+    const midpoint = offset + sliceLength / 2;
+    slices.push({ offset, duration: sliceLength, crop: resolveTextCrop(clip, midpoint) });
+  }
+  return slices;
+}
+
+/** One `crop=`+`pad=` stage for a `TextCrop` rectangle — shared by the static (single-slice) and
+ *  keyframed (multi-slice, one call per slice) text-crop paths below, so the two can't drift apart on
+ *  the actual pixel math. `pad`'s own `x=`/`y=` can't reuse `crop`'s output `iw`/`ih` symbolically the
+ *  way `crop`'s own `x=`/`y=` can reuse the PRE-crop stream's `iw`/`ih` — after `crop` runs, `iw`/`ih`
+ *  refer to the smaller cropped buffer, not the original frame. Frame dimensions and crop fractions are
+ *  both known JS constants here (unlike `buildTransformFilters`'s source crop, where source dimensions
+ *  vary per asset), so every arg below is a precomputed pixel literal rather than a mix of symbolic and
+ *  literal forms. `format=rgba` re-applied immediately before `pad`, same defensive convention as
+ *  everywhere else in this file that depends on alpha surviving a filter — never assumed to have
+ *  survived untouched. */
+function buildTextCropFilter(inputLabel: string, crop: TextCrop, outputLabel: string, width: number, height: number): string {
+  const cropX = n(width * crop.left);
+  const cropY = n(height * crop.top);
+  const cropW = n(width * (1 - crop.left - crop.right));
+  const cropH = n(height * (1 - crop.top - crop.bottom));
+  return (
+    `[${inputLabel}]crop=w=${cropW}:h=${cropH}:x=${cropX}:y=${cropY},format=rgba,` +
+    `pad=w=${n(width)}:h=${n(height)}:x=${cropX}:y=${cropY}:color=black@0[${outputLabel}]`
+  );
+}
+
 /** Windows paths carry a drive-letter colon and, in this repo, spaces (`.../App Development/...`) —
  *  both fatal to FFmpeg's OWN filter-graph string parser unless the whole value is wrapped in single
  *  quotes AND the colon is still separately backslash-escaped even inside them. Empirically verified
@@ -577,14 +621,38 @@ function buildDrawTextStyleParams(style: TextStyle): string {
   return `${box}${border}${shadow}`;
 }
 
-/** Computes the `alpha=` expression and (possibly fade-out-extended) enable-window end for one text
- *  clip's `drawtext` — shared by `buildDrawTextFilter` and `buildRotatedDrawTextFilter`. `fadeIn`/
- *  `fadeOut` are the transition durations at this clip's own head/tail (`fadeIn` from
- *  `findTransitionPartner` resolved against THIS clip; `fadeOut` from resolving it against whichever
- *  clip transitions FROM this one, computed once per track by the caller — see the main text-track
- *  loop's own `fadeOutByClipId` map) — `undefined`/`0` for a plain cut on that side, which is what
- *  every existing non-transitioning clip already has, so it gets byte-for-byte the same filter string
- *  as before this feature existed (no `alpha=` term at all).
+/** A text clip's own fade-out is one of two genuinely different things, both surfaced by the main
+ *  text-track loop's own `fadeOutByClipId`-or-`findTransitionOut` lookup, but needing DIFFERENT timing:
+ *
+ *  - A real crossfade INTO whatever clip follows this one directly (`extendsPastEnd: true`, sourced
+ *    from `fadeOutByClipId`): the alpha ramp must happen AFTER this clip's own nominal `clipEnd`, over
+ *    `[end, end+duration]` — staying FULLY VISIBLE right up to `end` — so it genuinely OVERLAPS the
+ *    incoming clip's own fade-in, which always ramps over ITS OWN `[start, start+duration]`. Fading out
+ *    BEFORE `end` instead would mean this clip finishes vanishing the instant the next one's fade-in
+ *    begins, with no moment both are simultaneously part-visible — not a real blend, matching this
+ *    file's own established reasoning for why `enableEnd` extends past `end` at all.
+ *  - A SOLO fade to nothing (`extendsPastEnd: false`, sourced from `findTransitionOut` — resolves only
+ *    when nothing genuinely follows this clip at all): there is no incoming clip to overlap with, so
+ *    the ramp instead happens DURING this clip's own existing tail, over `[end-duration, end]`, reaching
+ *    fully invisible EXACTLY at `end` — matching `PlaybackEngine.drawTextLayer`'s own solo
+ *    `compositeSoloReveal` timing exactly, and matching how a video/image clip's own solo fade-out
+ *    already behaves (`pushClipVideoFilters`'s `fade=t=out:st=${sliceDuration-fadeOut}`, self-contained
+ *    within the clip's existing duration, never past it). Confirmed live: before this distinction
+ *    existed, EVERY text fade-out (solo included) used the crossfade-shaped `[end, end+duration]`
+ *    timing — a solo clip stayed fully opaque for its entire nominal duration, then kept lingering on
+ *    screen fading out for `duration` MORE seconds past where its own clip bar visually ends in the
+ *    editor, a real, confirmed mismatch from what preview shows. */
+interface TextFadeOut {
+  duration: number;
+  extendsPastEnd: boolean;
+}
+
+/** Computes the `alpha=` expression and enable-window end for one text clip's `drawtext` — shared by
+ *  `buildDrawTextFilter` and `buildRotatedDrawTextFilter`. `fadeIn` is the transition duration at this
+ *  clip's own head (from `findTransitionPartner` resolved against THIS clip) — `undefined`/`0` for a
+ *  plain cut on that side, which is what every existing non-transitioning clip already has, so it gets
+ *  byte-for-byte the same filter string as before this feature existed (no `alpha=` term at all). See
+ *  `TextFadeOut`'s own doc comment for why `fadeOut`'s two shapes need different timing.
  *
  *  Always a plain fade regardless of the clip's own `transitionIn.type` — unlike video's `xfade`,
  *  `drawtext` has no per-type geometry primitive to reach for (a wipe/slide/circle needs masking two
@@ -592,14 +660,21 @@ function buildDrawTextStyleParams(style: TextStyle): string {
  *  renders as a dissolve in export specifically. The canvas preview's fuller wipe/slide/circle variety
  *  (see `PlaybackEngine.transitionFamily`) is preview-only for text — a deliberate, documented scope
  *  cut, not an oversight. */
-function buildTextFadeParams(clip: Clip, fadeIn: number | undefined, fadeOut: number | undefined): { enableEnd: number; alphaParam: string } {
+function buildTextFadeParams(clip: Clip, fadeIn: number | undefined, fadeOut: TextFadeOut | undefined): { enableEnd: number; alphaParam: string } {
   const start = clip.timelineStart;
   const end = clipEnd(clip);
-  const enableEnd = fadeOut ? end + fadeOut : end;
+  const enableEnd = fadeOut?.extendsPastEnd ? end + fadeOut.duration : end;
 
   const terms: string[] = [];
   if (fadeIn) terms.push(`(t-${t(start)})/${t(fadeIn)}`);
-  if (fadeOut) terms.push(`(${t(enableEnd)}-t)/${t(fadeOut)}`);
+  if (fadeOut) {
+    // The ramp's own END instant: `end+duration` for a crossfade (matches `enableEnd`), or plain `end`
+    // for a solo fade (the window itself is never extended, but the RAMP still needs to finish exactly
+    // at `end`, not `enableEnd`, which for a solo fade equals `end` anyway — spelled out explicitly
+    // rather than reusing `enableEnd` directly so this stays correct if the two ever diverge further).
+    const rampEnd = fadeOut.extendsPastEnd ? end + fadeOut.duration : end;
+    terms.push(`(${t(rampEnd)}-t)/${t(fadeOut.duration)}`);
+  }
   if (terms.length === 0) return { enableEnd, alphaParam: "" };
 
   // Nested `min(...)` (FFmpeg's `min`/`max` take exactly two args) clamped against 1 so a fade-in that
@@ -676,13 +751,17 @@ function buildWordHighlightAss(params: {
   fontsizeScale: number;
   frameWidth: number;
   frameHeight: number;
-  /** Same meaning as `buildDrawTextFilter`'s own `fadeIn`/`fadeOut` (seconds; `undefined`/`0` = a
-   *  plain cut on that side) — see `buildTextFadeParams`'s own doc comment. Rendered here via
-   *  libass's `\fad(t1,t2)` override tag rather than `drawtext`'s `alpha=` expression, since this
-   *  path renders through `subtitles=`, not `drawtext` — see `buildWordHighlightSubtitlesFilter`'s
-   *  own comment for why `wordHighlight` needs a wholly different filter to begin with. */
+  /** Same meaning as `buildDrawTextFilter`'s own `fadeIn`/`fadeOut` — see `TextFadeOut`'s own doc
+   *  comment for why `fadeOut`'s two shapes need different timing. Rendered here via libass's
+   *  `\fad(t1,t2)` override tag rather than `drawtext`'s `alpha=` expression, since this path renders
+   *  through `subtitles=`, not `drawtext` — see `buildWordHighlightSubtitlesFilter`'s own comment for
+   *  why `wordHighlight` needs a wholly different filter to begin with. Unlike `buildTextFadeParams`,
+   *  this needs no explicit "which instant does the ramp end at" branch: `\fad(t1,t2)` fades over the
+   *  last `t2` ms of THIS EVENT's own [Start,End] window, always — so simply choosing whether the
+   *  LAST event's own End extends past the clip's nominal end (`fadeOutSeconds` below) is already
+   *  enough to land the ramp in the right place for both cases. */
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
 }): string | null {
   const { content, style, clip, family, fontsizeScale, frameWidth, frameHeight, fadeIn, fadeOut } = params;
   const words = splitWords(content);
@@ -715,8 +794,12 @@ function buildWordHighlightAss(params: {
   // Converted once, outside the loop — `\fad`'s own two args are milliseconds, unlike every other
   // time value in this function (which are libass `H:MM:SS.cc` timestamps via `assTimestamp`).
   const fadeInMs = fadeIn ? Math.round(fadeIn * 1000) : 0;
-  const fadeOutMs = fadeOut ? Math.round(fadeOut * 1000) : 0;
-  const fadeOutSeconds = fadeOut ?? 0;
+  const fadeOutMs = fadeOut ? Math.round(fadeOut.duration * 1000) : 0;
+  // Only a REAL crossfade extends the last event's own End past the clip's nominal end — a solo
+  // fade-out's End stays exactly at `end` (a plain cut's own boundary), which is what makes `\fad`'s
+  // "over the last t2 ms of THIS event" own mechanic land the ramp at `[end-duration, end]` for free,
+  // matching `PlaybackEngine`'s own solo-reveal timing with no extra math needed here.
+  const fadeOutSeconds = fadeOut?.extendsPastEnd ? fadeOut.duration : 0;
 
   const events: string[] = [];
   for (let k = 0; k < words.length; k++) {
@@ -760,7 +843,14 @@ function buildWordHighlightAss(params: {
       });
       textParts.push(rendered.join(""));
     }
-    const text = fadeTag + `{\\pos(${n2(anchorX)}\\,${n2(anchorY)})}` + textParts.join("\\N");
+    // The comma inside `\pos(...)` is the OVERRIDE TAG's own argument separator, not a Dialogue-line
+    // CSV field separator — it must NOT be backslash-escaped, unlike this file's pervasive FFmpeg-
+    // expression convention (`between(t\,x\,y)`) that an escaped comma here was apparently copied from.
+    // Confirmed empirically against the real bundled libass: an escaped `\,` here makes `\pos` fail to
+    // parse silently (no error, no warning), falling back to the Style's own default MarginL/Alignment-
+    // based placement instead — exactly the "position is different after export" symptom this fixes.
+    // `\fad(...)` just below already uses a plain comma correctly; this now matches it.
+    const text = fadeTag + `{\\pos(${n2(anchorX)},${n2(anchorY)})}` + textParts.join("\\N");
 
     events.push(
       `Dialogue: 0,${assTimestamp(windowStart)},${assTimestamp(windowEnd)},Default,,0,0,0,,${text}`
@@ -817,7 +907,7 @@ function buildWordHighlightSubtitlesFilter(params: {
   fontsDirFor: () => string;
   /** Threaded straight through to `buildWordHighlightAss` — see its own doc comment. */
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
 }): string[] | null {
   const { inputLabel, outputLabel, content, style, clip, frameWidth, frameHeight, assFilePathFor, fontMetricsFor, fontsDirFor, fadeIn, fadeOut } = params;
   const font = fontById(style.fontFamily);
@@ -1045,7 +1135,7 @@ function buildDrawTextFilter(params: {
   fontPathFor: ExportPlanOptions["fontPathFor"];
   textFilePathFor: ExportPlanOptions["textFilePathFor"];
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
 }): string[] {
   const { inputLabel, outputLabel, content, style, clip, fontPathFor, textFilePathFor, fadeIn, fadeOut } = params;
   const geo = buildDrawTextGeometry(style, fontPathFor);
@@ -1116,7 +1206,7 @@ function buildKeyframedDrawTextCalls(params: {
   fontPathFor: ExportPlanOptions["fontPathFor"];
   textFilePathFor: ExportPlanOptions["textFilePathFor"];
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
   fps: number;
 }): string[] {
   const { inputLabel, outputLabel, content, baseStyle, clip, fontPathFor, textFilePathFor, fadeIn, fadeOut, fps } = params;
@@ -1251,7 +1341,7 @@ function buildRotatedDrawTextFilter(params: {
   fontPathFor: ExportPlanOptions["fontPathFor"];
   textFilePathFor: ExportPlanOptions["textFilePathFor"];
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
 }): string[] {
   const { inputLabel, bgIndex, outputLabel, content, style, clip, fontPathFor, textFilePathFor, fadeIn, fadeOut } = params;
   const geo = buildRotatedDrawTextGeometry(style, fontPathFor);
@@ -1295,7 +1385,7 @@ function buildKeyframedRotatedDrawTextCalls(params: {
   fontPathFor: ExportPlanOptions["fontPathFor"];
   textFilePathFor: ExportPlanOptions["textFilePathFor"];
   fadeIn?: number;
-  fadeOut?: number;
+  fadeOut?: TextFadeOut;
   fps: number;
 }): string[] {
   const { inputLabel, bgIndex, outputLabel, content, baseStyle, clip, fontPathFor, textFilePathFor, fadeIn, fadeOut, fps } = params;
@@ -1332,6 +1422,42 @@ function buildKeyframedRotatedDrawTextCalls(params: {
   return filters;
 }
 
+/** `sequenceDuration`'s own per-clip formula (`timelineStart + clipDuration`) has no notion of a text
+ *  clip's own REAL crossfade into whatever clip follows it EXTENDING its visible window past its own
+ *  nominal end — see `TextFadeOut`'s own doc comment for why that extension is deliberate for a
+ *  genuine overlap (and why a SOLO fade-out, by contrast, deliberately does NOT extend past its own
+ *  end — so it needs no entry here at all, only `fadeOutByClipId`-sourced crossfades do). Confirmed
+ *  live: without this, a text clip's own crossfade silently never became visible at all whenever
+ *  nothing else in the project happened to run past its own nominal end — the exported video simply
+ *  ENDED mid-ramp, at full opacity, before the fade window even started. This was the "the out
+ *  transition isn't applied after export" bug — the fade math itself was always correct, the video was
+ *  just too SHORT to ever reach it. Video/image clips need no equivalent: their own
+ *  `fade=t=out:st=${sliceDuration - fadeOut}` (`pushClipVideoFilters`) fades out WITHIN the clip's
+ *  already-existing duration, never past it — this extension is a text-crossfade-only concern.
+ *
+ *  Mirrors the main text-track loop's own `fadeOutByClipId` precompute (same `findTransitionPartner`
+ *  call) purely to find the LATEST point any text clip's own crossfade could still be visible — a
+ *  cheap, side-effect-free duplicate of that lookup, not a second copy of the actual filter-building
+ *  logic, and safe to run before any of it (`findTransitionPartner` only ever reads clip/track data).
+ *  Returns 0 (no extension) when no text clip has a real crossfade at all — every project that never
+ *  uses this feature computes the exact same duration as before it existed. */
+function computeTextFadeOutExtendedDuration(project: Project): number {
+  let maxEnd = 0;
+  for (const track of project.sequence.tracks) {
+    if (track.kind !== "text") continue;
+    const fadeOutByClipId = new Map<string, number>();
+    for (const clip of track.clips) {
+      const transition = findTransitionPartner(track, clip);
+      if (transition?.partner) fadeOutByClipId.set(transition.partner.id, transition.duration);
+    }
+    for (const clip of track.clips) {
+      const fadeOut = fadeOutByClipId.get(clip.id);
+      if (fadeOut) maxEnd = Math.max(maxEnd, clipEnd(clip) + fadeOut);
+    }
+  }
+  return maxEnd;
+}
+
 export function buildExportPlan(project: Project, options: ExportPlanOptions): ExportPlan {
   const { fps, crf, audioBitrateKbps } = project.exportSettings;
   // Every position/crop/offset in this whole file (`TEXT_MARGIN_PX`, `TextCrop` fractions, `ClipTransform`
@@ -1360,7 +1486,9 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
   const { width, height } = project.sequence;
   const outputWidth = project.exportSettings.width;
   const outputHeight = project.exportSettings.height;
-  const duration = sequenceDuration(project);
+  // See `computeTextFadeOutExtendedDuration`'s own doc comment: a text clip's fade-out can visibly need
+  // MORE time than `sequenceDuration`'s plain per-clip formula accounts for.
+  const duration = Math.max(sequenceDuration(project), computeTextFadeOutExtendedDuration(project));
   if (duration <= 0) throw new ExportError("There is nothing on the timeline to export");
 
   // Every visible video track with clips composites, in array order — later tracks drawn ON TOP of
@@ -1935,12 +2063,21 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
       // slice, motion intact, character-reveal ignored.
       const outputLabel = `txt${textIndex++}`;
       const fadeIn = findTransitionPartner(track, clip)?.duration;
-      // Two independent sources for a text clip's own fade-out, checked in order: is it the OUTGOING
-      // side of some OTHER clip's real transition-in (`fadeOutByClipId`, precomputed above), or — if
-      // not — does it have its own `transitionOut` resolving to a solo fade (`findTransitionOut`
-      // already returns `null` whenever a genuine successor exists at all, so these two can never
-      // both apply to the same clip; checking both here just avoids caring which one it was).
-      const fadeOut = fadeOutByClipId.get(clip.id) ?? findTransitionOut(track, clip)?.duration;
+      // Two independent sources for a text clip's own fade-out — never both at once (`findTransitionOut`
+      // already returns `null` whenever a genuine successor exists at all) — but needing DIFFERENT
+      // timing, so each is tagged with its own `extendsPastEnd`; see `TextFadeOut`'s own doc comment for
+      // the full reasoning (a real crossfade into the next clip must stay visible past this clip's own
+      // end to genuinely overlap the incoming clip's fade-in; a solo fade to nothing must NOT, fading
+      // out during this clip's own existing tail instead, matching `PlaybackEngine`'s own solo-reveal
+      // timing exactly).
+      const crossfadeOutDuration = fadeOutByClipId.get(clip.id);
+      const soloFadeOutDuration = crossfadeOutDuration === undefined ? findTransitionOut(track, clip)?.duration : undefined;
+      const fadeOut: TextFadeOut | undefined =
+        crossfadeOutDuration !== undefined
+          ? { duration: crossfadeOutDuration, extendsPastEnd: true }
+          : soloFadeOutDuration !== undefined
+            ? { duration: soloFadeOutDuration, extendsPastEnd: false }
+            : undefined;
 
       // `wordHighlight` is checked FIRST, ahead of the rotated/plain split below — it renders through a
       // completely different filter (`subtitles=`, not `drawtext`) regardless of `style.rotationDeg`,
@@ -1993,7 +2130,7 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
         // transparent buffer instead of the shared `videoOut`, then crop→pad→overlay's the result onto
         // the real `videoOut` afterward. A crop-less clip takes the exact byte-for-byte original path —
         // `drawInputLabel`/`drawOutputLabel` just equal `videoOut`/`outputLabel` unchanged.
-        const hasCrop = clip.textCrop && !isIdentityTextCrop(clip.textCrop);
+        const hasCrop = (clip.textCrop && !isIdentityTextCrop(clip.textCrop)) || hasTextCropKeyframes(clip);
         let drawInputLabel = videoOut;
         const drawOutputLabel = hasCrop ? `${outputLabel}_iso` : outputLabel;
 
@@ -2091,31 +2228,56 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
         }
 
         if (hasCrop) {
-          const crop = clip.textCrop!;
-          const cropX = n(width * crop.left);
-          const cropY = n(height * crop.top);
-          const cropW = n(width * (1 - crop.left - crop.right));
-          const cropH = n(height * (1 - crop.top - crop.bottom));
-          // `pad`'s own `x=`/`y=` can't reuse `crop`'s output `iw`/`ih` symbolically the way `crop`'s
-          // own `x=`/`y=` can reuse the PRE-crop stream's `iw`/`ih` — after `crop` runs, `iw`/`ih` refer
-          // to the smaller cropped buffer, not the original frame. Frame dimensions and crop fractions
-          // are both known JS constants here (unlike `buildTransformFilters`'s source crop, where source
-          // dimensions vary per asset), so every arg below is a precomputed pixel literal rather than a
-          // mix of symbolic and literal forms. `format=rgba` re-applied immediately before `pad`, same
-          // defensive convention as everywhere else in this file that depends on alpha surviving a
-          // filter — never assumed to have survived untouched.
-          filters.push(
-            `[${drawOutputLabel}]crop=w=${cropW}:h=${cropH}:x=${cropX}:y=${cropY},format=rgba,` +
-              `pad=w=${n(width)}:h=${n(height)}:x=${cropX}:y=${cropY}:color=black@0[${outputLabel}_padded]`
-          );
-          // No explicit `x=`/`y=` — `pad` already positioned the visible content correctly within a
-          // frame-sized buffer, so this is the same plain "two frame-sized buffers, stack one on the
-          // other" shape the multi-video-track layering overlay above already uses (`overlay=format=auto`,
-          // no position), not the offset overlays elsewhere whose content is smaller than the background.
+          // `crop`'s own w/h are evaluated ONCE at filter-graph configuration time (confirmed against
+          // FFmpeg's own documented behavior — same "buffer-geometry parameters can't themselves depend
+          // on `t`" constraint `pushKeyframedClipVideoFilters`'s own doc comment already establishes for
+          // `rotate`'s `ow=`/`oh=`), so an ANIMATING crop rectangle needs the same "many short static
+          // slices, not one continuously-varying expression" strategy every other keyframed property in
+          // this file already uses — see `computeTextCropKeyframeSlices`'s own doc comment. A clip with
+          // exactly one crop slice (a genuinely static crop, keyframed or not) takes the plain single
+          // crop/pad/overlay path unchanged; `split=` only appears once there are actually multiple
+          // slices to fan the ALREADY-fully-rendered text stream out to — same "avoid an untested
+          // `split=1` construct" caution `pushKeyframedClipVideoFilters`'s own fix already applied.
+          const cropKeyframed = hasTextCropKeyframes(clip);
+          const cropSlices = cropKeyframed ? computeTextCropKeyframeSlices(clip, fps) : null;
           const { enableEnd } = buildTextFadeParams(clip, fadeIn, fadeOut);
-          filters.push(
-            `${videoOut}[${outputLabel}_padded]overlay=format=auto:enable='between(t\\,${t(clip.timelineStart)}\\,${t(enableEnd)})'[${outputLabel}]`
-          );
+
+          if (!cropSlices || cropSlices.length === 1) {
+            const crop = cropSlices ? cropSlices[0].crop : clip.textCrop!;
+            filters.push(buildTextCropFilter(drawOutputLabel, crop, `${outputLabel}_padded`, width, height));
+            // No explicit `x=`/`y=` — `pad` already positioned the visible content correctly within a
+            // frame-sized buffer, so this is the same plain "two frame-sized buffers, stack one on the
+            // other" shape the multi-video-track layering overlay above already uses (`overlay=format=auto`,
+            // no position), not the offset overlays elsewhere whose content is smaller than the background.
+            filters.push(
+              `${videoOut}[${outputLabel}_padded]overlay=format=auto:enable='between(t\\,${t(clip.timelineStart)}\\,${t(enableEnd)})'[${outputLabel}]`
+            );
+          } else {
+            // Fan the ONE already-rendered text stream out into N independent pads — same `split=`
+            // fan-out mechanism (and reasoning: a filter-graph pad can only be consumed ONCE) this
+            // session's own `pushKeyframedClipVideoFilters` fix already established and proved live
+            // against the real FFmpeg binary — then crop/pad EACH pad to its own slice's own rectangle,
+            // and chain N sequential `overlay`s onto the accumulating `videoOut`, each confined to its
+            // own ABSOLUTE-timeline window via `enable=`, exactly mirroring `buildKeyframedDrawTextCalls`'s
+            // own per-slice `enable` windows (last slice extends to the real fade-adjusted `enableEnd`,
+            // not its own nominal boundary — same reasoning that function's own comment gives).
+            const splitLabels = cropSlices.map((_, i) => `${outputLabel}_cropsplit${i}`);
+            filters.push(`[${drawOutputLabel}]split=${cropSlices.length}${splitLabels.map((l) => `[${l}]`).join("")}`);
+
+            let chainInput = videoOut;
+            cropSlices.forEach((slice, i) => {
+              const isLast = i === cropSlices.length - 1;
+              const paddedLabel = `${outputLabel}_padded${i}`;
+              filters.push(buildTextCropFilter(splitLabels[i], slice.crop, paddedLabel, width, height));
+              const stepLabel = isLast ? outputLabel : `${outputLabel}_cropov${i}`;
+              const sliceStart = clip.timelineStart + slice.offset;
+              const sliceEnd = isLast ? enableEnd : clip.timelineStart + slice.offset + slice.duration;
+              filters.push(
+                `${chainInput}[${paddedLabel}]overlay=format=auto:enable='between(t\\,${t(sliceStart)}\\,${t(sliceEnd)})'[${stepLabel}]`
+              );
+              chainInput = `[${stepLabel}]`;
+            });
+          }
         }
       }
       videoOut = `[${outputLabel}]`;

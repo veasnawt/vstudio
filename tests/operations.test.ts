@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { clipDuration, findClip } from "../src/project/createProject.ts";
-import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../src/project/types.ts";
 import {
   addClip,
   addTrack,
@@ -17,6 +17,7 @@ import {
   setClipGain,
   setClipMuted,
   setClipTextCrop,
+  setClipTextCropKeyframes,
   setClipTransform,
   setClipTransformKeyframes,
   setClipTransitionIn,
@@ -720,6 +721,68 @@ describe("setClipTextCrop", () => {
   it("rejects an unknown clip", () => {
     const project = emptyProject();
     assert.throws(() => setClipTextCrop(project, "missing", { top: 0, right: 0, bottom: 0, left: 0 }), EditError);
+  });
+});
+
+describe("setClipTextCropKeyframes", () => {
+  it("stores a sorted, clamped keyframe array on the clip", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const result = setClipTextCropKeyframes(project, clip.id, [
+      { id: "b", time: 5, value: { ...IDENTITY_TEXT_CROP, top: 0.2 } },
+      { id: "a", time: 1, value: IDENTITY_TEXT_CROP },
+    ]);
+    const [stored] = clipsOf(result, videoTrackId(result));
+
+    assert.deepEqual(
+      stored.textCropKeyframes?.map((k) => [k.id, k.time]),
+      [
+        ["a", 1],
+        ["b", 5],
+      ]
+    );
+  });
+
+  it("clamps each keyframe's own value the same edge-pair-rebalancing way setClipTextCrop does", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const result = setClipTextCropKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: { top: 0.9, bottom: 0.9, left: 0, right: 0 } },
+    ]);
+    const [stored] = clipsOf(result, videoTrackId(result));
+    const { top, bottom } = stored.textCropKeyframes![0].value;
+
+    assert.ok(top + bottom < 1, `top+bottom was ${top + bottom}, would leave nothing visible`);
+    assert.ok(Math.abs(top - bottom) < 1e-9, `expected top and bottom to stay equal, got ${top} vs ${bottom}`);
+  });
+
+  it("null/empty deletes the field entirely", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const armed = setClipTextCropKeyframes(project, clip.id, [{ id: "a", time: 0, value: IDENTITY_TEXT_CROP }]);
+    const disarmed = setClipTextCropKeyframes(armed, clip.id, null);
+
+    assert.equal(clipsOf(disarmed, videoTrackId(disarmed))[0].textCropKeyframes, undefined);
+  });
+
+  it("refuses to set keyframes on a locked track", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setTrackFlag(project, videoTrackId(project), "locked", true);
+
+    assert.throws(() => setClipTextCropKeyframes(project, clip.id, [{ id: "a", time: 0, value: IDENTITY_TEXT_CROP }]), EditError);
+  });
+
+  it("rejects an unknown clip", () => {
+    const project = emptyProject();
+    assert.throws(() => setClipTextCropKeyframes(project, "missing", [{ id: "a", time: 0, value: IDENTITY_TEXT_CROP }]), EditError);
   });
 });
 

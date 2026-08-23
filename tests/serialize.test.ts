@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { deserializeProject, ProjectFormatError, serializeProject } from "../src/project/serialize.ts";
-import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, PROJECT_SCHEMA_VERSION } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, PROJECT_SCHEMA_VERSION } from "../src/project/types.ts";
 import { addClip, addTrack } from "../src/timeline/operations.ts";
 import { emptyProject, textAsset, textTrackId, videoTrackId } from "./fixture.ts";
 
@@ -195,6 +195,38 @@ describe("project serialization", () => {
     const restored = deserializeProject(JSON.stringify(raw));
 
     assert.equal(restored.sequence.tracks[0].clips[0].colorGradingKeyframes, undefined);
+  });
+
+  it("round-trips a clip's textCropKeyframes", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const raw = JSON.parse(serializeProject(project));
+    raw.sequence.tracks[0].clips[0].textCropKeyframes = [
+      { id: "kf1", time: 0, value: IDENTITY_TEXT_CROP },
+      { id: "kf2", time: 4, value: { top: 0.2, right: 0, bottom: 0, left: 0 } },
+    ];
+
+    const restored = deserializeProject(JSON.stringify(raw));
+    const clip = restored.sequence.tracks[0].clips[0];
+
+    assert.deepEqual(
+      clip.textCropKeyframes?.map((k) => [k.id, k.time, k.value]),
+      [
+        ["kf1", 0, IDENTITY_TEXT_CROP],
+        ["kf2", 4, { top: 0.2, right: 0, bottom: 0, left: 0 }],
+      ]
+    );
+  });
+
+  it("treats an empty or malformed textCropKeyframes array as absent", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const raw = JSON.parse(serializeProject(project));
+    raw.sequence.tracks[0].clips[0].textCropKeyframes = [{ id: "bad", time: "soon", value: {} }, "not an object"];
+
+    const restored = deserializeProject(JSON.stringify(raw));
+
+    assert.equal(restored.sequence.tracks[0].clips[0].textCropKeyframes, undefined);
   });
 
   it("regenerates a missing keyframe id rather than dropping the keyframe", () => {

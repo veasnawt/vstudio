@@ -287,6 +287,24 @@ function parseTextStyleKeyframes(raw: unknown): Clip["textStyleKeyframes"] {
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/** Mirrors `parseTransformKeyframes`, for a TEXT clip's TextCrop keyframe list. `r.value` is checked
+ *  truthy+object before calling `parseTextCrop`, which only ever returns `undefined` for exactly that
+ *  case, so the `!` assertion below is safe, same reasoning `parseTransformKeyframes`'s own uses. */
+function parseTextCropKeyframes(raw: unknown): Clip["textCropKeyframes"] {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): NonNullable<Clip["textCropKeyframes"]>[number] | undefined => {
+      if (!entry || typeof entry !== "object") return undefined;
+      const r = entry as Record<string, unknown>;
+      if (typeof r.time !== "number" || !Number.isFinite(r.time)) return undefined;
+      if (!r.value || typeof r.value !== "object") return undefined;
+      return { id: str(r.id, "keyframe id", newId("kf")), time: r.time, value: parseTextCrop(r.value)! };
+    })
+    .filter((k): k is NonNullable<Clip["textCropKeyframes"]>[number] => k !== undefined)
+    .sort((a, b) => a.time - b.time);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 /** Same leniency as `parseClipTransform`/`parseClipEffects` above: chroma key is purely additive
  *  enhancement data. A malformed/missing `color` falls back to `DEFAULT_CHROMA_KEY`'s green rather than
  *  dropping the whole setting — same field-by-field fallback `parseTextStyle` already uses. */
@@ -340,6 +358,7 @@ function parseClip(raw: Record<string, unknown>): Clip {
   const effectsKeyframes = parseEffectsKeyframes(raw.effectsKeyframes);
   const colorGradingKeyframes = parseColorGradingKeyframes(raw.colorGradingKeyframes);
   const textStyleKeyframes = parseTextStyleKeyframes(raw.textStyleKeyframes);
+  const textCropKeyframes = parseTextCropKeyframes(raw.textCropKeyframes);
   return {
     id: str(raw.id, "clip id"),
     assetId: str(raw.assetId, "clip asset reference"),
@@ -358,6 +377,7 @@ function parseClip(raw: Record<string, unknown>): Clip {
     ...(transitionOut ? { transitionOut } : null),
     ...(textAnimation ? { textAnimation } : null),
     ...(textCrop ? { textCrop } : null),
+    ...(textCropKeyframes ? { textCropKeyframes } : null),
     ...(raw.mutedAudio === true ? { mutedAudio: true } : null),
     ...(typeof raw.gain === "number" && Number.isFinite(raw.gain) && raw.gain !== 1
       ? { gain: Math.min(1, Math.max(0, raw.gain)) }

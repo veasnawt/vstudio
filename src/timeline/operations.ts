@@ -642,6 +642,23 @@ export function setClipTextCrop(project: Project, clipId: string, crop: TextCrop
   });
 }
 
+/** Mirrors `setClipTransformKeyframes`, for a text clip's `TextCrop`. */
+export function setClipTextCropKeyframes(project: Project, clipId: string, keyframes: Clip["textCropKeyframes"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!keyframes || keyframes.length === 0) {
+      delete found.clip.textCropKeyframes;
+      return;
+    }
+    const duration = clipDuration(found.clip);
+    found.clip.textCropKeyframes = keyframes
+      .map((k) => ({ id: k.id, time: Math.min(duration, Math.max(0, k.time)), value: clampTextCrop(k.value) }))
+      .sort((a, b) => a.time - b.time);
+  });
+}
+
 const MIN_BRIGHTNESS = -1;
 const MAX_BRIGHTNESS = 1;
 const MIN_CONTRAST = 0;

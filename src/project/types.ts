@@ -199,15 +199,17 @@ export function isIdentityTransform(transform: ClipTransform | undefined): boole
   );
 }
 
-/** Static, non-keyframed, frame-space rectangular crop for a TEXT clip — CSS `overflow: hidden` over
- *  the rendered text, NOT `ClipTransform.crop`'s pre-scale source-pixel crop (text has no source pixels
- *  to crop from). Shaped identically to `ClipTransform.crop` (4 edge-inset fractions, 0..1 — but of the
- *  SEQUENCE FRAME's own width/height, not the text's own dynamically-measured bounding box) purely
- *  because that's the closest existing UI/data precedent in this codebase, not because the two mean the
- *  same thing: text keeps rendering at its normal computed position (`TextStyle.offsetX/offsetY`/
- *  `align`), and this crop is an independent mask over the FRAME on top of that, not a repositioning of
- *  the text block itself. Not keyframed — mirrors `ChromaKeySettings`'s own "static per-clip data, not
- *  keyframed" precedent. */
+/** Frame-space rectangular crop for a TEXT clip — CSS `overflow: hidden` over the rendered text, NOT
+ *  `ClipTransform.crop`'s pre-scale source-pixel crop (text has no source pixels to crop from). Shaped
+ *  identically to `ClipTransform.crop` (4 edge-inset fractions, 0..1 — but of the SEQUENCE FRAME's own
+ *  width/height, not the text's own dynamically-measured bounding box) purely because that's the
+ *  closest existing UI/data precedent in this codebase, not because the two mean the same thing: text
+ *  keeps rendering at its normal computed position (`TextStyle.offsetX/offsetY`/`align`), and this crop
+ *  is an independent mask over the FRAME on top of that, not a repositioning of the text block itself.
+ *  This is the STATIC value — see `Clip.textCropKeyframes` for the animated counterpart, LERP-
+ *  interpolated exactly like `ClipTransform.crop` (every field here is plain numeric, so unlike
+ *  `ColorGrading`'s curves there's no "no natural correspondence between keyframes" problem to hold
+ *  instead of blend). */
 export interface TextCrop {
   top: number;
   right: number;
@@ -380,6 +382,8 @@ export type TextStyleKeyframe = Keyframe<TextStyle>;
 /** Held (never interpolated) between keyframes — see `Clip.colorGradingKeyframes`'s own doc comment for
  *  why smoothly cross-fading between two differently-shaped curves isn't attempted in v1. */
 export type ColorGradingKeyframe = Keyframe<ColorGrading>;
+/** LERP-interpolated between keyframes, like `TransformKeyframe` — see `TextCrop`'s own doc comment. */
+export type TextCropKeyframe = Keyframe<TextCrop>;
 
 /** Every transition style either renderer can produce. Kept to the subset of FFmpeg's own `xfade`
  *  filter's transition names (see `TRANSITION_XFADE_NAME` in `export/buildExportPlan.ts`) that's been
@@ -557,6 +561,14 @@ export interface Clip {
    *  visible), same "small JSON, cheap default path" reasoning as `transform`. See `TextCrop`'s own doc
    *  comment for why this is a separate, frame-space mask rather than reusing `ClipTransform.crop`. */
   textCrop?: TextCrop;
+  /** Mirrors `transformKeyframes`, for a TEXT clip's `TextCrop` — same "present+non-empty is what both
+   *  renderers resolve, absent means not keyframed" contract, and the same clip-scoped (not asset-
+   *  scoped) placement `textStyleKeyframes` uses. `resolveTextCrop` (`timeline/keyframes.ts`) LERPs
+   *  between keyframes, matching `transformKeyframes`'s own convention — every `TextCrop` field is
+   *  plain numeric, so unlike `colorGradingKeyframes` there's no "no natural correspondence between two
+   *  keyframes' shapes" problem forcing a HOLD instead. Meaningful only on a TEXT clip, same gating as
+   *  `textCrop` itself. */
+  textCropKeyframes?: TextCropKeyframe[];
   /** Silences this clip's OWN embedded audio, independent of the track it's on. Distinct from a
    *  video track's `visible` flag (which already silences a hidden clip's audio as a side effect of
    *  hiding it — muting a clip you can still SEE is a genuinely different thing to ask for) and from

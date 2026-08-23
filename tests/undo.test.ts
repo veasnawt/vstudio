@@ -13,6 +13,7 @@ import {
   SetClipEffectsKeyframesCommand,
   SetClipGainCommand,
   SetClipMutedCommand,
+  SetClipTextCropKeyframesCommand,
   SetClipTransformCommand,
   SetClipTransformKeyframesCommand,
   SetClipTransitionCommand,
@@ -27,7 +28,7 @@ import {
 } from "../src/commands/index.ts";
 import type { Command } from "../src/commands/index.ts";
 import type { Project } from "../src/project/types.ts";
-import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../src/project/types.ts";
 import { addClip, addTrack } from "../src/timeline/operations.ts";
 import { UndoStack } from "../src/undo/UndoStack.ts";
 import { audioTrackId, clipsOf, comparable, emptyProject, textAsset, videoAsset, videoTrackId } from "./fixture.ts";
@@ -631,6 +632,35 @@ describe("SetClipEffectsKeyframesCommand", () => {
 
   it("throws on revert if apply was never called — there is no previous value to distinguish from absent", () => {
     const command = new SetClipEffectsKeyframesCommand("clip1", [{ id: "kf1", time: 0, value: IDENTITY_EFFECTS }]);
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    assert.throws(() => command.revert(project), /never applied/);
+  });
+});
+
+describe("SetClipTextCropKeyframesCommand", () => {
+  it("round-trips like every other command", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    assertRoundTrips(project, new SetClipTextCropKeyframesCommand(clip.id, [{ id: "kf1", time: 0, value: IDENTITY_TEXT_CROP }]));
+  });
+
+  it("undoes back to a truly absent textCropKeyframes field, not null", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    const command = new SetClipTextCropKeyframesCommand(clip.id, [{ id: "kf1", time: 0, value: IDENTITY_TEXT_CROP }]);
+
+    const applied = command.apply(project);
+    const reverted = command.revert(applied);
+
+    assert.equal(clipsOf(reverted, videoTrackId(reverted))[0].textCropKeyframes, undefined);
+    assert.deepEqual(comparable(reverted), comparable(project));
+  });
+
+  it("throws on revert if apply was never called — there is no previous value to distinguish from absent", () => {
+    const command = new SetClipTextCropKeyframesCommand("clip1", [{ id: "kf1", time: 0, value: IDENTITY_TEXT_CROP }]);
     const base = emptyProject();
     const project = addClip(base, videoTrackId(base), "asset1", 0);
     assert.throws(() => command.revert(project), /never applied/);

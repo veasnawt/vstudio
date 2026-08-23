@@ -1,6 +1,6 @@
 import { newId } from "../project/createProject.ts";
-import type { Clip, ClipEffects, ClipTransform, ColorGrading, ColorGradingKeyframe, EffectsKeyframe, Keyframe, TextStyle, TextStyleKeyframe, TransformKeyframe } from "../project/types.ts";
-import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../project/types.ts";
+import type { Clip, ClipEffects, ClipTransform, ColorGrading, ColorGradingKeyframe, EffectsKeyframe, Keyframe, TextCrop, TextCropKeyframe, TextStyle, TextStyleKeyframe, TransformKeyframe } from "../project/types.ts";
+import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../project/types.ts";
 import { frameDuration, snapToFrame } from "./time.ts";
 
 export function hasTransformKeyframes(clip: Clip): boolean {
@@ -17,6 +17,10 @@ export function hasColorGradingKeyframes(clip: Clip): boolean {
 
 export function hasTextStyleKeyframes(clip: Clip): boolean {
   return (clip.textStyleKeyframes?.length ?? 0) > 0;
+}
+
+export function hasTextCropKeyframes(clip: Clip): boolean {
+  return (clip.textCropKeyframes?.length ?? 0) > 0;
 }
 
 function lerp(a: number, b: number, p: number): number {
@@ -48,6 +52,15 @@ function lerpEffects(a: ClipEffects, b: ClipEffects, p: number): ClipEffects {
     saturation: lerp(a.saturation, b.saturation, p),
     blur: lerp(a.blur, b.blur, p),
     opacity: lerp(a.opacity, b.opacity, p),
+  };
+}
+
+function lerpTextCrop(a: TextCrop, b: TextCrop, p: number): TextCrop {
+  return {
+    top: lerp(a.top, b.top, p),
+    right: lerp(a.right, b.right, p),
+    bottom: lerp(a.bottom, b.bottom, p),
+    left: lerp(a.left, b.left, p),
   };
 }
 
@@ -127,6 +140,16 @@ export function resolveClipColorGrading(clip: Clip, elapsedSeconds: number): Col
   return "value" in result ? result.value : result.a.value;
 }
 
+/** `clip`'s effective TextCrop at `elapsedSeconds` — `resolveClipTransform`'s own counterpart. Falls
+ *  back to `clip.textCrop ?? IDENTITY_TEXT_CROP` when `textCropKeyframes` is absent/empty, same as
+ *  every other resolver here — zero behavior change for a never-keyframed text clip. */
+export function resolveTextCrop(clip: Clip, elapsedSeconds: number): TextCrop {
+  const kfs = clip.textCropKeyframes;
+  if (!kfs || kfs.length === 0) return clip.textCrop ?? IDENTITY_TEXT_CROP;
+  const result = bracket(kfs, elapsedSeconds);
+  return "value" in result ? result.value : lerpTextCrop(result.a.value, result.b.value, result.progress);
+}
+
 /** `clip`'s effective TextStyle at `elapsedSeconds` — `resolveClipTransform`'s own counterpart, with
  *  one structural difference: TextStyle has no `clip.textStyle` fallback field the way `transform`/
  *  `effects` do (the style lives on the ASSET, not the clip — see `Clip.textStyleKeyframes`'s own doc
@@ -169,4 +192,4 @@ export function upsertKeyframe<T>(keyframes: Keyframe<T>[], atSeconds: number, n
   return [...keyframes, inserted].sort((a, b) => a.time - b.time);
 }
 
-export type { ColorGradingKeyframe, EffectsKeyframe, Keyframe, TransformKeyframe };
+export type { ColorGradingKeyframe, EffectsKeyframe, Keyframe, TextCropKeyframe, TransformKeyframe };
