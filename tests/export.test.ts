@@ -6,24 +6,42 @@ import {
   addClip,
   addTrack,
   moveClip,
+  setClipColorGrading,
+  setClipColorGradingKeyframes,
   setClipEffects,
+  setClipEffectsKeyframes,
   setClipGain,
   setClipMuted,
+  setClipTextAnimation,
+  setClipTextCrop,
+  setClipTextStyleKeyframes,
   setClipTransform,
+  setClipTransformKeyframes,
   setClipTransitionIn,
+  setClipTransitionOut,
+  setMasterGain,
   setTextAsset,
   setTrackFlag,
+  setTrackGain,
   splitClip,
   trimClip,
 } from "../src/timeline/operations.ts";
 import { audioAsset, audioTrackId, clipsOf, closeTo, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
-import { DEFAULT_TEXT_STYLE, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
+import { DEFAULT_WORD_HIGHLIGHT_COLOR } from "../src/timeline/textAnimation.ts";
+
+/** "#rrggbb" → the same `&H00bbggrr` form `buildExportPlan.ts`'s own (unexported) `assColor` produces —
+ *  duplicated here deliberately rather than exported from production code purely for a test to import,
+ *  matching this test file's existing style of asserting against literal expected strings elsewhere. */
+function assColorForTest(hex: string): string {
+  return `&H00${hex.slice(5, 7)}${hex.slice(3, 5)}${hex.slice(1, 3)}`;
+}
 
 const options = {
   inputPathFor: (assetId: string) => `/media/${assetId}.mp4`,
   outputPath: "/out/export.mp4",
   fontPathFor: (fileName: string) => `/fonts/${fileName}`,
-  textFilePathFor: (clip: { id: string }) => `/tmp/${clip.id}.txt`,
+  textFilePathFor: (clip: { id: string }, _content: string, variant?: string) => `/tmp/${clip.id}${variant ? `-${variant}` : ""}.txt`,
 };
 
 function plan(project: Parameters<typeof buildExportPlan>[0]) {
@@ -130,15 +148,24 @@ describe("buildExportPlan", () => {
     assert.match(graph, /setsar=1/);
   });
 
-  it("positions an audio-track clip with adelay and mixes it without attenuation", () => {
+  it("positions an audio-track clip with a leading silent gap segment, then mixes the track in", () => {
     const base = emptyProject([videoAsset("asset1", 10), audioAsset()]);
     let project = addClip(base, videoTrackId(base), "asset1", 0);
     project = addClip(project, audioTrackId(project), "music", 2);
 
-    const graph = filterGraph(plan(project).args);
+    const { args } = plan(project);
+    const graph = filterGraph(args);
 
-    assert.match(graph, /adelay=2000\|2000/);
-    assert.match(graph, /amix=inputs=2:normalize=0/);
+    // Positioned via a 2s silent gap segment ahead of the clip's own audio, concatenated into one
+    // per-track stream — the same "pad with silence, then concat" mechanism a video track's own audio
+    // already uses, not `adelay` (replaced so this track can also support real `acrossfade`
+    // transitions between its own clips — see `buildAudioTrackStream`'s own comment). The gap's own
+    // silence source is an `-i` input argument, not part of the filter graph string itself — same
+    // place every other generated-silence input in this suite gets checked (e.g. the image tests'
+    // "gives a silent still a generated audio pad" above).
+    assert.ok(args.some((a) => a.startsWith("anullsrc")), "the leading gap needs a generated silent pad");
+    assert.match(graph, /concat=n=2:v=0:a=1\[at0\]/);
+    assert.match(graph, /\[ca0\]\[at0\]amix=inputs=2:normalize=0/);
   });
 
   it("omits the mix stage entirely when there are no audio-track clips", () => {
@@ -181,6 +208,51 @@ describe("buildExportPlan", () => {
     const project = addClip(base, videoTrackId(base), "asset1", 0);
 
     assert.throws(() => plan(project), ExportError);
+  });
+});
+
+describe("buildExportPlan when exportSettings' own resolution differs from the sequence's", () => {
+  it("uses the SEQUENCE's own width/height for every internal filter, not exportSettings' — regression for a real position-shift bug", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    // The sequence itself stays at its default 1080x1920 (every position/crop/offset in the whole app
+    // is authored against THIS canvas, via the live preview) — only the export dialog's own,
+    // independently-editable resolution differs, exactly like a user picking a smaller/different preset
+    // there. Confirmed live against the real FFmpeg binary: before this fix, a `TextStyle.offsetX: 100`
+    // landed at 20.4% from the left edge at a mismatched 720x1280 export instead of the correct 13.6% —
+    // this test guards the mechanism (internal canvas size), not the specific pixel math (covered by
+    // the text-position tests elsewhere).
+    project = { ...project, exportSettings: { ...project.exportSettings, width: 720, height: 1280 } };
+
+    const graph = filterGraph(plan(project).args);
+
+    // The plain scale+pad chain (see "letterboxes into the export frame rather than stretching" above)
+    // must still target the SEQUENCE's own 1080x1920 — proving every clip's own geometry is computed
+    // against the canvas preview actually shows, unaffected by the mismatched export size.
+    assert.match(graph, /pad=1080:1920/);
+  });
+
+  it("conforms the fully-composited result to the REQUESTED export size in one closing scale/pad stage", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = { ...project, exportSettings: { ...project.exportSettings, width: 720, height: 1280 } };
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    // Exactly one additional conform stage, targeting the requested 720x1280 — distinct from the
+    // per-clip 1080x1920 pad already asserted above.
+    assert.match(graph, /\[cv0\]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:\(ow-iw\)\/2:\(oh-ih\)\/2,setsar=1\[conformed\]/);
+    assert.equal(args[args.indexOf("-map") + 1], "[conformed]", "the map target must be the conformed output, not the raw sequence-sized composite");
+  });
+
+  it("skips the conform stage entirely — byte-for-byte identical graph — when the sizes already match (the common case)", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("[conformed]"), "no project ever pays for this stage unless it actually asked for a different export size");
   });
 });
 
@@ -305,6 +377,178 @@ describe("buildExportPlan with a real transform", () => {
   });
 });
 
+describe("buildExportPlan with keyframed transform/effects", () => {
+  it("a plain clip's filter graph never mentions the slicing machinery (regression)", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("_kf"), "an unkeyframed clip must not go through per-slice labels");
+    assert.ok(!graph.includes("v=1:a=0"), "the keyframe inner concat pattern must not appear for a plain clip");
+  });
+
+  it("slices a keyframed Transform clip into the expected number of static sub-segments, concatenated video-only", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 0.5, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    // A single 0.5s gap subdivided at the 0.15s base interval: ceil(0.5 / 0.15) = 4 slices.
+    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    // Each slice goes through the exact same buildTransformFilters chain a static transformed clip
+    // uses (crop/eq/scale/rotate/overlay) — 4 full occurrences, one per slice.
+    assert.equal((graph.match(/overlay=x=/g) ?? []).length, 4);
+  });
+
+  it("slices a keyframed Effects clip the same way", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipEffectsKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: { ...IDENTITY_EFFECTS, opacity: 1 } },
+      { id: "b", time: 0.5, value: { ...IDENTITY_EFFECTS, opacity: 0 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    assert.equal((graph.match(/lutyuv=/g) ?? []).length, 4);
+  });
+
+  it("slices a clip keyframed ONLY on ColorGrading (no transform/effects keyframes) the same way", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    // The boundary at 0.25 sits STRICTLY inside the 0.5s clip (unlike the transform/effects tests
+    // above, whose second keyframe sits at the clip's own end and never actually becomes a mid-clip
+    // boundary) — this is what actually exercises the HOLD-not-lerp behavior: every slice before 0.25
+    // must resolve to the identity keyframe, every slice from 0.25 onward to the non-identity one.
+    project = setClipColorGradingKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_COLOR_GRADING },
+      { id: "b", time: 0.25, value: { ...IDENTITY_COLOR_GRADING, master: [{ x: 0, y: 0.2 }, { x: 1, y: 1 }] } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    // Confirms the `hasColorGradingKeyframes` gate: a color-grading-only keyframed clip must still
+    // route through the keyframed slicing path, not the plain one.
+    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    assert.equal((graph.match(/overlay=x=/g) ?? []).length, 4);
+    // Only the 2 post-boundary slices carry a `curves=` fragment — the 2 pre-boundary slices hold the
+    // identity curve, which emits no fragment at all (see `buildCurvesFilterFragment`'s own `null`
+    // shape).
+    assert.equal((graph.match(/curves=interp=natural:/g) ?? []).length, 2);
+  });
+
+  it("never slices audio — exactly one audio chain for a keyframed clip, not one per slice", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 0.5, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.equal((graph.match(/aresample=48000/g) ?? []).length, 1);
+  });
+
+  it("a keyframed clip with no real audio produces no wasted audio-only source input", () => {
+    const base = emptyProject([{ ...videoAsset("asset1", 0.5), hasAudio: false }]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 0.5, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("aresample=48000"), "no real audio to extract — must fall back to anullsrc");
+    assert.ok(args.some((a) => a.startsWith("anullsrc")), "a keyframed clip with no audio still needs a generated silent pad");
+  });
+
+  it("opens the real source and the background color exactly once per segment, not once per slice (ENAMETOOLONG regression)", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 0.5, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+    const inputValuesAfter = (flag: string) => args.filter((a, i) => args[i - 1] === flag);
+
+    // 4 slices (see the earlier "slices a keyframed Transform clip..." test), but the real source path
+    // must be opened only twice — once for `pushKeyframedClipVideoFilters`'s own segment-wide source,
+    // once for `pushKeyframedAudio`'s own separate (and always segment-wide, never per-slice) audio
+    // source — never once per slice. Before this fix it was opened 5 times here (4 video + 1 audio),
+    // and grew unboundedly with slice count on a longer clip (see the regression test below).
+    assert.equal(inputValuesAfter("-i").filter((v) => v === "/media/asset1.mp4").length, 2);
+    // The synthetic background color source has no audio counterpart, so it must be opened exactly once.
+    assert.equal(inputValuesAfter("-i").filter((v) => v.startsWith("color=")).length, 1);
+
+    // In-graph fan-out replaces the old per-slice re-opens: one `split=4` for the source pad, one for
+    // the background pad.
+    assert.equal((graph.match(/split=4\[/g) ?? []).length, 2);
+  });
+
+  it("trims each fanned-out slice pad to its own telescoping, zero-based sub-range", () => {
+    const base = emptyProject([videoAsset("asset1", 0.5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 0.5, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    const srcTrims = [...graph.matchAll(/_kfsrcsplit\d+\]trim=start=([\d.]+):end=([\d.]+),setpts=PTS-STARTPTS/g)].map(
+      (m) => [Number(m[1]), Number(m[2])] as const
+    );
+    assert.equal(srcTrims.length, 4, "one trim= per slice, reading from its own split-fanned pad");
+    assert.equal(srcTrims[0][0], 0, "the first slice's trim starts at the segment's own zero");
+    assert.equal(srcTrims[srcTrims.length - 1][1], 0.5, "the last slice's trim ends at the segment's own end");
+    for (let i = 1; i < srcTrims.length; i++) {
+      assert.equal(srcTrims[i][0], srcTrims[i - 1][1], "slices telescope with no gap or overlap");
+    }
+  });
+
+  it("keeps the input count constant, not proportional to slice count, on a long clip driven to the adaptive slice ceiling (ENAMETOOLONG regression)", () => {
+    // A 220s clip with keyframes spanning its whole duration forces `computeSliceBoundaries`'s own
+    // adaptive recompute (see its doc comment), landing on exactly `MAX_KEYFRAME_SLICES_PER_CLIP` = 240
+    // slices — the shape of the user's real, reported crash (a long, richly keyframed clip).
+    const base = emptyProject([videoAsset("asset1", 220)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clip.id, [
+      { id: "a", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "b", time: 220, value: { ...IDENTITY_TRANSFORM, scale: 2 } },
+    ]);
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    assert.match(graph, /concat=n=240:v=1:a=0\[/);
+    // The bug this fix targets: the old per-slice-input version pushed 2 fresh `-i` per slice (source +
+    // bg), i.e. 480 for this fixture alone, plus 1 more for audio — 481 total. The fix keeps this fixed
+    // at 3 (source + bg + audio) regardless of slice count.
+    const totalInputCount = args.filter((a) => a === "-i").length;
+    assert.equal(totalInputCount, 3);
+  });
+});
+
 describe("buildExportPlan with clip effects", () => {
   it("keeps the untransformed scale+pad chain byte-for-byte identical when effects are absent too (regression)", () => {
     const base = emptyProject();
@@ -337,7 +581,14 @@ describe("buildExportPlan with clip effects", () => {
 
     const graph = filterGraph(plan(project).args);
 
-    assert.match(graph, /eq=brightness=0\.200000:contrast=1\.300000:saturation=0\.500000/);
+    // Not a literal `eq=brightness=...` — `eq` is GPL-only, so brightness/contrast/saturation are
+    // reproduced via `lutyuv` instead (see `buildTransformFilters`'s own comment on the exact
+    // per-plane formula this mirrors). contrast=1.3 is the `y=` multiplier, brightness=0.2*255=51 is
+    // its additive offset, saturation=0.5 is the `u=`/`v=` multiplier.
+    assert.match(
+      graph,
+      /lutyuv=y='clip\(\(val-127\.5\)\*1\.300000\+127\.5\+51\.000000,0,255\)':u='clip\(\(val-127\.5\)\*0\.500000\+127\.5,0,255\)':v='clip\(\(val-127\.5\)\*0\.500000\+127\.5,0,255\)'/
+    );
     // Neutral (untouched) geometry — scale multiplier of 1, offset of 0 — since only effects were set.
     assert.match(graph, /scale=w='iw\*min\(1080\/iw,1920\/ih\)\*1\.000000'/);
     assert.match(graph, /overlay=x='\(W-w\)\/2\+0\.000000':y='\(H-h\)\/2\+0\.000000':format=auto/);
@@ -380,8 +631,69 @@ describe("buildExportPlan with clip effects", () => {
 
     const graph = filterGraph(plan(project).args);
 
-    assert.match(graph, /eq=brightness=0\.000000:contrast=1\.000000:saturation=0\.000000/);
+    // See the earlier "effects-only clip" test for why this is `lutyuv`, not `eq`. Identity
+    // brightness/contrast (0/1) with saturation zeroed out.
+    assert.match(
+      graph,
+      /lutyuv=y='clip\(\(val-127\.5\)\*1\.000000\+127\.5\+0\.000000,0,255\)':u='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)':v='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)'/
+    );
     assert.match(graph, /rotate=a=20\.000000\*PI\/180/);
+  });
+});
+
+describe("buildExportPlan with clip color grading", () => {
+  it("keeps the untransformed scale+pad chain byte-for-byte identical when color grading is absent too (regression)", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("curves="), "a color-grading-less clip must not go through the curves chain");
+    assert.ok(!graph.includes("rotate="), "a color-grading-less clip must not go through the full transform chain");
+  });
+
+  it("an explicit identity color grading object takes the same untransformed path as none at all", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipColorGrading(project, clip.id, IDENTITY_COLOR_GRADING);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /scale=1080:1920:force_original_aspect_ratio=decrease/);
+    assert.ok(!graph.includes("curves="));
+  });
+
+  it("a color-grading-only clip (no real transform/effects) still routes through the full chain", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipColorGrading(project, clip.id, {
+      ...IDENTITY_COLOR_GRADING,
+      master: [{ x: 0, y: 0 }, { x: 0.5, y: 0.6 }, { x: 1, y: 1 }],
+    });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /curves=interp=natural:master='0\.000000\/0\.000000 0\.500000\/0\.600000 1\.000000\/1\.000000'/);
+    // Positioned right after the (unconditional) eq/lutyuv fragment, before scale — mirrors
+    // `PlaybackEngine.ts`'s own post-chroma-key/pre-geometry placement of its curves LUT pass.
+    const eqIndex = graph.indexOf("lutyuv=");
+    const curvesIndex = graph.indexOf("curves=");
+    const scaleIndex = graph.indexOf("scale=w=");
+    assert.ok(eqIndex >= 0 && curvesIndex > eqIndex && scaleIndex > curvesIndex);
+  });
+
+  it("only emits master=, never all=", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipColorGrading(project, clip.id, { ...IDENTITY_COLOR_GRADING, master: [{ x: 0, y: 0.1 }, { x: 1, y: 1 }] });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(graph.includes("master="));
+    assert.ok(!graph.includes("all="));
   });
 });
 
@@ -441,7 +753,7 @@ describe("buildExportPlan with clip gain", () => {
     assert.match(graph, /aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=0\.500000/);
   });
 
-  it("an audio-track overlay clip's gain appears in its own filter chain, alongside its adelay", () => {
+  it("an audio-track overlay clip's gain appears in its own filter chain", () => {
     const base = emptyProject([videoAsset("asset1", 10), audioAsset()]);
     let project = addClip(base, videoTrackId(base), "asset1", 0);
     project = addClip(project, audioTrackId(project), "music", 2);
@@ -450,7 +762,7 @@ describe("buildExportPlan with clip gain", () => {
 
     const graph = filterGraph(plan(project).args);
 
-    assert.match(graph, /adelay=2000\|2000,volume=0\.250000/);
+    assert.match(graph, /aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=0\.250000/);
   });
 
   it("muting still wins over gain — a muted-and-gained clip still gets silence, not a scaled real stream", () => {
@@ -464,6 +776,54 @@ describe("buildExportPlan with clip gain", () => {
 
     assert.ok(args.some((a) => a.startsWith("anullsrc")), "muted still substitutes silence regardless of gain");
     assert.ok(!filterGraph(args).includes("volume="), "no volume filter is meaningful against a silent pad");
+  });
+});
+
+describe("buildExportPlan with track/master gain", () => {
+  it("multiplies an audio-track clip's own gain by its track's gain", () => {
+    const base = emptyProject([videoAsset("asset1", 10), audioAsset()]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, audioTrackId(project), "music", 2);
+    const [musicClip] = clipsOf(project, audioTrackId(project));
+    project = setClipGain(project, musicClip.id, 2);
+    project = setTrackGain(project, audioTrackId(project), 1.5);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /volume=3\.000000/);
+  });
+
+  it("an audio track with no gain set contributes no extra multiplier — a bare clip gain passes through unchanged", () => {
+    const base = emptyProject([videoAsset("asset1", 10), audioAsset()]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, audioTrackId(project), "music", 2);
+    const [musicClip] = clipsOf(project, audioTrackId(project));
+    project = setClipGain(project, musicClip.id, 0.25);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /volume=0\.250000/);
+  });
+
+  it("applies a final master volume= stage after the last amix, only when masterGain isn't 1", () => {
+    const base = emptyProject([videoAsset("asset1", 10), audioAsset()]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, audioTrackId(project), "music", 2);
+    project = setMasterGain(project, 1.5);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /amix=inputs=\d+:normalize=0:dropout_transition=0\[mixa\];\[mixa\]volume=1\.500000\[mastered\]/);
+    assert.ok(plan(project).args.includes("[mastered]"), "the final -map should point at the mastered output");
+  });
+
+  it("omits the master volume= stage entirely when masterGain is left at 1", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("[mastered]"), "an unadjusted master level should generate byte-identical output to before this feature");
   });
 });
 
@@ -697,8 +1057,10 @@ describe("buildExportPlan with text clips", () => {
     const { args } = plan(project);
     const graph = filterGraph(args);
 
-    // A fresh full-sequence-duration transparent lavfi input to draw and rotate the text onto.
-    assert.ok(args.includes("color=c=black@0:s=1080x1920:r=30"));
+    // A fresh full-sequence-duration transparent lavfi input to draw and rotate the text onto. The
+    // trailing `,format=rgba` is load-bearing (see `buildExportPlan.ts`'s own comment on this input) —
+    // without it FFmpeg's `color` lavfi source silently drops the `@0` alpha at the source.
+    assert.ok(args.includes("color=c=black@0:s=1080x1920:r=30,format=rgba"));
     assert.match(graph, /drawtext=.*\[txt0_drawn\]/);
     assert.match(graph, /\[txt0_drawn\]format=rgba,rotate=a=45\.000000\*PI\/180:ow=rotw\(45\.000000\*PI\/180\):oh=roth\(45\.000000\*PI\/180\):c=black@0\[txt0_rot\]/);
     assert.match(graph, /\[cv0\]\[txt0_rot\]overlay=x='\(W-w\)\/2\+0\.000000':y='\(H-h\)\/2\+0\.000000':format=auto:enable='between\(t\\,/);
@@ -732,6 +1094,741 @@ describe("buildExportPlan with text clips", () => {
     assert.match(graph, /\[cv0\]drawtext=.*\[txt0\]/);
     assert.match(graph, /\[txt0\]\[txt1_rot\]overlay=/);
     assert.equal(args[args.indexOf("-map") + 1], "[txt1]");
+  });
+});
+
+describe("buildExportPlan with text animations", () => {
+  it("bounce adds a time-varying -abs(sin(...)) term onto the plain y expression", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hop")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 2);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "bounce" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[cv0\]drawtext=/, "bounce stays on the plain (non-rotated) drawtext path");
+    assert.match(
+      graph,
+      /y=\(h\/2\)\+0\.000000-text_h\/2-abs\(sin\(2\*PI\*\(\(t-2\.000000\)\*1\.000000\)\/0\.900000\)\)\*14\.000000/
+    );
+  });
+
+  it("bounce's speed multiplier scales the elapsed-time term, not the amplitude or period", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hop")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "bounce", speed: 2 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\(\(t-0\.000000\)\*2\.000000\)\/0\.900000/);
+  });
+
+  it("pulse renders fontsize as a quoted sin(...)-modulated expression instead of a plain number", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Grow")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Grow", { ...DEFAULT_TEXT_STYLE, fontSize: 64 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "pulse" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(
+      graph,
+      /fontsize='64\.000000\*\(1\+sin\(2\*PI\*\(\(t-0\.000000\)\*1\.000000\)\/1\.100000\)\*0\.080000\)'/
+    );
+    // x/y stay the plain, unmodified expressions — `text_w`/`text_h` already re-track the animated size
+    // every frame on their own (see this feature's own empirical FFmpeg verification notes).
+    assert.match(graph, /y=\(h\/2\)\+0\.000000-text_h\/2:/);
+  });
+
+  it("a static rotationDeg combined with bounce or pulse renders as plain static rotated text, animation ignored", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Spin")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Spin", { ...DEFAULT_TEXT_STYLE, rotationDeg: 20 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "pulse" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("sin("), "a documented scope cut — the rotated path never adds a pulse/bounce term");
+    assert.match(graph, /rotate=a=20\.000000\*PI\/180:ow=rotw\(20\.000000\*PI\/180\):oh=roth\(20\.000000\*PI\/180\)/);
+  });
+
+  it("wiggle routes even an UNrotated clip through the rotate pipeline, angle animating with a fixed buffer size", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Shake")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wiggle" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(
+      graph,
+      /rotate=a=\(0\.000000\+sin\(2\*PI\*\(\(t-0\.000000\)\*1\.000000\)\/1\.300000\)\*6\.000000\)\*PI\/180:ow=rotw\(6\.000000\*PI\/180\):oh=roth\(6\.000000\*PI\/180\)/
+    );
+  });
+
+  it("wiggle combined with a static rotationDeg offsets the animated angle and sizes the buffer for the worst case", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Shake")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Shake", { ...DEFAULT_TEXT_STYLE, rotationDeg: 20 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wiggle" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /rotate=a=\(20\.000000\+sin\(/);
+    // 20 (static) + 6 (wiggle's own amplitude) — the fixed worst-case bound `ow`/`oh` need up front.
+    assert.match(graph, /ow=rotw\(26\.000000\*PI\/180\):oh=roth\(26\.000000\*PI\/180\)/);
+  });
+
+  it("typewriter chains one drawtext per revealed-prefix step, each with its own text file and enable window", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hi!")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "typewriter" });
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    // "Hi!" is 3 characters — 3 chained drawtext calls, the first two writing into intermediate labels,
+    // the last one writing into the SAME `txt0` label every other text clip's final call would use.
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    assert.equal(drawtextCount, 3);
+    assert.ok(graph.includes(`textfile='/tmp/${textClip.id}-tw1.txt'`));
+    assert.ok(graph.includes(`textfile='/tmp/${textClip.id}-tw2.txt'`));
+    assert.ok(graph.includes(`textfile='/tmp/${textClip.id}-tw3.txt'`));
+    assert.match(graph, /\[cv0\]drawtext=.*\[txt0_tw1\]/);
+    assert.match(graph, /\[txt0_tw1\]drawtext=.*\[txt0_tw2\]/);
+    assert.match(graph, /\[txt0_tw2\]drawtext=.*\[txt0\]/);
+    // Step k's own window is exactly one character-duration wide (1 / 18 chars-per-second here); the
+    // FINAL step's window instead extends to the clip's own end, not just one more character-width.
+    assert.ok(graph.includes(`enable='between(t\\,0.000000\\,0.055556)'`));
+    assert.ok(graph.includes(`enable='between(t\\,0.055556\\,0.111111)'`));
+    assert.equal(args[args.indexOf("-map") + 1], "[txt0]");
+  });
+
+  it("typewriter's speed multiplier shortens each character's reveal window", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hi")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "typewriter", speed: 2 });
+
+    const graph = filterGraph(plan(project).args);
+
+    // 18 chars/sec * 2 speed = 36 chars/sec → each step is 1/36s wide instead of 1/18s.
+    assert.ok(graph.includes(`enable='between(t\\,0.000000\\,0.027778)'`));
+  });
+
+  it("a rotated clip with typewriter renders as plain static full text, animation ignored (same documented scope cut)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Spin")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Spin", { ...DEFAULT_TEXT_STYLE, rotationDeg: 15 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "typewriter" });
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    assert.equal(drawtextCount, 1, "no per-character chain — a single static drawtext, same as a plain rotated clip");
+    assert.ok(graph.includes(`textfile='/tmp/${textClip.id}.txt'`));
+  });
+
+  it("wordHighlight without ASS capability options supplied falls back to plain static full text", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two Three")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight", highlightColor: "#ff00ff" });
+
+    // The shared `options` fixture at the top of this file omits `assFilePathFor`/`fontMetricsFor`/
+    // `fontsDirFor` — same as a caller (e.g. a not-yet-updated mobile export) that hasn't wired up ASS
+    // support at all.
+    const graph = filterGraph(plan(project).args);
+
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    assert.equal(drawtextCount, 1);
+    assert.ok(!graph.includes("#ff00ff".slice(1)), "the highlight color never reaches the filter graph");
+  });
+});
+
+describe("buildExportPlan with text crop", () => {
+  it("a crop-less clip's filter graph is byte-for-byte identical to before this feature (regression)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 2);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[cv0\]drawtext=/, "still the plain onto-[cv0] chain, no isolate/crop/pad stage");
+    assert.ok(!graph.includes("_iso"), "no isolated buffer for a crop-less clip");
+    assert.ok(!graph.includes("crop="));
+    assert.ok(!graph.includes("_padded"));
+  });
+
+  it("an explicit identity crop takes the same untransformed path as no crop at all", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCrop(project, textClip.id, { top: 0, right: 0, bottom: 0, left: 0 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[cv0\]drawtext=/);
+    assert.ok(!graph.includes("crop="));
+  });
+
+  it("a cropped plain-text clip gets an isolated buffer, crop/pad fragment, and overlay onto [cv0]", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCrop(project, textClip.id, { top: 0.1, right: 0.2, bottom: 0.3, left: 0.4 });
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    // The isolated full-frame transparent buffer text draws onto instead of [cv0].
+    assert.ok(args.includes("color=c=black@0:s=1080x1920:r=30,format=rgba"));
+    assert.match(graph, /drawtext=.*\[txt0_iso\]/, "drawtext should chain onto the isolated buffer, not [cv0]");
+    assert.ok(!graph.includes("[cv0]drawtext="), "must NOT draw directly onto the shared video stream when cropped");
+
+    // 1080 * 0.4 = 432 (left), 1920 * 0.1 = 192 (top), 1080 * (1-0.4-0.2) = 432 (w), 1920 * (1-0.1-0.3) = 1152 (h).
+    assert.match(
+      graph,
+      /\[txt0_iso\]crop=w=432\.000000:h=1152\.000000:x=432\.000000:y=192\.000000,format=rgba,pad=w=1080\.000000:h=1920\.000000:x=432\.000000:y=192\.000000:color=black@0\[txt0_padded\]/
+    );
+    assert.match(graph, /\[cv0\]\[txt0_padded\]overlay=format=auto:enable='between\(t\\,0\.000000\\,/);
+    assert.equal(args[args.indexOf("-map") + 1], "[txt0]");
+  });
+
+  it("a cropped bounce clip keeps its own expression term unchanged, redirected onto the isolated input", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hop")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 2);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "bounce" });
+    project = setClipTextCrop(project, textClip.id, { top: 0, right: 0, bottom: 0.5, left: 0 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /drawtext=.*\[txt0_iso\]/, "bounce redirected onto the isolated input");
+    assert.ok(!graph.includes("[cv0]drawtext="));
+    // Same expression this exact case already asserts in the "bounce adds a time-varying..." test above
+    // — confirms the animation math itself is untouched by the crop redirect.
+    assert.match(
+      graph,
+      /y=\(h\/2\)\+0\.000000-text_h\/2-abs\(sin\(2\*PI\*\(\(t-2\.000000\)\*1\.000000\)\/0\.900000\)\)\*14\.000000/
+    );
+    assert.match(graph, /crop=w=.*\[txt0_padded\]/);
+  });
+
+  it("a cropped rotated clip keeps its own pre-rotation bgIndex input, plus a SEPARATE isolated input for the crop redirect", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Spin")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Spin", { ...DEFAULT_TEXT_STYLE, rotationDeg: 45 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCrop(project, textClip.id, { top: 0.2, right: 0, bottom: 0, left: 0 });
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+
+    // Two SEPARATE full-frame transparent lavfi inputs — one for the rotation path's own pre-rotation
+    // canvas (unchanged), one for the crop-isolation redirect.
+    const isolatedInputCount = args.filter((a) => a === "color=c=black@0:s=1080x1920:r=30,format=rgba").length;
+    assert.equal(isolatedInputCount, 2);
+    assert.match(graph, /drawtext=.*\[txt0_iso_drawn\]/);
+    assert.match(graph, /rotate=a=45\.000000\*PI\/180.*\[txt0_iso\]/, "the rotated path's own final overlay targets the isolated buffer, not [cv0]");
+    assert.match(graph, /\[txt0_iso\]crop=/, "crop/pad picks up the ALREADY frame-sized rotated-path result");
+    assert.match(graph, /\[cv0\]\[txt0_padded\]overlay=format=auto:enable=/);
+  });
+
+  it("fade in/out still applies inside the isolate stage when combined with crop", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Fading")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTransitionIn(project, textClip.id, { duration: 0.5, type: "crossfade" });
+    project = setClipTextCrop(project, textClip.id, { top: 0.1, right: 0, bottom: 0, left: 0 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /drawtext=.*alpha='min\(1\\,\(t-0\.000000\)\/0\.500000\)'.*\[txt0_iso\]/);
+    assert.match(graph, /\[cv0\]\[txt0_padded\]overlay=format=auto:enable='between\(t\\,0\.000000\\,/);
+  });
+});
+
+describe("buildExportPlan with keyframed text style", () => {
+  it("a non-keyframed clip's filter graph is byte-for-byte unchanged, no _kf labels or concat= at all (regression)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[cv0\]drawtext=/);
+    assert.ok(!graph.includes("_kf"), "no per-slice labels for a non-keyframed clip");
+  });
+
+  it("slices into the expected number of chained drawtext calls for a known keyframe gap", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    let [textClip] = clipsOf(project, textTrackId(project));
+    // Trim to exactly 1 second so the keyframe pair spans the clip's ENTIRE duration (no extra tail
+    // segment past the last keyframe to also subdivide) -- one 1s gap -> ceil(1/0.15) = 7 slices.
+    project = trimClip(project, textClip.id, "out", 1);
+    [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.equal((graph.match(/drawtext=/g) ?? []).length, 7);
+  });
+
+  it("two slices produce genuinely different x= literals, proving real interpolation reached the filter string", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+    const xLiterals = [...graph.matchAll(/x=\(\(w\/2\)\+(-?\d+\.\d+)\)-text_w\/2/g)].map((m) => m[1]);
+
+    assert.ok(xLiterals.length >= 2, "expected multiple slices, each with their own x= literal");
+    assert.notEqual(xLiterals[0], xLiterals[xLiterals.length - 1], "first and last slice must resolve to different offsetX values");
+    // First slice should be close to the start keyframe's value, last close to the end keyframe's.
+    assert.ok(Number(xLiterals[0]) < 0, `first slice's offsetX should still be negative, got ${xLiterals[0]}`);
+    assert.ok(Number(xLiterals[xLiterals.length - 1]) > 0, `last slice's offsetX should be positive, got ${xLiterals[xLiterals.length - 1]}`);
+  });
+
+  it("bounce's own expression term is unchanged and present in every slice", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hop")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 2);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "bounce" });
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -50 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 50 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    const bounceCount = (graph.match(/-abs\(sin\(2\*PI\*\(\(t-2\.000000\)\*1\.000000\)\/0\.900000\)\)\*14\.000000/g) ?? []).length;
+
+    assert.ok(drawtextCount > 1, "should be sliced into multiple chained calls");
+    assert.equal(bounceCount, drawtextCount, "the bounce term must appear in every single slice, unchanged");
+  });
+
+  it("composes with textCrop: crop/pad/overlay wraps the whole chained result once, not per slice", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+    project = setClipTextCrop(project, textClip.id, { top: 0, right: 0, bottom: 0.5, left: 0 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok((graph.match(/drawtext=/g) ?? []).length > 1, "still sliced");
+    assert.match(graph, /\[txt0_iso\]drawtext=|drawtext=.*\[txt0_iso\]/, "first slice targets the isolated buffer");
+    assert.equal((graph.match(/crop=w=/g) ?? []).length, 1, "crop applied exactly ONCE, around the whole chained result");
+    assert.equal((graph.match(/\[cv0\]\[txt0_padded\]overlay=/g) ?? []).length, 1);
+  });
+
+  it("wordHighlight wins over textStyleKeyframes when both are set on the same clip", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two Three")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    // Supply the full ASS capability (same fixture shape as the "wordHighlight with ASS/libass
+    // capability" describe block below) so `wordHighlightFilter` genuinely resolves to a real
+    // `subtitles=` filter, not the plain-text fallback — this is what actually exercises the priority
+    // decision, not just the absence of both mechanisms.
+    const { args } = buildExportPlan(project, {
+      ...options,
+      assFilePathFor: (clip, assContent) => {
+        void assContent;
+        return `/tmp/${clip.id}.ass`;
+      },
+      fontMetricsFor: () => ({ family: "TestFamily", fontsizeScale: 1.5 }),
+      fontsDirFor: () => "/fonts",
+    });
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("_kf"), "textStyleKeyframes must not be reachable when wordHighlight is set");
+    assert.ok(!graph.includes("drawtext="), "must route through subtitles=, never drawtext=");
+    assert.match(graph, /subtitles=/);
+  });
+
+  it("textStyleKeyframes wins over typewriter when both are set on the same clip", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hi")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "typewriter" });
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("_tw"), "typewriter's own per-character labels must not appear");
+    assert.ok(graph.includes("_kf"), "keyframe-slicing must have taken over instead");
+  });
+
+  it("fade in/out applies once, shared across every chained slice, not repeated per boundary", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Fading")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTransitionIn(project, textClip.id, { duration: 0.5, type: "crossfade" });
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, offsetX: -100 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, offsetX: 100 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    const alphaCount = (graph.match(/alpha='min\(1\\,\(t-0\.000000\)\/0\.500000\)'/g) ?? []).length;
+
+    assert.ok(drawtextCount > 1);
+    assert.equal(alphaCount, drawtextCount, "the SAME shared alpha ramp is reused verbatim by every slice");
+  });
+
+  it("a keyframe pair crossing zero rotation routes the whole clip through the rotated per-slice chain", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Spin")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "kf1", time: 0, value: { ...DEFAULT_TEXT_STYLE, rotationDeg: 0 } },
+      { id: "kf2", time: 1, value: { ...DEFAULT_TEXT_STYLE, rotationDeg: 45 } },
+    ]);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /rotate=a=/);
+    assert.ok(!graph.includes("[cv0]drawtext="), "must never mix the plain and rotated chains within one clip");
+    // Every slice's own drawtext->rotate->overlay triple.
+    const rotateCount = (graph.match(/rotate=a=/g) ?? []).length;
+    const drawtextCount = (graph.match(/drawtext=/g) ?? []).length;
+    assert.equal(rotateCount, drawtextCount, "one rotate= per slice, matching the per-slice drawtext count");
+  });
+});
+
+describe("buildExportPlan wordHighlight with ASS/libass capability", () => {
+  // A tiny fake `AssFontMetrics` resolver — real font-byte parsing is `readAssFontMetrics`'s own job
+  // (see fonts.test.ts), tested separately; this only needs to exercise buildExportPlan's OWN wiring.
+  const fontMetricsFor = () => ({ family: "TestFamily", fontsizeScale: 1.5 });
+
+  function planWithAss(project: Parameters<typeof buildExportPlan>[0], writtenAss: { content?: string } = {}) {
+    return buildExportPlan(project, {
+      ...options,
+      assFilePathFor: (clip, assContent) => {
+        writtenAss.content = assContent;
+        return `/tmp/${clip.id}.ass`;
+      },
+      fontMetricsFor,
+      fontsDirFor: () => "/fonts",
+    });
+  }
+
+  it("routes a wordHighlight clip through subtitles= instead of drawtext when all three options are supplied", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two Three")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const { args } = planWithAss(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("drawtext="), "a wordHighlight clip with ASS capability never reaches drawtext");
+    assert.match(graph, /\[cv0\]subtitles='\/tmp\/[^']+\.ass':fontsdir='\/fonts'\[txt0\]/);
+    assert.equal(args[args.indexOf("-map") + 1], "[txt0]");
+  });
+
+  it("generates one Dialogue event per word, timed evenly across the clip's own duration", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two Three")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 2); // starts at t=2s
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+    // A freshly-added text clip gets `TEXT_DEFAULT_DURATION` (5s) — 3 words split it into three
+    // 5/3-second windows, the last one extending to the clip's own end exactly like every other
+    // animation type's final state (see `buildTypewriterDrawTextCalls`'s identical pattern).
+    const clip = project.sequence.tracks.find((t) => t.kind === "text")!.clips[0];
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const dialogueLines = written.content!.split("\n").filter((l) => l.startsWith("Dialogue:"));
+    assert.equal(dialogueLines.length, 3, "one event per word");
+
+    function startEndOf(line: string): [string, string] {
+      const parts = line.split(",");
+      return [parts[1], parts[2]];
+    }
+    const [start0, end0] = startEndOf(dialogueLines[0]);
+    const [start1, end1] = startEndOf(dialogueLines[1]);
+    const [start2, end2] = startEndOf(dialogueLines[2]);
+
+    assert.equal(start0, "0:00:02.00", "first event starts at the clip's own timelineStart");
+    assert.equal(end0, start1, "each event's end is exactly the next one's start — no gap, no overlap");
+    assert.equal(end1, start2);
+    assert.equal(end2, "0:00:" + clipEnd(clip).toFixed(2).padStart(5, "0"), "the LAST event extends to the clip's own end, not just one more word-width");
+  });
+
+  it("wraps exactly the active word's run in the highlight color, leaving the others in the base color", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Alpha Beta Gamma")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "Alpha Beta Gamma", { ...DEFAULT_TEXT_STYLE, color: "#112233" });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight", highlightColor: "#ff00aa" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const ass = written.content!;
+
+    const baseAss = "&H00332211"; // "#112233" -> BGR, no trailing "&" (Style-field form)
+    const highlightAss = "&H00aa00ff"; // "#ff00aa" -> BGR
+    const dialogueLines = ass.split("\n").filter((l) => l.startsWith("Dialogue:"));
+
+    assert.match(dialogueLines[0], new RegExp(`\\{\\\\c${highlightAss}&\\}Alpha \\{\\\\c${baseAss}&\\}Beta \\{\\\\c${baseAss}&\\}Gamma`));
+    assert.match(dialogueLines[1], new RegExp(`\\{\\\\c${baseAss}&\\}Alpha \\{\\\\c${highlightAss}&\\}Beta \\{\\\\c${baseAss}&\\}Gamma`));
+    assert.match(dialogueLines[2], new RegExp(`\\{\\\\c${baseAss}&\\}Alpha \\{\\\\c${baseAss}&\\}Beta \\{\\\\c${highlightAss}&\\}Gamma`));
+    // No color value anywhere carries a doubled "&&" — a real bug caught during this feature's own
+    // development (an earlier version of `assColor` baked its OWN trailing "&" into every use,
+    // including the `Style:` line, which then got a SECOND "&" appended at the inline-override call
+    // site specifically).
+    assert.ok(!ass.includes("&&"), "no color value should ever double up its trailing '&'");
+  });
+
+  it("defaults to DEFAULT_WORD_HIGHLIGHT_COLOR when the clip has no highlightColor of its own", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Solo")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+
+    assert.ok(written.content!.includes(assColorForTest(DEFAULT_WORD_HIGHLIGHT_COLOR)));
+  });
+
+  it("falls back to plain drawtext when fontMetricsFor returns null for this clip's font", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const { args } = buildExportPlan(project, {
+      ...options,
+      assFilePathFor: (clip, content) => `/tmp/${clip.id}.ass`,
+      fontMetricsFor: () => null,
+      fontsDirFor: () => "/fonts",
+    });
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("subtitles="));
+    assert.match(graph, /drawtext=/);
+  });
+
+  it("skips wordHighlight entirely (falls back to plain text) for a clip with empty content", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const { args } = planWithAss(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("subtitles="));
+  });
+
+  it("segments Khmer content into its real words instead of treating the whole line as one word", () => {
+    // "សួស្តី" (hello) + "អ្នករាល់គ្នា" (everyone) — no space between them, exactly how Khmer is
+    // actually written. A plain whitespace split would produce ONE Dialogue event covering the whole
+    // phrase; `segmentLine` (see `timeline/textAnimation.ts`) correctly finds the real word boundary.
+    let base = emptyProject([videoAsset(), textAsset("text1", "សួស្តីអ្នករាល់គ្នា")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const dialogueLines = written.content!.split("\n").filter((l) => l.startsWith("Dialogue:"));
+
+    assert.equal(dialogueLines.length, 2, "two real Khmer words, so two Dialogue events");
+    assert.match(
+      dialogueLines[0],
+      /\{\\c&H[0-9a-f]+&\}សួស្តី\{\\c&H[0-9a-f]+&\}អ្នករាល់គ្នា/,
+      "word 1 highlighted, word 2 in base color, no space between them"
+    );
+    assert.match(
+      dialogueLines[1],
+      /\{\\c&H[0-9a-f]+&\}សួស្តី\{\\c&H[0-9a-f]+&\}អ្នករាល់គ្នា/,
+      "word 2 highlighted, word 1 in base color"
+    );
+  });
+
+  it("threads the clip's own transitionIn/transitionOut into \\fad() on the first/last Dialogue events only (regression: this used to be silently dropped)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two Three")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+    project = setClipTransitionIn(project, textClip.id, { duration: 0.5, type: "crossfade" });
+    project = setClipTransitionOut(project, textClip.id, { duration: 0.25, type: "crossfade" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const dialogueLines = written.content!.split("\n").filter((l) => l.startsWith("Dialogue:"));
+    assert.equal(dialogueLines.length, 3);
+
+    assert.match(dialogueLines[0], /,\{\\fad\(500,0\)\}/, "first event fades IN over the transitionIn duration (ms), no fade-out term");
+    assert.ok(!dialogueLines[1].includes("\\fad("), "a middle word's own event never fades — only the block's head/tail do");
+    assert.match(dialogueLines[2], /,\{\\fad\(0,250\)\}/, "last event fades OUT over the transitionOut duration (ms), no fade-in term");
+  });
+
+  it("a single-word clip's one Dialogue event gets BOTH fade-in and fade-out in the same \\fad() tag", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Solo")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+    project = setClipTransitionIn(project, textClip.id, { duration: 0.5, type: "crossfade" });
+    project = setClipTransitionOut(project, textClip.id, { duration: 0.25, type: "crossfade" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    const dialogueLines = written.content!.split("\n").filter((l) => l.startsWith("Dialogue:"));
+    assert.equal(dialogueLines.length, 1);
+    assert.match(dialogueLines[0], /,\{\\fad\(500,250\)\}/);
+  });
+
+  it("a real crossfade between two wordHighlight clips: the outgoing clip's last event genuinely OVERLAPS the incoming clip's window, not just meets it at a hard cut", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Alpha Beta"), textAsset("text2", "Gamma Delta")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [clipA] = clipsOf(project, textTrackId(project));
+    project = addClip(project, textTrackId(project), "text2", clipEnd(clipA)); // adjacent, no gap
+    const [, clipB] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, clipA.id, { type: "wordHighlight" });
+    project = setClipTextAnimation(project, clipB.id, { type: "wordHighlight" });
+    project = setClipTransitionIn(project, clipB.id, { duration: 0.5, type: "crossfade" });
+
+    const written: { content?: string } = {};
+    // Two clips means two separate subtitles= filters/ASS files — capture the LAST one written (B's),
+    // and re-derive A's own written content via a second pass keyed by clip id, since `planWithAss`'s
+    // single-slot capture only keeps whichever clip was written last.
+    const byClip: Record<string, string> = {};
+    buildExportPlan(project, {
+      ...options,
+      assFilePathFor: (clip, assContent) => {
+        byClip[clip.id] = assContent;
+        return `/tmp/${clip.id}.ass`;
+      },
+      fontMetricsFor,
+      fontsDirFor: () => "/fonts",
+    });
+
+    const aLines = byClip[clipA.id].split("\n").filter((l) => l.startsWith("Dialogue:"));
+    const bLines = byClip[clipB.id].split("\n").filter((l) => l.startsWith("Dialogue:"));
+    const aLastEnd = aLines[aLines.length - 1].split(",")[2];
+    const bFirstStart = bLines[0].split(",")[1];
+
+    // clipA is 5s (TEXT_DEFAULT_DURATION), so its own nominal end is 0:00:05.00 — the fade-out window
+    // must reach 0.5s PAST that, to 0:00:05.50, landing on the SAME instant clipB's own fade-in
+    // finishes (clipB starts at 0:00:05.00, ramps in for 0.5s).
+    assert.equal(aLastEnd, "0:00:05.50", "outgoing clip's last event extends fadeOut seconds past its own nominal end");
+    assert.equal(bFirstStart, "0:00:05.00", "incoming clip starts at its own normal timelineStart, unshifted");
+    assert.match(aLines[aLines.length - 1], /,\{\\fad\(0,500\)\}/);
+    assert.match(bLines[0], /,\{\\fad\(500,0\)\}/);
+  });
+
+  it("no transitionIn/transitionOut means no \\fad() tag at all — byte-for-byte the same as before this feature existed", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "One Two")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const written: { content?: string } = {};
+    planWithAss(project, written);
+    assert.ok(!written.content!.includes("\\fad("));
   });
 });
 
@@ -853,7 +1950,150 @@ describe("buildExportPlan with transitions", () => {
 
     const graph = filterGraph(plan(project).args);
 
-    assert.match(graph, /eq=brightness=0\.000000:contrast=1\.000000:saturation=0\.000000/);
+    // See "buildExportPlan with clip effects"'s own tests for why this is `lutyuv`, not `eq`.
+    assert.match(
+      graph,
+      /lutyuv=y='clip\(\(val-127\.5\)\*1\.000000\+127\.5\+0\.000000,0,255\)':u='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)':v='clip\(\(val-127\.5\)\*0\.000000\+127\.5,0,255\)'/
+    );
+  });
+});
+
+describe("buildExportPlan with audio-track transitions", () => {
+  // A base video track's own clip just gives the timeline SOME video content — every test below cares
+  // only about the audio TRACK's own segment/concat/acrossfade shape, mirroring "buildExportPlan with
+  // transitions" above but for `buildAudioTrackStream` instead of `buildTrackStreams`. `TransitionType`
+  // never appears in any assertion here — only `"crossfade"` (or, for the type-agnostic test, an
+  // exotic value) is set, since `acrossfade` has no "shape" concept at all (see
+  // `buildAudioTrackStream`'s own comment on why audio transitions never read `.type`).
+  // `videoDuration` sized to exactly match whatever the audio timeline in a given test needs, so the
+  // trailing `buildSegments` gap-to-`targetDuration` padding (driven by the OVERALL project duration,
+  // which the video track sets here) never adds an extra, test-irrelevant gap segment to the audio
+  // track's own count.
+  function baseWithVideo(videoDuration = 10) {
+    const base = emptyProject([videoAsset("v", videoDuration), audioAsset("a", 5), audioAsset("b", 5)]);
+    return addClip(base, videoTrackId(base), "v", 0);
+  }
+
+  it("two adjacent audio clips with no transition produce the plain 2-segment concat (regression)", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /concat=n=2:v=0:a=1\[at0\]/);
+    assert.ok(!graph.includes("acrossfade="));
+  });
+
+  it("a valid transition splices a third segment in and blends with acrossfade at the right duration", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const { args, duration } = plan(project);
+    const graph = filterGraph(args);
+
+    assert.match(graph, /concat=n=3:v=0:a=1\[at0\]/);
+    assert.match(graph, /acrossfade=d=1\.000000/);
+    assert.ok(!graph.includes("xfade="), "an audio-only track never reaches the video xfade filter");
+    // A crossfade blends, it doesn't shorten the timeline — same guarantee the video suite checks.
+    assert.ok(closeTo(duration, 10));
+  });
+
+  it("every TransitionType still renders as a plain acrossfade — audio has no per-style rendering", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "wipeLeft" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /acrossfade=d=1\.000000/);
+    assert.ok(!graph.includes("wipeleft"), "the video-only xfade transition NAME never reaches an audio-only track");
+  });
+
+  it("the outgoing clip's own segment is emitted in full; only the incoming clip is shortened, at its head", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const { args } = plan(project);
+
+    const aInputs = inputsFor(args, "/media/a.mp4");
+    assert.equal(aInputs.length, 2, "clip A's own full segment, plus the transition's FROM slice of it");
+    assert.ok(aInputs.some((x) => closeTo(x.ss, 0) && closeTo(x.t, 5)), "clip A's own segment must be unshortened");
+    assert.ok(aInputs.some((x) => closeTo(x.ss, 4) && closeTo(x.t, 1)), "the transition's FROM slice is A's own last 1s");
+
+    const bInputs = inputsFor(args, "/media/b.mp4");
+    assert.equal(bInputs.length, 2, "the transition's TO slice, plus clip B's own head-shortened remainder");
+    assert.ok(bInputs.some((x) => closeTo(x.ss, 0) && closeTo(x.t, 1)), "the transition's TO slice is B's own first 1s");
+    assert.ok(bInputs.some((x) => closeTo(x.ss, 1) && closeTo(x.t, 4)), "clip B's own remaining segment starts 1s into its footage");
+  });
+
+  it("clamps the blend duration to the shorter clip's own length rather than the requested value", () => {
+    let base = emptyProject([videoAsset("v", 20), audioAsset("a", 2), audioAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "v", 0);
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 10, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /acrossfade=d=2\.000000/);
+  });
+
+  it("a broken adjacency (a dragged-open gap) makes the transition silently fall back to a plain cut", () => {
+    // 11s of video: 5+1+5 — the deliberate 1s gap below plus both clips, with nothing left over for
+    // `buildSegments`'s own trailing-gap padding to add a fourth, test-irrelevant segment.
+    let project = baseWithVideo(11);
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA) + 1);
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("acrossfade="));
+    // Same 3-segment shape (clip, gap, clip) the video suite's identical scenario produces.
+    assert.match(graph, /concat=n=3:v=0:a=1\[at0\]/);
+  });
+
+  it("a transitioning clip's own gain still applies to its half of the blend", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+    project = setClipGain(project, clipB.id, 0.5);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=0\.500000.*\[at0_1_to\]/);
+  });
+
+  it("a solo transitionOut on the last clip of an audio track renders as a plain afade, not acrossfade", () => {
+    let project = baseWithVideo();
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionOut(project, clipA.id, { duration: 1, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("acrossfade="), "a solo fade has no partner to blend with");
+    assert.match(graph, /afade=t=out:st=4\.000000:d=1\.000000/);
   });
 });
 
@@ -882,7 +2122,10 @@ describe("buildExportPlan with multiple video tracks", () => {
     // `args` directly, same as the existing single-track "gives the transform chain its own black
     // background input" test does.
     assert.ok(args.some((a) => a === "color=c=black:s=1080x1920:r=30"), "the base track's own gap stays opaque");
-    assert.ok(args.some((a) => a === "color=c=black@0:s=1080x1920:r=30"), "the upper track's own gap is transparent");
+    assert.ok(
+      args.some((a) => a === "color=c=black@0:s=1080x1920:r=30,format=rgba"),
+      "the upper track's own gap is transparent"
+    );
     assert.match(graph, /\[ca0\]\[ca1\]amix=inputs=2:normalize=0:dropout_transition=0\[mixa\]/);
   });
 
@@ -966,7 +2209,7 @@ describe("buildExportPlan with multiple video tracks", () => {
     // clip — two `-loop 1`/`-ss` video inputs feeding its own 2-segment concat.
     assert.match(graph, /concat=n=2:v=1:a=1\[cv1\]\[ca1\]/, "track 2's own stream gets a trailing gap segment");
     assert.ok(
-      args.some((a) => a === "color=c=black@0:s=1080x1920:r=30"),
+      args.some((a) => a === "color=c=black@0:s=1080x1920:r=30,format=rgba"),
       "the trailing gap on the non-base track is transparent, not opaque"
     );
   });
@@ -983,7 +2226,10 @@ describe("buildExportPlan with multiple video tracks", () => {
     const { args } = plan(project);
     const graph = filterGraph(args);
 
-    assert.ok(args.some((a) => a === "color=c=black@0:s=1080x1920:r=30"), "the rotated clip's own bg input should be transparent");
+    assert.ok(
+      args.some((a) => a === "color=c=black@0:s=1080x1920:r=30,format=rgba"),
+      "the rotated clip's own bg input should be transparent"
+    );
     assert.match(graph, /rotate=a=15\.000000\*PI\/180/);
   });
 });

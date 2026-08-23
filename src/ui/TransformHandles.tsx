@@ -2,20 +2,21 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import type { Command } from "../commands/index.ts";
-import { BatchCommand, SetClipTransformCommand, SetTextCommand } from "../commands/index.ts";
+import { BatchCommand, SetClipTransformCommand, SetClipTransformKeyframesCommand, SetTextCommand } from "../commands/index.ts";
 import { findAsset, findClip } from "../project/createProject.ts";
 import type { ClipTransform } from "../project/types.ts";
-import { IDENTITY_TRANSFORM } from "../project/types.ts";
 import type { AlignBox, AlignmentGuide } from "../playback/alignmentGuides.ts";
 import { computeAlignmentGuides } from "../playback/alignmentGuides.ts";
-import { computeTransformedBox } from "../playback/transformGeometry.ts";
+import { clampPointToRect, computeTransformedBox, rotatedPoint } from "../playback/transformGeometry.ts";
 import { computeVisibleClipBoxes } from "../playback/visibleClips.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
 import { computeGroupMoveOverrides } from "../timeline/groupMove.ts";
+import { hasTransformKeyframes, resolveClipTransform, upsertKeyframe } from "../timeline/keyframes.ts";
 import { clipAtTime } from "../timeline/queries.ts";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 import { AlignmentGuideOverlay } from "./AlignmentGuideOverlay.tsx";
+import { useTranslation } from "../i18n/useTranslation.ts";
 
 /** How close (in on-screen CSS pixels, so it feels the same at any zoom) a dragged clip's edge/center
  *  must come to another clip's or the frame's before a guide line appears and the drag snaps to it —
@@ -53,11 +54,24 @@ const CORNERS: { x: number; y: number; cursor: string; label: string }[] = [
  *  updates only local state (so React re-renders freely without touching the project or the undo
  *  stack on every pixel of movement), and exactly ONE `SetClipTransformCommand` is dispatched on
  *  release. */
-export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null }) {
+export function TransformHandles({
+  canvas,
+  stageEl,
+}: {
+  canvas: HTMLCanvasElement | null;
+  /** The Preview panel's own stable stage element (`Preview.tsx`'s `previewBoxRef`) — larger than, and
+   *  independent of, the canvas's own (possibly zoomed-out) on-screen size. Corner/rotate handles clamp
+   *  to THIS rect, not the canvas's, so zooming the preview out actually opens up reachable space for
+   *  them (see `clampPointToRect`'s own call sites below) rather than shrinking canvas and overflow by
+   *  the same proportion, which would net to nothing. Optional — degrades to clamping against the
+   *  canvas's own rect when omitted/not yet mounted. */
+  stageEl?: HTMLDivElement | null;
+}) {
   const project = useEditorStore((s) => s.project);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const playhead = useEditorStore((s) => s.playhead);
   const run = useEditorStore((s) => s.run);
+  const t = useTranslation();
 
   const [preview, setPreview] = useState<ClipTransform | null>(null);
   const previewRef = useRef<ClipTransform | null>(null);
@@ -122,7 +136,21 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
       if (clipAtTime(found.track, playhead)?.id !== found.clip.id) continue;
       const asset = findAsset(project, found.clip.assetId);
       if (!asset?.width || !asset.height) continue;
-      return { clipId: found.clip.id, savedTransform: found.clip.transform, assetWidth: asset.width, assetHeight: asset.height, sequence: project.sequence };
+      // Resolved at the CURRENT PLAYHEAD, not the clip's raw static `transform` — for a keyframed
+      // clip this is the interpolated value for whatever frame is actually showing, so the handles
+      // draw/drag from where the box visually IS, not a fixed authored value. Zero behavior change
+      // for an unkeyframed clip: `resolveClipTransform` falls back to `clip.transform ??
+      // IDENTITY_TRANSFORM` internally, so `savedTransform` is never `undefined` either way.
+      const savedTransform = resolveClipTransform(found.clip, playhead - found.clip.timelineStart);
+      return {
+        clipId: found.clip.id,
+        savedTransform,
+        hasKeyframes: hasTransformKeyframes(found.clip),
+        timelineStart: found.clip.timelineStart,
+        assetWidth: asset.width,
+        assetHeight: asset.height,
+        sequence: project.sequence,
+      };
     }
     return null;
   })();
@@ -131,7 +159,7 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
 
   if (!resolved || !canvas) return null;
 
-  const transform = preview ?? resolved.savedTransform ?? IDENTITY_TRANSFORM;
+  const transform = preview ?? resolved.savedTransform;
   const box = computeTransformedBox(resolved.assetWidth, resolved.assetHeight, resolved.sequence.width, resolved.sequence.height, transform);
   if (!box) return null;
 
@@ -150,6 +178,11 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
   const cssCenterX = canvasRect.left + box.centerX * cssScale;
   const cssCenterY = canvasRect.top + box.centerY * cssScale;
 
+  // The rect corner/rotate handles clamp INTO — the Preview panel's own stable stage, not the
+  // (possibly zoomed-out, possibly huge-content-overflowing) canvas rect itself. See `stageEl`'s own
+  // prop doc comment for why these need to be different rects.
+  const stageRect = stageEl?.getBoundingClientRect() ?? canvasRect;
+
   // For a corner resize, `anchor` is the OPPOSITE corner (bottom-right dragged → top-left anchor, and
   // so on) — the point that should stay visually fixed in place while the box grows/shrinks around it,
   // matching how resize handles behave in Figma/PowerPoint/etc. `undefined` for move/rotate, which
@@ -157,7 +190,7 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
   function beginDrag(startEvent: React.MouseEvent | React.TouchEvent, mode: DragMode, corner?: { x: number; y: number }) {
     startEvent.stopPropagation();
     preventDefaultIfMouse(startEvent);
-    const origin = resolved!.savedTransform ?? IDENTITY_TRANSFORM;
+    const origin = resolved!.savedTransform;
     const start = clientPoint(startEvent);
     const startAngle = Math.atan2(start.y - cssCenterY, start.x - cssCenterX);
 
@@ -171,9 +204,9 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
       anchorLocal = { x: 1 - corner.x, y: 1 - corner.y };
       const localX = (anchorLocal.x - 0.5) * cssWidth;
       const localY = (anchorLocal.y - 0.5) * cssHeight;
-      const theta = (origin.rotationDeg * Math.PI) / 180;
-      anchorScreenX = cssCenterX + localX * Math.cos(theta) - localY * Math.sin(theta);
-      anchorScreenY = cssCenterY + localX * Math.sin(theta) + localY * Math.cos(theta);
+      const anchor = rotatedPoint(cssCenterX, cssCenterY, localX, localY, origin.rotationDeg);
+      anchorScreenX = anchor.x;
+      anchorScreenY = anchor.y;
     }
 
     dragRef.current = {
@@ -309,10 +342,28 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
         const deltaX = final.offsetX - drag.origin.offsetX;
         const deltaY = final.offsetY - drag.origin.offsetY;
         const groupOverrides = computeGroupMoveOverrides(project, selectedClipIds, resolved!.clipId, deltaX, deltaY);
-        const commands: Command[] = [new SetClipTransformCommand(resolved!.clipId, final)];
+
+        // Each clip in the group must respect ITS OWN keyframe state exactly like a solo drag does
+        // (the `hasKeyframes` branch below) — `resolveClipTransform` only reads a clip's flat
+        // `.transform` when it has NO keyframes, so a bare SetClipTransformCommand on a keyframed
+        // clip is silently discarded by playback: the canvas shows the move live during the drag
+        // (`livePreviewOverrides` bypasses this entirely) but snaps right back the instant you
+        // release, which reads as "group move doesn't work" for any keyframed member.
+        function commandForTransform(clipId: string, nextTransform: ClipTransform, ownTimelineStart: number): Command {
+          const found = findClip(project!, clipId);
+          if (found && hasTransformKeyframes(found.clip)) {
+            const elapsed = playhead - ownTimelineStart;
+            const next = upsertKeyframe(found.clip.transformKeyframes ?? [], elapsed, nextTransform, resolved!.sequence.fps);
+            return new SetClipTransformKeyframesCommand(clipId, next);
+          }
+          return new SetClipTransformCommand(clipId, nextTransform);
+        }
+
+        const commands: Command[] = [commandForTransform(resolved!.clipId, final, resolved!.timelineStart)];
         for (const o of groupOverrides) {
           if (o.transform) {
-            commands.push(new SetClipTransformCommand(o.clipId, o.transform));
+            const found = findClip(project, o.clipId);
+            commands.push(commandForTransform(o.clipId, o.transform, found?.clip.timelineStart ?? 0));
           } else if (o.textStyle) {
             const found = findClip(project, o.clipId);
             const asset = found && findAsset(project, found.clip.assetId);
@@ -320,6 +371,15 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
           }
         }
         run(commands.length > 1 ? new BatchCommand("Move Clips", commands) : commands[0]);
+      } else if (resolved!.hasKeyframes) {
+        // Same auto-key rule the Inspector's NumberFields use (`upsertKeyframe`, `timeline/
+        // keyframes.ts`) — a canvas drag and a typed value make the identical insert-vs-update
+        // decision, so it doesn't matter which surface you used to edit a given frame.
+        const elapsed = playhead - resolved!.timelineStart;
+        const found = project ? findClip(project, resolved!.clipId) : undefined;
+        const existing = found?.clip.transformKeyframes ?? [];
+        const next = upsertKeyframe(existing, elapsed, final, resolved!.sequence.fps);
+        run(new SetClipTransformKeyframesCommand(resolved!.clipId, next));
       } else {
         run(new SetClipTransformCommand(resolved!.clipId, final));
       }
@@ -328,66 +388,115 @@ export function TransformHandles({ canvas }: { canvas: HTMLCanvasElement | null 
     const removeListeners = addDragListeners(onMove, onUp);
   }
 
+  // Corner/rotate handle SCREEN positions, computed independently of the (possibly huge, possibly
+  // off-screen) rotated box below via the exact same rotation math `beginDrag`'s own anchor
+  // computation uses, then clamped into `stageRect` — see `clampPointToRect`'s own doc comment for
+  // why: without this, a large `transform.scale` pushes these small dots outside the visible preview
+  // (or behind another panel) with nothing left to grab, a real, confirmed bug. `beginDrag`'s own drag
+  // math is untouched — it only ever reads the pointer's actual position, never these computed points,
+  // so clamping is purely a render-time concern.
+  const cornerHandles = CORNERS.map(({ x, y, cursor, label }) => {
+    const truePoint = rotatedPoint(cssCenterX, cssCenterY, (x - 0.5) * cssWidth, (y - 0.5) * cssHeight, transform.rotationDeg);
+    return { x, y, cursor, label, point: clampPointToRect(truePoint, stageRect, HANDLE_SIZE / 2) };
+  });
+  const rotateTruePoint = rotatedPoint(cssCenterX, cssCenterY, 0, -cssHeight / 2 - ROTATE_HANDLE_OFFSET, transform.rotationDeg);
+  const rotatePoint = clampPointToRect(rotateTruePoint, stageRect, HANDLE_SIZE / 2);
+  // Whether clamping actually moved the rotate handle from its true position — drives the connecting
+  // line below (see its own comment for why a clamped handle hides it rather than trying to draw a
+  // correct line to it).
+  const rotateHandleClamped = rotatePoint.x !== rotateTruePoint.x || rotatePoint.y !== rotateTruePoint.y;
+
   return (
     <>
       <AlignmentGuideOverlay guides={guides} canvasRect={canvasRect} cssScale={cssScale} />
       <div
         style={{
           position: "fixed",
-          left: cssCenterX,
-          top: cssCenterY,
-          width: cssWidth,
-          height: cssHeight,
-          transform: `translate(-50%, -50%) rotate(${transform.rotationDeg}deg)`,
+          left: stageRect.left,
+          top: stageRect.top,
+          width: stageRect.right - stageRect.left,
+          height: stageRect.bottom - stageRect.top,
+          overflow: "hidden",
           zIndex: 40,
         }}
         className="pointer-events-none"
       >
+      {/* The rotated box itself — `position: absolute` now, relative to the clipping wrapper above,
+          not `fixed` against the viewport. A large `transform.scale` can make this box far bigger
+          than the visible frame; unlike the corner/rotate dots below (which clamp to a single grabbable
+          POINT), there's no single "clamped rectangle" that stays both correctly rotated AND a
+          faithful stand-in for the clip's real size, so this wrapper's own `overflow: hidden` is what
+          keeps the oversized box from visually covering (and intercepting clicks meant for) the Media
+          Library, Inspector, Timeline, or the Preview's own transport bar — confirmed live: without
+          this, dragging a large clip's move-region could sit on TOP of those controls and swallow
+          clicks meant for them, not just look messy. */}
+      <div
+        style={{
+          position: "absolute",
+          left: cssCenterX - stageRect.left,
+          top: cssCenterY - stageRect.top,
+          width: cssWidth,
+          height: cssHeight,
+          transform: `translate(-50%, -50%) rotate(${transform.rotationDeg}deg)`,
+        }}
+      >
       <div
         role="button"
         tabIndex={0}
-        aria-label="Move clip"
+        aria-label={t("Move clip")}
         onMouseDown={(e) => beginDrag(e, "move")}
         onTouchStart={(e) => beginDrag(e, "move")}
         className="pointer-events-auto absolute inset-0 touch-none cursor-move border-2 border-sky-400/80"
       />
 
+      {/* Connecting line stays nested in the ROTATED box above (unlike the corner/rotate dots below,
+          which render as independent fixed-position siblings so they can be clamped) — its own CSS
+          rotation already draws it correctly from the box's top edge up to the rotate handle's TRUE
+          (unclamped) position, so this is only ever shown when that position needs no clamping in the
+          first place; see the rotate handle's own comment for what happens otherwise. Purely visual —
+          decorative, so it's excluded from the accessibility tree rather than announced as an
+          unlabeled element. */}
+      {!isGroupSelection && !rotateHandleClamped && (
+        <div
+          aria-hidden
+          style={{ left: "50%", top: -ROTATE_HANDLE_OFFSET, height: ROTATE_HANDLE_OFFSET }}
+          className="pointer-events-none absolute w-px -translate-x-1/2 bg-white/50"
+        />
+      )}
+      </div>
+      </div>
+
       {/* Resize/rotate hidden for a multi-selection — see `isGroupSelection`'s own comment above:
-          there's no well-defined group meaning for either yet, only move. */}
+          there's no well-defined group meaning for either yet, only move. Rendered as independent
+          `position: fixed` siblings of the rotated box (not CSS-percentage children of it) precisely
+          so each one's CLAMPED position can be expressed in plain screen coordinates — a rotated
+          parent's `left: X%` can only ever place a point along ITS OWN (possibly off-screen) rotated
+          axis, never clamped to the axis-aligned visible frame. */}
       {!isGroupSelection && (
         <>
-          {CORNERS.map(({ x, y, cursor, label }) => (
+          {cornerHandles.map(({ x, y, cursor, label, point }) => (
             <div
               key={label}
               role="button"
               tabIndex={0}
-              aria-label={`Resize clip (${label})`}
+              aria-label={t("Resize clip ({corner})", { corner: t(label) })}
               onMouseDown={(e) => beginDrag(e, "scale", { x, y })}
               onTouchStart={(e) => beginDrag(e, "scale", { x, y })}
-              style={{ left: `${x * 100}%`, top: `${y * 100}%`, width: HANDLE_SIZE, height: HANDLE_SIZE }}
-              className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
+              style={{ position: "fixed", left: point.x, top: point.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
+              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
             />
           ))}
-
-          {/* Connecting line is purely visual — decorative, so it's excluded from the accessibility
-              tree rather than announced as an unlabeled element. */}
-          <div
-            aria-hidden
-            style={{ left: "50%", top: -ROTATE_HANDLE_OFFSET, height: ROTATE_HANDLE_OFFSET }}
-            className="pointer-events-none absolute w-px -translate-x-1/2 bg-white/50"
-          />
           <div
             role="button"
             tabIndex={0}
-            aria-label="Rotate clip"
+            aria-label={t("Rotate clip")}
             onMouseDown={(e) => beginDrag(e, "rotate")}
             onTouchStart={(e) => beginDrag(e, "rotate")}
-            style={{ left: "50%", top: -ROTATE_HANDLE_OFFSET, width: HANDLE_SIZE, height: HANDLE_SIZE }}
-            className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
+            style={{ position: "fixed", left: rotatePoint.x, top: rotatePoint.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
+            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
           />
         </>
       )}
-      </div>
     </>
   );
 }

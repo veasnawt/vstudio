@@ -1,15 +1,21 @@
 import { findAsset, findClip } from "../project/createProject.ts";
-import type { ClipTransform, Project, TextStyle } from "../project/types.ts";
+import type { ClipEffects, ClipTransform, ColorGrading, Project, TextCrop, TextStyle } from "../project/types.ts";
 import { DEFAULT_TEXT_STYLE, IDENTITY_TRANSFORM } from "../project/types.ts";
 
-/** One clip's live-drag (not-yet-committed) position — `transform` for a video/image clip, `textStyle`
- *  for a text one. Shared shape between `EditorState.livePreviewOverrides` (what `PlaybackEngine`
- *  actually draws) and this module's own return value (what a multi-select group move computes), so
- *  the two can never drift apart. */
+/** One clip's live-drag (not-yet-committed) position — `transform` for a video/image clip, `textStyle`/
+ *  `textCrop` for a text one, `effects`/`colorGrading` for an in-progress Effects/Color-Grading panel
+ *  edit (never produced by a group move, only by `Inspector`'s own NumberFields/`CurveEditor`, but they
+ *  live in this same shape since `PlaybackEngine` reads all of them off the one override slot per clip).
+ *  Shared shape between `EditorState.livePreviewOverrides` (what `PlaybackEngine` actually draws) and
+ *  this module's own return value (what a multi-select group move computes), so the two can never drift
+ *  apart. */
 export interface ClipOverride {
   clipId: string;
   transform?: ClipTransform;
   textStyle?: TextStyle;
+  effects?: ClipEffects;
+  colorGrading?: ColorGrading;
+  textCrop?: TextCrop;
 }
 
 /** For every OTHER selected clip (excluding `primaryClipId`, the one actually under the pointer),

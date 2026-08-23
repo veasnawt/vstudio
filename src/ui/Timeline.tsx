@@ -5,8 +5,9 @@ import { AddTrackCommand, ReorderTrackCommand } from "../commands/index.ts";
 import { sequenceDuration } from "../project/createProject.ts";
 import type { Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { formatTimecode } from "../timeline/time.ts";
-import { addDragListeners, clientPoint } from "./pointerEvents.ts";
+import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 import { TimelineClip } from "./TimelineClip.tsx";
 import { TrackHeader } from "./TrackHeader.tsx";
 
@@ -23,6 +24,11 @@ const RULER_HEIGHT = 26;
 /** Empty space kept past the end of the edit, so there's always somewhere to drop a clip and extend
  *  the timeline rather than being fenced in at exactly the last frame. */
 const TRAILING_SECONDS = 10;
+/** Screen pixels the pointer must travel before a press on empty lane space counts as a marquee drag
+ *  rather than a plain click — same reasoning and same value as `TimelineClip`'s own `DRAG_THRESHOLD`:
+ *  without it, a slightly-shaky click meant only to deselect (the lane background's existing `onClick`)
+ *  could register as a real (if tiny) drag instead. */
+const MARQUEE_DRAG_THRESHOLD = 3;
 
 /** Chooses a ruler interval that keeps labels readable at any zoom — roughly one every 80px, snapped
  *  to a human-friendly step so labels land on whole seconds and minutes rather than arbitrary values. */
@@ -38,14 +44,16 @@ function tickInterval(pixelsPerSecond: number): number {
  *  that file's own git history for the original comment this one's adapted from. */
 function CurrentTime({ fps }: { fps: number }) {
   const playhead = useEditorStore((s) => s.playhead);
+  const t = useTranslation();
   return (
-    <span role="timer" aria-live="off" aria-label="Current time" className="text-white/90">
+    <span role="timer" aria-live="off" aria-label={t("Current time")} className="text-white/90">
       {formatTimecode(playhead, fps)}
     </span>
   );
 }
 
 export function Timeline() {
+  const t = useTranslation();
   const project = useEditorStore((s) => s.project);
   const projectId = useEditorStore((s) => s.projectId);
   const pixelsPerSecond = useEditorStore((s) => s.pixelsPerSecond);
@@ -425,15 +433,26 @@ export function Timeline() {
       // Auto-follow (desktop only): once the playhead scrolls past the right edge of the visible
       // timeline (during playback, or a big jump like "Go to end"), snap the view forward so it
       // reappears at the LEFT edge — matching Premiere/Resolve rather than a smooth continuous scroll,
-      // which would fight the viewport's own width by constantly re-centering. Skipped entirely while
-      // the user is dragging the ruler themselves (`isScrubbingRef`): their own cursor position IS the
+      // which would fight the viewport's own width by constantly re-centering. The mirror image
+      // handles a jump the OTHER way — "Go to start", or clicking far back on the ruler/a keyframe nav
+      // button while scrolled forward — which used to leave the view sitting wherever it already was,
+      // with the playhead now off-screen to the left and nothing visibly following it: confirmed real
+      // bug, not just a hypothetical gap in the (already asymmetric-looking) right-edge-only comment
+      // above. Snaps the view BACK so the playhead reappears at the RIGHT edge, the same "opposite
+      // edge" convention the forward case already uses — for `playhead = 0` specifically this clamps
+      // straight to `scrollLeft = 0`, so "Go to start" always lands on the true beginning of the
+      // timeline, not just "somewhere the playhead happens to be visible". Skipped entirely while the
+      // user is dragging the ruler themselves (`isScrubbingRef`): their own cursor position IS the
       // reference point during a manual scrub, so jumping the view out from under it mid-drag would be
       // actively disorienting rather than helpful.
       if (container && !isScrubbingRef.current) {
         const playheadPx = playhead * pixelsPerSecond;
+        const leftEdge = container.scrollLeft;
         const rightEdge = container.scrollLeft + container.clientWidth;
         if (playheadPx > rightEdge) {
           container.scrollLeft = Math.max(0, Math.min(playheadPx, container.scrollWidth - container.clientWidth));
+        } else if (playheadPx < leftEdge) {
+          container.scrollLeft = Math.max(0, Math.min(playheadPx - container.clientWidth, container.scrollWidth - container.clientWidth));
         }
       }
     }
@@ -540,6 +559,94 @@ export function Timeline() {
     scrollTo(maxScrollLeft * ((clickX - thumbWidth / 2) / scrollableTrack));
   }
 
+  /** On-screen (client-pixel) rectangle of an in-progress marquee drag, or `null` when none is active —
+   *  drawn as a `position: fixed` overlay below, and also what `beginMarquee`'s own hit test compares
+   *  each clip's live `getBoundingClientRect()` against. Screen space, not timeline/time space,
+   *  deliberately: clip positions already account for scroll offset, zoom, and (on mobile) the
+   *  fixed-center-playhead leading pad automatically the instant you ask the DOM where an element
+   *  really is — reimplementing that same math by hand here would be a second place for it to drift
+   *  out of sync with the real layout. */
+  const [marquee, setMarquee] = useState<{ startX: number; startY: number; x: number; y: number } | null>(null);
+  /** Set for exactly one click right after a REAL marquee drag (one that crossed the move threshold)
+   *  finishes — see `beginMarquee`'s own `onUp` for why. The browser still fires a plain "click" event
+   *  after this drag's mouseup regardless of how far the pointer traveled or where it ends up, and that
+   *  click bubbles to this same lane background's own `onClick={() => select([])}` below — without this
+   *  guard, every completed marquee selection was being wiped out the instant the mouse was released,
+   *  which is the whole reason marquee-select could look "broken" despite the drag itself, and its live
+   *  selection-growing, working correctly the entire time (confirmed directly: `select(...)` during the
+   *  drag was already hitting the right clips). */
+  const justMarqueedRef = useRef(false);
+
+  /** Press-and-drag on empty lane space (mouse only — see below) to select every clip whose on-screen
+   *  box the resulting rectangle touches, live as the rectangle grows — the Timeline counterpart to
+   *  drag-selecting several files in a folder view. Normally only reaches this handler for a press that
+   *  ISN'T on a clip: `TimelineClip`'s own `onMouseDown` (see its own `beginDrag`) `stopPropagation()`s
+   *  before a plain press there could bubble up here, the same way it already keeps a clip-drag from
+   *  also registering as the lane background's plain "click to deselect". The one deliberate exception
+   *  is Alt+drag STARTING on a clip's body — `beginDrag` skips its own interception entirely for that
+   *  gesture and lets it bubble up here untouched, since a track packed edge-to-edge with clips would
+   *  otherwise leave nowhere empty to start a marquee from at all.
+   *
+   *  Mouse-only, no touch equivalent: a touch-drag on empty lane space is how someone pans/scrolls the
+   *  timeline (see the scroll container's own `touchAction` comment) — hijacking that same gesture for
+   *  marquee-select on touch would make ordinary scrolling ambiguous with selecting, which is worse
+   *  than not offering the feature there at all. Touch already has its own multi-select gesture
+   *  (`TimelineClip`'s long-press-to-toggle). */
+  function beginMarquee(event: React.MouseEvent) {
+    if (event.button !== 0) return;
+    preventDefaultIfMouse(event);
+    const start = clientPoint(event);
+    // Shift OR Ctrl/Cmd held at the START of the drag extends the CURRENT selection rather than
+    // replacing it — matching the modifier convention `TimelineClip`'s own additive click already
+    // uses (Ctrl/Cmd there), plus Shift (the more common "extend a range/area selection" modifier in
+    // file browsers and design tools, which a marquee is closer to than a single click is).
+    const additive = event.shiftKey || event.ctrlKey || event.metaKey;
+    const baseSelection = additive ? selectedClipIds : [];
+    // Snapshotted once at drag start, not re-queried on every move — cheap enough given a timeline's
+    // realistic clip count, and avoids paying `querySelectorAll` several dozen times a second while
+    // dragging. Each clip's own RECT, in contrast, genuinely does need re-reading every move (that's
+    // the whole point — the rectangle comparison below needs where it is RIGHT NOW).
+    const clipEls = lanesRef.current ? Array.from(lanesRef.current.querySelectorAll<HTMLElement>("[data-clip-id]")) : [];
+    let moved = false;
+
+    const remove = addDragListeners(
+      (moveEvent) => {
+        const point = clientPoint(moveEvent);
+        if (!moved) {
+          if (Math.hypot(point.x - start.x, point.y - start.y) < MARQUEE_DRAG_THRESHOLD) return;
+          moved = true;
+        }
+        setMarquee({ startX: start.x, startY: start.y, x: point.x, y: point.y });
+
+        const left = Math.min(start.x, point.x);
+        const right = Math.max(start.x, point.x);
+        const top = Math.min(start.y, point.y);
+        const bottom = Math.max(start.y, point.y);
+
+        const hitIds: string[] = [];
+        for (const el of clipEls) {
+          const rect = el.getBoundingClientRect();
+          if (rect.left < right && rect.right > left && rect.top < bottom && rect.bottom > top) {
+            const id = el.dataset.clipId;
+            if (id) hitIds.push(id);
+          }
+        }
+        select([...new Set([...baseSelection, ...hitIds])]);
+      },
+      () => {
+        remove();
+        setMarquee(null);
+        // A press that never crossed the threshold falls through to the lane background's own
+        // `onClick={() => select([])}` (a real `click` event still fires after this `mouseup`,
+        // untouched by anything here) — so a plain click still deselects exactly as it always has.
+        // A press that DID cross the threshold (a real marquee) sets this one-shot guard instead, so
+        // that SAME native click — which still fires here too, regardless of how far the drag
+        // traveled — doesn't immediately wipe out the selection this drag just made.
+        if (moved) justMarqueedRef.current = true;
+      }
+    );
+  }
+
   /** Turns "dropped `sourceId` before/after `targetId`" into the `beforeTrackId` `ReorderTrackCommand`
    *  actually wants — "after `targetId`" means "before whatever CURRENTLY comes right after it", which
    *  only Timeline can resolve since it's the one holding the ordered track list. */
@@ -563,7 +670,7 @@ export function Timeline() {
           enough to clip off-screen on a narrow phone otherwise, since this row has no scroll of its
           own — wrapping to a second line is a plain, no-JS way to guarantee nothing gets cut off. */}
       <header className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-white/10 px-3 py-1.5">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-white/60">Timeline</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-white/60">{t("Timeline")}</h2>
         {/* Current position + total duration — both moved here from Preview's transport bar, which now
             carries only the playback buttons themselves. This panel is what visualizes the whole
             project's timespan, so both halves of "where am I / how long is this" read naturally here
@@ -571,7 +678,7 @@ export function Timeline() {
         <div className="flex items-baseline gap-1 font-mono text-[11px] tabular-nums">
           <CurrentTime fps={project.sequence.fps} />
           <span className="text-white/30">/</span>
-          <span aria-label="Total duration" className="text-white/45">
+          <span aria-label={t("Total duration")} className="text-white/45">
             {formatTimecode(total, project.sequence.fps)}
           </span>
         </div>
@@ -582,11 +689,11 @@ export function Timeline() {
           // the shortcut, or the "Reset to full timeline" link buried inside the Export dialog.
           <button
             onClick={() => clearExportRange()}
-            aria-label="Clear export range"
-            title="Clear export in/out range (Shift+X)"
+            aria-label={t("Clear export range")}
+            title={t("Clear export in/out range (Shift+X)")}
             className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-amber-300/80 transition hover:bg-amber-500/15 hover:text-amber-200"
           >
-            × Range
+            {t("× Range")}
           </button>
         )}
         <div className="ml-auto flex items-center gap-1">
@@ -594,43 +701,43 @@ export function Timeline() {
             onClick={() => run(new AddTrackCommand("video"))}
             className="rounded px-2 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
           >
-            + Video
+            {t("+ Video")}
           </button>
           <button
             onClick={() => run(new AddTrackCommand("audio"))}
             className="rounded px-2 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
           >
-            + Audio
+            {t("+ Audio")}
           </button>
           <button
             onClick={() => run(new AddTrackCommand("text"))}
             className="rounded px-2 py-1 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
           >
-            + Text
+            {t("+ Text")}
           </button>
           <span className="mx-1 h-4 w-px bg-white/10" />
           {/* min-h/min-w 26px — same touch-target floor as TrackHeader's FlagButton (see its own
               comment: padding-only sizing measured as small as ~17×19px on a real mobile viewport). */}
           <button
             onClick={() => zoomAround(1 / 1.4)}
-            aria-label="Zoom out"
-            title="Zoom out (Ctrl/⌘ −)"
+            aria-label={t("Zoom out")}
+            title={t("Zoom out (Ctrl/⌘ −)")}
             className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white"
           >
             −
           </button>
           <button
             onClick={() => resetZoom()}
-            aria-label="Reset zoom"
-            title="Reset zoom (Ctrl/⌘ 0)"
+            aria-label={t("Reset zoom")}
+            title={t("Reset zoom (Ctrl/⌘ 0)")}
             className="min-h-[26px] min-w-[3.5ch] rounded px-1 text-center font-mono text-[11px] tabular-nums text-white/45 transition hover:bg-white/10 hover:text-white"
           >
             {Math.round((pixelsPerSecond / 60) * 100)}%
           </button>
           <button
             onClick={() => zoomAround(1.4)}
-            aria-label="Zoom in"
-            title="Zoom in (Ctrl/⌘ +)"
+            aria-label={t("Zoom in")}
+            title={t("Zoom in (Ctrl/⌘ +)")}
             className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white"
           >
             +
@@ -739,7 +846,7 @@ export function Timeline() {
             <div
               ref={rulerRef}
               role="slider"
-              aria-label="Playhead"
+              aria-label={t("Playhead")}
               aria-valuemin={0}
               aria-valuemax={Math.round(total)}
               aria-valuenow={Math.round(useEditorStore.getState().playhead)}
@@ -764,7 +871,20 @@ export function Timeline() {
               ))}
             </div>
 
-            <div ref={lanesRef} onClick={() => select([])}>
+            <div
+              ref={lanesRef}
+              onClick={() => {
+                // See `justMarqueedRef`'s own comment — swallow exactly the one native click the
+                // browser fires right after a real marquee drag's mouseup, then let every click after
+                // that deselect normally again.
+                if (justMarqueedRef.current) {
+                  justMarqueedRef.current = false;
+                  return;
+                }
+                select([]);
+              }}
+              onMouseDown={beginMarquee}
+            >
               {project.sequence.tracks.map((track) => (
                 <div
                   key={track.id}
@@ -818,7 +938,7 @@ export function Timeline() {
                       projectId={projectId}
                       pixelsPerSecond={pixelsPerSecond}
                       selected={selectedClipIds.includes(clip.id)}
-                      assetName={assetNames.get(clip.assetId) ?? "Missing media"}
+                      assetName={assetNames.get(clip.assetId) ?? t("Missing media")}
                       resolveTrackAt={resolveTrackAt}
                       onTargetTrackChange={setDropTrackId}
                     />
@@ -841,7 +961,7 @@ export function Timeline() {
                     >
                       <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-rose-300" />
                       <span className="truncate">
-                        {recording.phase === "recording" ? "Recording…" : "Finishing…"}
+                        {recording.phase === "recording" ? t("Recording…") : t("Finishing…")}
                       </span>
                     </div>
                   )}
@@ -881,7 +1001,7 @@ export function Timeline() {
               <div style={{ left: exportStart * pixelsPerSecond }} className="absolute top-0 bottom-0 z-30 w-px bg-amber-400">
                 <div
                   role="slider"
-                  aria-label="Export range start"
+                  aria-label={t("Export range start")}
                   aria-valuemin={0}
                   aria-valuemax={Math.round(total)}
                   aria-valuenow={Math.round(exportStart)}
@@ -896,7 +1016,7 @@ export function Timeline() {
               <div style={{ left: exportEnd * pixelsPerSecond }} className="absolute top-0 bottom-0 z-30 w-px bg-amber-400">
                 <div
                   role="slider"
-                  aria-label="Export range end"
+                  aria-label={t("Export range end")}
                   aria-valuemin={0}
                   aria-valuemax={Math.round(total)}
                   aria-valuenow={Math.round(exportEnd)}
@@ -951,7 +1071,7 @@ export function Timeline() {
           <div
             onMouseDown={beginScrollbarThumbDrag}
             onTouchStart={beginScrollbarThumbDrag}
-            title="Scroll timeline"
+            title={t("Scroll timeline")}
             style={{ left: thumbLeft, width: thumbWidth }}
             className="absolute top-1/2 h-2 -translate-y-1/2 touch-none rounded-full bg-white/25 transition-colors hover:bg-white/40 active:bg-sky-400/70"
           />
@@ -975,6 +1095,22 @@ export function Timeline() {
         >
           {formatTimecode(Math.max(0, timeFromEvent(hoverX)), project.sequence.fps)}
         </div>
+      )}
+
+      {/* The marquee rectangle itself — see `beginMarquee`'s own comment for why this lives in plain
+          screen (client-pixel) coordinates rather than the scrolling content's own coordinate space,
+          same `position: fixed` reasoning as the hover tooltip just above. */}
+      {marquee && (
+        <div
+          aria-hidden
+          className="pointer-events-none fixed z-40 border border-sky-400 bg-sky-400/10"
+          style={{
+            left: Math.min(marquee.startX, marquee.x),
+            top: Math.min(marquee.startY, marquee.y),
+            width: Math.abs(marquee.x - marquee.startX),
+            height: Math.abs(marquee.y - marquee.startY),
+          }}
+        />
       )}
     </section>
   );

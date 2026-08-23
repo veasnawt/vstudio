@@ -54,3 +54,41 @@ export function computeTransformedBox(
     cropHeight,
   };
 }
+
+export interface ScreenPoint {
+  x: number;
+  y: number;
+}
+
+/** Screen position of a point `localX`/`localY` CSS px from `pivotX`/`pivotY` (before rotation),
+ *  rotated by `rotationDeg` around that pivot. Extracted from `TransformHandles`'/`TextTransformHandles`'
+ *  own scale-anchor and corner/rotate-handle math so drag math and render-position math share one
+ *  implementation, and it's unit-testable without a DOM. */
+export function rotatedPoint(pivotX: number, pivotY: number, localX: number, localY: number, rotationDeg: number): ScreenPoint {
+  const theta = (rotationDeg * Math.PI) / 180;
+  return {
+    x: pivotX + localX * Math.cos(theta) - localY * Math.sin(theta),
+    y: pivotY + localX * Math.sin(theta) + localY * Math.cos(theta),
+  };
+}
+
+/** Clamps `point` into `rect`, inset by `margin` on every side — so a circular handle of that radius
+ *  is never visually cut at the edge of the visible frame. Used to keep a Transform/Effects clip's
+ *  on-canvas Position/Scale/Rotation handles reachable even when the clip is scaled up far larger than
+ *  the visible preview — without this, a corner or rotate handle can render entirely outside the
+ *  browser viewport (or behind another panel) with nothing to grab, which is a real, confirmed bug, not
+ *  a hypothetical one. `rect` is a plain structural type, not `DOMRect` itself, so a test can pass a
+ *  bare object literal — no DOM/jsdom needed. A `rect` narrower or shorter than `2 * margin` caps the
+ *  margin down to half that axis's own extent, so the resulting min/max bounds can never invert. */
+export function clampPointToRect(
+  point: ScreenPoint,
+  rect: { left: number; top: number; right: number; bottom: number },
+  margin: number
+): ScreenPoint {
+  const marginX = Math.min(margin, (rect.right - rect.left) / 2);
+  const marginY = Math.min(margin, (rect.bottom - rect.top) / 2);
+  return {
+    x: Math.min(rect.right - marginX, Math.max(rect.left + marginX, point.x)),
+    y: Math.min(rect.bottom - marginY, Math.max(rect.top + marginY, point.y)),
+  };
+}

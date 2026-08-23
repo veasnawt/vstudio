@@ -1,6 +1,7 @@
 "use client";
 
 import { createPortal } from "react-dom";
+import { useTranslation } from "../i18n/useTranslation.ts";
 
 /** A small confirm/cancel modal for actions that need a deliberate second click before they happen —
  *  same overlay/card visual language as `ExportDialog`, kept generic (title/message/labels as props)
@@ -20,8 +21,8 @@ import { createPortal } from "react-dom";
 export function ConfirmDialog({
   title,
   message,
-  confirmLabel = "Remove",
-  cancelLabel = "Cancel",
+  confirmLabel,
+  cancelLabel,
   danger = true,
   onConfirm,
   onCancel,
@@ -34,6 +35,9 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const t = useTranslation();
+  const resolvedConfirmLabel = confirmLabel ?? t("Remove");
+  const resolvedCancelLabel = cancelLabel ?? t("Cancel");
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
@@ -54,7 +58,7 @@ export function ConfirmDialog({
             onClick={onCancel}
             className="rounded-md px-3 py-1.5 text-xs font-medium text-white/60 transition hover:bg-white/10 hover:text-white"
           >
-            {cancelLabel}
+            {resolvedCancelLabel}
           </button>
           <button
             onClick={onConfirm}
@@ -63,7 +67,7 @@ export function ConfirmDialog({
               danger ? "bg-rose-500 hover:bg-rose-400" : "bg-sky-500 hover:bg-sky-400"
             }`}
           >
-            {confirmLabel}
+            {resolvedConfirmLabel}
           </button>
         </div>
       </div>

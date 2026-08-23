@@ -1,6 +1,6 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Directory, Encoding, Filesystem } from "@capacitor/filesystem";
-import { buildExportPlan } from "../export/buildExportPlan.ts";
+import { buildExportPlan, MAX_TYPEWRITER_STEPS } from "../export/buildExportPlan.ts";
 import { findAsset, newId } from "../project/createProject.ts";
 import { FONT_REGISTRY } from "../project/fonts.ts";
 import type { Clip, Project } from "../project/types.ts";
@@ -133,14 +133,31 @@ function primeFontPaths(): Promise<Map<string, string>> {
  *  the server's `fs.writeFileSync`), while writing on native is unavoidably async — so every file this
  *  export could need has to be written up front, not lazily inside the callback. If `buildExportPlan`'s
  *  own text-track loop condition ever changes, this needs to change with it. */
-function collectTextClips(project: Project): { clip: Clip; content: string }[] {
-  const out: { clip: Clip; content: string }[] = [];
+// `variant` mirrors `buildExportPlan.ts`'s own `textFilePathFor` third argument — `undefined` for the
+// plain single-file case, or `tw${k}` for one of `typewriter`'s per-character-prefix reveal states (see
+// `buildTypewriterDrawTextCalls`). `key` is what both `writeTextFiles` and the `textFilePathFor`
+// callback below address the resulting map by.
+function textFileKey(clipId: string, variant?: string): string {
+  return variant ? `${clipId}-${variant}` : clipId;
+}
+
+function collectTextClips(project: Project): { clip: Clip; content: string; variant?: string }[] {
+  const out: { clip: Clip; content: string; variant?: string }[] = [];
   for (const track of project.sequence.tracks) {
     if (track.kind !== "text" || !track.visible) continue;
     for (const clip of track.clips) {
       const asset = findAsset(project, clip.assetId);
       if (!asset || asset.kind !== "text" || !asset.textStyle) continue;
-      out.push({ clip, content: asset.textContent ?? "" });
+      const content = asset.textContent ?? "";
+      // Same condition `buildDrawTextFilter` uses to decide whether to branch into the typewriter chain
+      // — an empty or over-cap clip renders as plain static text instead, needing only the one file.
+      if (clip.textAnimation?.type === "typewriter" && content.length > 0 && content.length <= MAX_TYPEWRITER_STEPS) {
+        for (let k = 1; k <= content.length; k++) {
+          out.push({ clip, content: content.slice(0, k), variant: `tw${k}` });
+        }
+      } else {
+        out.push({ clip, content });
+      }
     }
   }
   return out;
@@ -153,11 +170,12 @@ async function writeTextFiles(project: Project): Promise<Map<string, string>> {
 
   await Filesystem.mkdir({ path: TEXT_SCRATCH_DIR, directory: Directory.Cache, recursive: true }).catch(() => {});
   await Promise.all(
-    targets.map(async ({ clip, content }) => {
-      const relPath = `${TEXT_SCRATCH_DIR}/${clip.id}.txt`;
+    targets.map(async ({ clip, content, variant }) => {
+      const key = textFileKey(clip.id, variant);
+      const relPath = `${TEXT_SCRATCH_DIR}/${key}.txt`;
       await Filesystem.writeFile({ path: relPath, directory: Directory.Cache, data: content, encoding: Encoding.UTF8 });
       const { uri } = await Filesystem.getUri({ path: relPath, directory: Directory.Cache });
-      map.set(clip.id, stripFileScheme(uri));
+      map.set(key, stripFileScheme(uri));
     })
   );
   return map;
@@ -224,8 +242,8 @@ export async function nativeStartExport(projectId: string, project: Project, fil
       if (!path) throw new ApiRequestError(`Missing bundled font file "${fontFileName}"`, 500, "font-missing");
       return path;
     },
-    textFilePathFor: (clip) => {
-      const path = textFiles.get(clip.id);
+    textFilePathFor: (clip, _content, variant) => {
+      const path = textFiles.get(textFileKey(clip.id, variant));
       if (!path) throw new ApiRequestError("A text clip's content wasn't prepared for export", 500, "text-file-missing");
       return path;
     },

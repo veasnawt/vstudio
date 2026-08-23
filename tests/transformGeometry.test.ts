@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { IDENTITY_TRANSFORM } from "../src/project/types.ts";
-import { computeTransformedBox } from "../src/playback/transformGeometry.ts";
+import { clampPointToRect, computeTransformedBox, rotatedPoint } from "../src/playback/transformGeometry.ts";
 import { closeTo } from "./fixture.ts";
 
 describe("computeTransformedBox", () => {
@@ -62,5 +62,90 @@ describe("computeTransformedBox", () => {
     });
 
     assert.equal(box, null);
+  });
+});
+
+describe("rotatedPoint", () => {
+  it("returns the local offset unrotated at 0 degrees", () => {
+    const p = rotatedPoint(500, 500, 100, 0, 0);
+    assert.ok(closeTo(p.x, 600));
+    assert.ok(closeTo(p.y, 500));
+  });
+
+  it("rotates a point 90 degrees clockwise around the pivot", () => {
+    // A point 100px to the right of the pivot, rotated 90°, ends up 100px BELOW it (screen Y grows
+    // downward) — the same direction `TransformHandles`'/`TextTransformHandles`' own rotate handles
+    // already visibly sweep in the running app.
+    const p = rotatedPoint(500, 500, 100, 0, 90);
+    assert.ok(closeTo(p.x, 500));
+    assert.ok(closeTo(p.y, 600));
+  });
+
+  it("rotates a point 180 degrees to the opposite side of the pivot", () => {
+    const p = rotatedPoint(500, 500, 100, 0, 180);
+    assert.ok(closeTo(p.x, 400, 1e-6));
+    assert.ok(closeTo(p.y, 500, 1e-6));
+  });
+
+  it("matches the pre-refactor inline anchor formula TransformHandles used to compute directly", () => {
+    // Regression pin: the exact expression `beginDrag`'s scale-anchor computation used before it was
+    // extracted into this shared helper (cssCenter + local rotated by theta), for a representative
+    // scale/rotation combination.
+    const cssCenterX = 320;
+    const cssCenterY = 480;
+    const localX = -150;
+    const localY = 90;
+    const rotationDeg = 37;
+    const theta = (rotationDeg * Math.PI) / 180;
+    const expectedX = cssCenterX + localX * Math.cos(theta) - localY * Math.sin(theta);
+    const expectedY = cssCenterY + localX * Math.sin(theta) + localY * Math.cos(theta);
+
+    const p = rotatedPoint(cssCenterX, cssCenterY, localX, localY, rotationDeg);
+
+    assert.ok(closeTo(p.x, expectedX));
+    assert.ok(closeTo(p.y, expectedY));
+  });
+});
+
+describe("clampPointToRect", () => {
+  const rect = { left: 0, top: 0, right: 200, bottom: 100 };
+
+  it("leaves an in-bounds point unchanged", () => {
+    const p = clampPointToRect({ x: 50, y: 50 }, rect, 10);
+    assert.deepEqual(p, { x: 50, y: 50 });
+  });
+
+  it("clamps a point past the right edge on the X axis only", () => {
+    const p = clampPointToRect({ x: 500, y: 50 }, rect, 10);
+    assert.ok(closeTo(p.x, 190));
+    assert.ok(closeTo(p.y, 50));
+  });
+
+  it("clamps a point past the left edge on the X axis only", () => {
+    const p = clampPointToRect({ x: -500, y: 50 }, rect, 10);
+    assert.ok(closeTo(p.x, 10));
+    assert.ok(closeTo(p.y, 50));
+  });
+
+  it("clamps a point past the top/bottom edges on the Y axis only", () => {
+    const below = clampPointToRect({ x: 50, y: 500 }, rect, 10);
+    assert.ok(closeTo(below.y, 90));
+    const above = clampPointToRect({ x: 50, y: -500 }, rect, 10);
+    assert.ok(closeTo(above.y, 10));
+  });
+
+  it("clamps a point past a corner on both axes at once", () => {
+    const p = clampPointToRect({ x: 9999, y: -9999 }, rect, 10);
+    assert.ok(closeTo(p.x, 190));
+    assert.ok(closeTo(p.y, 10));
+  });
+
+  it("never inverts min/max for a rect narrower/shorter than 2×margin", () => {
+    const tinyRect = { left: 0, top: 0, right: 10, bottom: 4 };
+    const p = clampPointToRect({ x: 9999, y: 9999 }, tinyRect, 50);
+    // Margin caps to half the axis extent, so the clamped bounds collapse to the rect's own midline
+    // rather than crossing over each other.
+    assert.ok(closeTo(p.x, 5));
+    assert.ok(closeTo(p.y, 2));
   });
 });

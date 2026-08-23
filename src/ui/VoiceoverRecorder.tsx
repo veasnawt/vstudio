@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Microphone } from "@veasnawt/vicons";
 import { AddClipCommand } from "../commands/index.ts";
 import { useEditorStore } from "../store/editorStore.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 
 /** How often the live recording indicator's length is refreshed while capturing. Fast enough to look
  *  genuinely live growing on the timeline, far below the cost of the 30-60/sec playhead updates
@@ -37,6 +38,7 @@ export function VoiceoverRecorder() {
   const importFiles = useEditorStore((s) => s.importFiles);
   const run = useEditorStore((s) => s.run);
   const setStatus = useEditorStore((s) => s.setStatus);
+  const t = useTranslation();
 
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -75,8 +77,8 @@ export function VoiceoverRecorder() {
       const insecure = typeof window !== "undefined" && window.isSecureContext === false;
       setStatus(
         insecure
-          ? "Recording needs a secure connection (HTTPS, or localhost) — this page was opened over a plain http:// LAN address, which browsers block microphone access from."
-          : "This browser can't record audio — no microphone API available",
+          ? t("Recording needs a secure connection (HTTPS, or localhost) — this page was opened over a plain http:// LAN address, which browsers block microphone access from.")
+          : t("This browser can't record audio — no microphone API available"),
         "error"
       );
       return;
@@ -93,10 +95,10 @@ export function VoiceoverRecorder() {
       const name = err instanceof Error ? err.name : "";
       setStatus(
         name === "NotAllowedError"
-          ? "Microphone access was denied — allow it for this site in your browser's settings and try again."
+          ? t("Microphone access was denied — allow it for this site in your browser's settings and try again.")
           : name === "NotFoundError"
-            ? "No microphone was found on this device."
-            : "Microphone access was denied or unavailable",
+            ? t("No microphone was found on this device.")
+            : t("Microphone access was denied or unavailable"),
         "error"
       );
       return;
@@ -109,7 +111,7 @@ export function VoiceoverRecorder() {
     const target = useEditorStore.getState().beginVoiceoverRecording();
     if (!target) {
       stream.getTracks().forEach((track) => track.stop());
-      setStatus("Open a project before recording a voiceover", "error");
+      setStatus(t("Open a project before recording a voiceover"), "error");
       return;
     }
     targetRef.current = target;
@@ -180,8 +182,8 @@ export function VoiceoverRecorder() {
     return (
       <button
         onClick={stop}
-        aria-label="Stop recording"
-        title="Stop recording"
+        aria-label={t("Stop recording")}
+        title={t("Stop recording")}
         className="flex h-10 shrink-0 items-center gap-1.5 rounded px-2 text-xs font-medium tabular-nums text-rose-300 transition hover:bg-rose-500/20"
       >
         <span aria-hidden className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-400" />
@@ -193,12 +195,12 @@ export function VoiceoverRecorder() {
   return (
     <button
       onClick={start}
-      aria-label="Record voiceover"
-      title="Record a voiceover from your microphone"
+      aria-label={t("Record voiceover")}
+      title={t("Record a voiceover from your microphone")}
       className="flex h-10 min-w-11 shrink-0 flex-col items-center justify-center gap-0.5 rounded px-1 leading-none text-white/70 transition hover:bg-white/10 hover:text-white"
     >
       <Microphone size={18} />
-      <span className="max-w-full truncate text-[9px] font-medium">Voice</span>
+      <span className="max-w-full truncate text-[9px] font-medium">{t("Voice")}</span>
     </button>
   );
 }

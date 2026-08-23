@@ -1,19 +1,28 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Delete, Save, Settings, Split, Text, Transition, Video } from "@veasnawt/vicons";
-import { DeleteClipsCommand, SetClipTransitionCommand, SplitClipCommand } from "../commands/index.ts";
+import { ArrowLeft, ClosedCaption, Copy, Delete, Document, Save, Settings, Split, Text, Transition, Video, Volume } from "@veasnawt/vicons";
+import { reportError } from "../api/crashLog.ts";
+import { DeleteClipsCommand, SetClipTransitionCommand, SetClipTransitionOutCommand, SplitClipCommand } from "../commands/index.ts";
+import { translateText } from "../i18n/translations.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { findClip } from "../project/createProject.ts";
+import { preloadAllFonts } from "../project/fonts.ts";
 import { flushPendingSave, useEditorStore } from "../store/editorStore.ts";
 import { clipAtTime } from "../timeline/queries.ts";
-import { DEFAULT_TRANSITION, findTransitionCandidate } from "../timeline/transitions.ts";
+import { DEFAULT_TRANSITION } from "../timeline/transitions.ts";
+import { AutoCaptionsDialog } from "./AutoCaptionsDialog.tsx";
+import { ErrorBoundary } from "./ErrorBoundary.tsx";
 import { ExportDialog } from "./ExportDialog.tsx";
+import { TextToClipsDialog } from "./TextToClipsDialog.tsx";
 import { Inspector } from "./Inspector.tsx";
 import { MediaLibrary } from "./MediaLibrary.tsx";
+import { MixerPanel } from "./MixerPanel.tsx";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 import { Preview } from "./Preview.tsx";
 import { Timeline } from "./Timeline.tsx";
+import { TransitionPickerMenu } from "./TransitionPickerMenu.tsx";
 import { VoiceoverRecorder } from "./VoiceoverRecorder.tsx";
 
 /** Bounds for the draggable Preview/Timeline divider — see `beginTimelineResize`. A fixed pixel
@@ -40,6 +49,19 @@ const MIN_PREVIEW_HEIGHT = 120;
 function clampTimelineHeight(height: number, viewportHeight: number): number {
   const maxForPreview = viewportHeight - CHROME_HEIGHT - MIN_PREVIEW_HEIGHT;
   return Math.max(MIN_TIMELINE_HEIGHT, Math.min(height, Math.max(MIN_TIMELINE_HEIGHT, maxForPreview)));
+}
+
+/** Same floor/ceiling shape as `MIN_TIMELINE_HEIGHT`/`clampTimelineHeight`, along the horizontal axis
+ *  for Media/Properties instead — a fixed pixel floor per side panel (below this its own content, a
+ *  media grid or a Properties field's label+input+suffix row, starts wrapping badly) and Preview kept
+ *  to at least `MIN_PREVIEW_WIDTH` between whichever two widths (this panel's, and the OTHER side
+ *  panel's current width) are currently competing for the same viewport. */
+const MIN_SIDE_PANEL_WIDTH = 180;
+const MIN_PREVIEW_WIDTH = 320;
+
+function clampSideWidth(width: number, otherSideWidth: number, viewportWidth: number): number {
+  const maxForPreview = viewportWidth - otherSideWidth - MIN_PREVIEW_WIDTH;
+  return Math.max(MIN_SIDE_PANEL_WIDTH, Math.min(width, Math.max(MIN_SIDE_PANEL_WIDTH, maxForPreview)));
 }
 
 /** Input types that accept typed text. Everything else — file, button, checkbox, radio, range — can
@@ -86,35 +108,8 @@ function splitAtPlayhead() {
         .filter((t) => t.kind === "video" && !t.locked)
         .map((t) => clipAtTime(t, state.playhead))
         .find(Boolean);
-  if (!target) return state.setStatus("Put the playhead over a clip to split it", "error");
+  if (!target) return state.setStatus(translateText(state.language, "Put the playhead over a clip to split it"), "error");
   state.run(new SplitClipCommand(target.id, state.playhead));
-}
-
-/** Toggles a crossfade transition on the selected clip — the toolbar's quick on/off counterpart to
- *  the Inspector's own "Transition In" section (which stays the place to fine-tune the duration
- *  afterward; this button and that checkbox both dispatch the identical `SetClipTransitionCommand`,
- *  so neither can drift out of sync with the other). Turning ON only ever fires when
- *  `findTransitionCandidate` confirms a genuinely adjacent predecessor exists — same gate the
- *  Inspector uses to decide whether to even show its own section — but turning OFF an existing
- *  `transitionIn` is always allowed regardless, since removing one is safe even if the clip's
- *  adjacency has since broken. */
-function toggleTransitionOnSelected() {
-  const state = useEditorStore.getState();
-  const current = state.project;
-  const selectedId = state.selectedClipIds[0];
-  if (!current || !selectedId) return;
-  const found = findClip(current, selectedId);
-  if (!found) return;
-  const { clip, track } = found;
-
-  if (clip.transitionIn) {
-    state.run(new SetClipTransitionCommand(clip.id, null));
-    return;
-  }
-  if (!findTransitionCandidate(track, clip)) {
-    return state.setStatus("Move this clip flush against the previous one to add a transition", "error");
-  }
-  state.run(new SetClipTransitionCommand(clip.id, DEFAULT_TRANSITION));
 }
 
 /** One toolbar icon, disabled state, an optional highlighted "active" state (used by toggles like
@@ -125,25 +120,21 @@ function toggleTransitionOnSelected() {
  *  either) — a phone user can't hover to discover what an icon-only button does the way a mouse user
  *  can, and even for a mouse this row's icons (Split/Delete/Save/Text/Transition/Media/Properties)
  *  aren't universally self-explanatory the way Play/Pause are. */
-function ToolbarButton({
-  onClick,
-  disabled,
-  active,
-  title,
-  label,
-  className = "",
-  children,
-}: {
-  onClick: () => void;
-  disabled?: boolean;
-  active?: boolean;
-  title: string;
-  label: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
+const ToolbarButton = React.forwardRef<
+  HTMLButtonElement,
+  {
+    onClick: () => void;
+    disabled?: boolean;
+    active?: boolean;
+    title: string;
+    label: string;
+    className?: string;
+    children: React.ReactNode;
+  }
+>(function ToolbarButton({ onClick, disabled, active, title, label, className = "", children }, ref) {
   return (
     <button
+      ref={ref}
       onClick={onClick}
       disabled={disabled}
       title={title}
@@ -159,30 +150,41 @@ function ToolbarButton({
       <span className="max-w-full truncate text-[9px] font-medium">{label}</span>
     </button>
   );
-}
+});
 
 function StatusBar({
   mobileSheet,
   setMobileSheet,
+  bottomPanel,
+  setBottomPanel,
 }: {
   mobileSheet: "media" | "inspector" | null;
   setMobileSheet: (next: "media" | "inspector" | null) => void;
+  bottomPanel: "timeline" | "mixer";
+  setBottomPanel: (next: "timeline" | "mixer") => void;
 }) {
   const setStatus = useEditorStore((s) => s.setStatus);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const run = useEditorStore((s) => s.run);
   const save = useEditorStore((s) => s.save);
   const addTextAtPlayhead = useEditorStore((s) => s.addTextAtPlayhead);
+  const duplicateSelectedClips = useEditorStore((s) => s.duplicateSelectedClips);
   const project = useEditorStore((s) => s.project);
+  const t = useTranslation();
+  const [showCaptions, setShowCaptions] = useState(false);
+  const [showTextImport, setShowTextImport] = useState(false);
+  const [showTransitionMenu, setShowTransitionMenu] = useState(false);
+  const transitionButtonRef = useRef<HTMLButtonElement>(null);
 
-  // Drives the Transition button's active/disabled look — recomputed on every render from the same
-  // store state `toggleTransitionOnSelected` itself reads imperatively, so the two can never disagree
-  // about what clicking the button will actually do.
+  // Drives the Transition button's active/disabled look, and what `TransitionPickerMenu` (opened by
+  // that button) applies to and highlights as currently selected. Enabled for ANY video/text clip now,
+  // not just one with a genuinely adjacent predecessor — `findTransitionPartner` resolves a clip with
+  // no eligible neighbor into a solo fade (from black for video, from transparent for text) rather than
+  // refusing to apply at all, so there's no longer a real reason to gate the button on adjacency.
   const selectedId = selectedClipIds[0];
   const foundForTransition = project && selectedId ? findClip(project, selectedId) : undefined;
-  const transitionActive = Boolean(foundForTransition?.clip.transitionIn);
-  const transitionCandidate = foundForTransition && findTransitionCandidate(foundForTransition.track, foundForTransition.clip);
-  const transitionDisabled = !foundForTransition || (!transitionActive && !transitionCandidate);
+  const transitionActive = Boolean(foundForTransition?.clip.transitionIn || foundForTransition?.clip.transitionOut);
+  const transitionDisabled = !foundForTransition || (foundForTransition.track.kind !== "video" && foundForTransition.track.kind !== "text");
 
   return (
     <footer className="flex shrink-0 items-center gap-1 border-t border-white/10 bg-[#0d0f14] px-2 py-1.5 text-[11px]">
@@ -196,49 +198,108 @@ function StatusBar({
           reached instead, which pushed the button count past what a phone's width can show without
           scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
       <div className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
-        <ToolbarButton title="Split at playhead (S)" label="Split" onClick={splitAtPlayhead}>
+        {/* Workflow order, left to right: ADD content first (what you reach for to put something new
+            on the timeline), then STRUCTURAL edits (reshaping what's already there), then
+            destructive/save actions last (Delete right before Save specifically — "remove, then commit
+            the result" is the natural order those two get used in together, and it keeps the one
+            irreversible-feeling action away from the row's own leading edge, where a stray tap/click
+            during a fast workflow is most likely to land). */}
+
+        {/* Text and voiceover recording: moved here from the Media panel so both land straight on the
+            timeline (and so in the preview) the instant they're created, rather than sitting as a
+            library-only asset waiting for a separate double-click/drag to place. */}
+        <ToolbarButton title={t("Add text")} label={t("Text")} onClick={addTextAtPlayhead}>
+          <Text size={18} />
+        </ToolbarButton>
+        <VoiceoverRecorder />
+        <ToolbarButton title={t("Import Text as Clips")} label={t("Script")} onClick={() => setShowTextImport(true)}>
+          <Document size={18} />
+        </ToolbarButton>
+        <ToolbarButton title={t("Auto Captions")} label={t("Captions")} onClick={() => setShowCaptions(true)}>
+          <ClosedCaption size={18} />
+        </ToolbarButton>
+        <ToolbarButton
+          title={t("Audio Mixer")}
+          label={t("Mixer")}
+          active={bottomPanel === "mixer"}
+          onClick={() => setBottomPanel(bottomPanel === "mixer" ? "timeline" : "mixer")}
+        >
+          <Volume size={18} />
+        </ToolbarButton>
+
+        <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
+
+        <ToolbarButton title={t("Split at playhead (S)")} label={t("Split")} onClick={splitAtPlayhead}>
           <Split size={18} />
         </ToolbarButton>
         <ToolbarButton
-          title="Delete selected (Del)"
-          label="Delete"
+          title={t("Duplicate selected (Ctrl+D)")}
+          label={t("Duplicate")}
+          disabled={selectedClipIds.length === 0}
+          onClick={duplicateSelectedClips}
+        >
+          <Copy size={18} />
+        </ToolbarButton>
+
+        {/* Opens a grid of every transition style, each tile a live animated preview
+            (`TransitionPickerMenu`), with an In/Out tab switch covering both `transitionIn` and
+            `transitionOut` — the Inspector's own "Transition In"/"Transition Out" sections (the same
+            underlying `SetClipTransitionCommand`/`SetClipTransitionOutCommand`) are still where each
+            direction's duration gets fine-tuned afterward. */}
+        <ToolbarButton
+          ref={transitionButtonRef}
+          title={transitionActive ? t("Change or remove transition") : t("Choose a transition")}
+          label={t("Transition")}
+          disabled={transitionDisabled}
+          active={transitionActive}
+          onClick={() => setShowTransitionMenu((v) => !v)}
+        >
+          <Transition size={18} />
+        </ToolbarButton>
+        {showTransitionMenu && foundForTransition && (
+          <TransitionPickerMenu
+            anchorRef={transitionButtonRef}
+            activeIn={foundForTransition.clip.transitionIn?.type ?? null}
+            activeOut={foundForTransition.clip.transitionOut?.type ?? null}
+            onChangeIn={(type) => {
+              if (!type) {
+                run(new SetClipTransitionCommand(foundForTransition.clip.id, null));
+                return;
+              }
+              const duration = foundForTransition.clip.transitionIn?.duration ?? DEFAULT_TRANSITION.duration;
+              run(new SetClipTransitionCommand(foundForTransition.clip.id, { duration, type }));
+            }}
+            onChangeOut={(type) => {
+              if (!type) {
+                run(new SetClipTransitionOutCommand(foundForTransition.clip.id, null));
+                return;
+              }
+              const duration = foundForTransition.clip.transitionOut?.duration ?? DEFAULT_TRANSITION.duration;
+              run(new SetClipTransitionOutCommand(foundForTransition.clip.id, { duration, type }));
+            }}
+            onClose={() => setShowTransitionMenu(false)}
+          />
+        )}
+
+        <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
+
+        <ToolbarButton
+          title={t("Delete selected (Del)")}
+          label={t("Delete")}
           disabled={selectedClipIds.length === 0}
           onClick={() => run(new DeleteClipsCommand(selectedClipIds))}
         >
           <Delete size={18} />
         </ToolbarButton>
         <ToolbarButton
-          title="Save (Ctrl+S)"
-          label="Save"
+          title={t("Save (Ctrl+S)")}
+          label={t("Save")}
           onClick={() => {
             void save();
-            setStatus("Project saved");
+            setStatus(t("Project saved"));
           }}
         >
           <Save size={18} />
-        </ToolbarButton>
-
-        <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
-
-        {/* Text and voiceover recording: moved here from the Media panel so both land straight on the
-            timeline (and so in the preview) the instant they're created, rather than sitting as a
-            library-only asset waiting for a separate double-click/drag to place. */}
-        <ToolbarButton title="Add text" label="Text" onClick={addTextAtPlayhead}>
-          <Text size={18} />
-        </ToolbarButton>
-        <VoiceoverRecorder />
-
-        {/* Quick on/off for the selected clip's crossfade — the Inspector's own "Transition In" section
-            (same underlying `SetClipTransitionCommand`) is still where the duration gets fine-tuned; see
-            `toggleTransitionOnSelected`'s own comment. */}
-        <ToolbarButton
-          title={transitionActive ? "Remove transition" : "Add crossfade transition from previous clip"}
-          label="Transition"
-          disabled={transitionDisabled}
-          active={transitionActive}
-          onClick={toggleTransitionOnSelected}
-        >
-          <Transition size={18} />
         </ToolbarButton>
 
         {/* Media/Properties, mobile-only — desktop keeps its permanent side columns (see
@@ -247,8 +308,8 @@ function StatusBar({
             `active`'s highlighted state always reflecting what's actually showing below. */}
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10 lg:hidden" />
         <ToolbarButton
-          title="Media"
-          label="Media"
+          title={t("Media")}
+          label={t("Media")}
           className="lg:hidden"
           active={mobileSheet === "media"}
           onClick={() => setMobileSheet(mobileSheet === "media" ? null : "media")}
@@ -256,8 +317,8 @@ function StatusBar({
           <Video size={18} />
         </ToolbarButton>
         <ToolbarButton
-          title="Properties"
-          label="Properties"
+          title={t("Properties")}
+          label={t("Properties")}
           className="lg:hidden"
           active={mobileSheet === "inspector"}
           onClick={() => setMobileSheet(mobileSheet === "inspector" ? null : "inspector")}
@@ -265,6 +326,8 @@ function StatusBar({
           <Settings size={18} />
         </ToolbarButton>
       </div>
+      {showCaptions && <AutoCaptionsDialog onClose={() => setShowCaptions(false)} />}
+      {showTextImport && <TextToClipsDialog onClose={() => setShowTextImport(false)} />}
     </footer>
   );
 }
@@ -277,8 +340,9 @@ function SaveStatus() {
   const dirty = useEditorStore((s) => s.dirty);
   const saving = useEditorStore((s) => s.saving);
   const lastSavedAt = useEditorStore((s) => s.lastSavedAt);
+  const t = useTranslation();
 
-  const text = saving ? "Saving…" : dirty ? "Unsaved changes" : lastSavedAt ? "All changes saved" : "";
+  const text = saving ? t("Saving…") : dirty ? t("Unsaved changes") : lastSavedAt ? t("All changes saved") : "";
   if (!text) return null;
 
   return <span className="shrink-0 truncate text-[11px] text-white/40">{text}</span>;
@@ -294,11 +358,15 @@ function StatusToast() {
   const status = useEditorStore((s) => s.status);
   const setStatus = useEditorStore((s) => s.setStatus);
 
-  // Transient messages clear themselves; errors stay until replaced, since an error the user blinked
-  // and missed is worse than one that lingers.
+  // Every status eventually clears itself — errors just get longer on screen (6s vs. 3s) since one
+  // the user blinked and missed is worse than a transient success message would be, but "longer" is
+  // not "forever": an error nobody ever replaces with a new status (the common case — most edits
+  // never fail again right after one does) used to sit there indefinitely with no way to close it.
+  // The manual dismiss button below is the other half of the actual fix — even 6s can be too eager to
+  // read a longer message, so closing it shouldn't require waiting out a timer either.
   useEffect(() => {
-    if (!status || status.tone === "error") return;
-    const timer = setTimeout(() => setStatus(null), 3000);
+    if (!status) return;
+    const timer = setTimeout(() => setStatus(null), status.tone === "error" ? 6000 : 3000);
     return () => clearTimeout(timer);
   }, [status, setStatus]);
 
@@ -313,15 +381,24 @@ function StatusToast() {
       // covering the very buttons a user might want to react with. `pointer-events-none` on the
       // wrapper + `-auto` on the pill itself: the empty space around the centered pill must stay
       // click-through (it spans the full width so the pill can center in it), but the pill itself
-      // should still be interactive if it's ever given a dismiss control.
+      // stays interactive for the dismiss button below.
       className="pointer-events-none fixed inset-x-0 bottom-16 z-40 flex justify-center px-4"
     >
       <div
-        className={`pointer-events-auto max-w-[90vw] truncate rounded-md px-3 py-1.5 text-xs shadow-lg ${
+        className={`pointer-events-auto flex max-w-[90vw] items-center gap-2 rounded-md py-1.5 pl-3 pr-1.5 text-xs shadow-lg ${
           status.tone === "error" ? "bg-rose-500/95 text-white" : "border border-white/10 bg-[#181b22] text-white/80"
         }`}
       >
-        {status.message}
+        <span className="truncate">{status.message}</span>
+        <button
+          onClick={() => setStatus(null)}
+          aria-label="Dismiss"
+          className={`shrink-0 rounded p-0.5 leading-none transition ${
+            status.tone === "error" ? "text-white/70 hover:bg-white/15 hover:text-white" : "text-white/40 hover:bg-white/10 hover:text-white/80"
+          }`}
+        >
+          ✕
+        </button>
       </div>
     </div>,
     document.body
@@ -336,6 +413,7 @@ function StatusToast() {
 function EditableProjectTitle() {
   const name = useEditorStore((s) => s.project?.name ?? "");
   const renameProject = useEditorStore((s) => s.renameProject);
+  const t = useTranslation();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(name);
   // Set right before an Escape-triggered exit, so the `onBlur` that follows (removing the input from
@@ -377,7 +455,7 @@ function EditableProjectTitle() {
             e.currentTarget.blur();
           }
         }}
-        aria-label="Project name"
+        aria-label={t("Project name")}
         className="min-w-0 max-w-[240px] flex-1 rounded bg-white/10 px-1.5 py-0.5 text-xs text-white outline-none ring-1 ring-sky-400/60"
       />
     );
@@ -386,8 +464,8 @@ function EditableProjectTitle() {
   return (
     <button
       onClick={startEditing}
-      title="Rename project"
-      aria-label="Rename project"
+      title={t("Rename project")}
+      aria-label={t("Rename project")}
       className="min-w-0 max-w-[240px] flex-1 truncate rounded px-1.5 py-0.5 text-left text-xs text-white/35 transition hover:bg-white/10 hover:text-white/70"
     >
       {name}
@@ -395,12 +473,54 @@ function EditableProjectTitle() {
   );
 }
 
-export function VStudioApp({ projectId, projectName }: { projectId: string; projectName?: string }) {
+interface VStudioAppProps {
+  projectId: string;
+  projectName?: string;
+  // Optional: a host-embedded editor (BP Studio's `<iframe>`, today) has no "VStudio project list" of
+  // its own to go back to, so VStudioApp itself stays agnostic about whether one exists rather than
+  // assuming "/" is always a valid place to send the user — see `edit/page.tsx`'s own comment on how
+  // it decides whether to pass this.
+  onHome?: () => void;
+}
+
+function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   const load = useEditorStore((s) => s.load);
   const loading = useEditorStore((s) => s.loading);
   const loadError = useEditorStore((s) => s.loadError);
   const project = useEditorStore((s) => s.project);
+  const language = useEditorStore((s) => s.language);
+  const setLanguage = useEditorStore((s) => s.setLanguage);
+  const t = useTranslation();
   const [exportOpen, setExportOpen] = useState(false);
+
+  // Warms every registered font's real `@font-face` fetch up front — see `preloadAllFonts`'s own
+  // doc comment for why this is necessary at all (Canvas-only text rendering doesn't reliably trigger
+  // a font's fetch on its own the way a DOM element with real CSS would). Mount-only: the module-scope
+  // `preloadedFontIds` set inside `fonts.ts` already makes repeat calls (from here on every remount,
+  // or from a hovered/selected font in the Inspector's picker) cheap no-ops regardless.
+  useEffect(() => {
+    preloadAllFonts();
+  }, []);
+
+  // Catches errors OUTSIDE React's own render cycle — `ErrorBoundary` (wrapping this whole component,
+  // see `VStudioApp`'s own export below) only ever sees throws during render; an error inside an event
+  // handler, a `setTimeout`/async callback, or `PlaybackEngine`'s own imperative (non-React) code
+  // reaches here instead. Routed through the same `reportError` the boundary uses, so both land in the
+  // same crash log regardless of which path caught them.
+  useEffect(() => {
+    function onError(event: ErrorEvent) {
+      reportError("window-error", event.error ?? event.message);
+    }
+    function onRejection(event: PromiseRejectionEvent) {
+      reportError("unhandled-rejection", event.reason);
+    }
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, []);
   // Below the `lg` breakpoint there's no permanent Media/Inspector column at all (240px + 260px of
   // fixed side columns doesn't fit next to a preview that still needs to show a legible frame) —
   // instead, the toolbar's Media/Properties buttons (see StatusBar) swap the Timeline row's own
@@ -412,13 +532,20 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   // adding a third mobile layout mode alongside it.
   const [mobileSheet, setMobileSheet] = useState<"media" | "inspector" | null>(null);
 
+  // Independent of `mobileSheet` above — that one is deliberately the mobile-only "borrow the bottom
+  // row because there's no side column to put this in" concept (see its own comment). This decides
+  // what the SAME row shows at every breakpoint whenever `mobileSheet` isn't itself active: "timeline"
+  // (the default) or "mixer" (toggled from the always-visible Mixer toolbar button in `StatusBar`,
+  // replacing the track lanes with a row of channel strips — the DaVinci-Resolve-Fairlight-page
+  // pattern, not a new grid column). A literal union rather than a boolean in case a future third
+  // bottom-panel mode is ever added.
+  const [bottomPanel, setBottomPanel] = useState<"timeline" | "mixer">("timeline");
+
   // Lets the user trade vertical space between Preview (clearer to look at, bigger) and Timeline
   // (more clips/tracks visible at once) via a draggable divider, on every breakpoint. Seeded
   // per-breakpoint, NOT one shared default: desktop's roomy 320px starting point squeezed Preview's
   // row down to a sliver on a short phone the instant it was reused as mobile's default too —
-  // confirmed live, the transport bar's own real content then overflowed its row. `typeof window`
-  // guard: this file is "use client", but the very first render (SSR/hydration) still runs once
-  // without a real `window`.
+  // confirmed live, the transport bar's own real content then overflowed its row.
   //
   // The per-breakpoint preferred value alone isn't enough, though: it's keyed on `min-width`, which
   // tracks portrait-vs-landscape only by accident. A phone rotated to landscape is still under the
@@ -430,15 +557,26 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   // wrong: it reused `MAX_TIMELINE_HEIGHT_RATIO` (a generous 75%, meant for how far a user's own
   // manual drag is allowed to go) for automatic reflow too, so re-rotating portrait's already-small
   // 224px default against a 390px-tall landscape viewport passed that loose check and never shrank.
-  const [timelineHeight, setTimelineHeight] = useState(() => {
-    if (typeof window === "undefined") return 224;
-    const preferred = window.matchMedia("(min-width: 1024px)").matches ? 320 : 224;
-    return clampTimelineHeight(preferred, window.innerHeight);
-  });
+  //
+  // Starts at the plain 224px fallback UNCONDITIONALLY — not a `typeof window === "undefined"` branch
+  // in the initializer, which used to read the real `window.innerHeight`/`matchMedia` on the client
+  // but not on the server: since the very first CLIENT render (during hydration) ran that same
+  // initializer before any effect could run, it was already computing a DIFFERENT number than the
+  // server had rendered, tripping a hydration mismatch on every load where the real viewport didn't
+  // happen to clamp to exactly 224. `useLayoutEffect` below corrects it to the real per-breakpoint
+  // value SYNCHRONOUSLY after mount, before the browser paints — client-only by nature (effects never
+  // run during SSR), so the server/first-client-render pair stays byte-for-byte identical, and the
+  // correction lands before the user ever sees the placeholder 224px.
+  const [timelineHeight, setTimelineHeight] = useState(224);
 
-  // Re-clamps on resize/rotation — the initializer above only runs once at mount, so rotating a
-  // phone mid-session (portrait, where 224px comfortably fits, to landscape, where it doesn't) would
-  // otherwise reproduce the exact same squeeze the initializer fixes for a fresh landscape load. Only
+  useLayoutEffect(() => {
+    const preferred = window.matchMedia("(min-width: 1024px)").matches ? 320 : 224;
+    setTimelineHeight(clampTimelineHeight(preferred, window.innerHeight));
+  }, []);
+
+  // Re-clamps on resize/rotation — the mount effect above only runs once, so rotating a phone
+  // mid-session (portrait, where 224px comfortably fits, to landscape, where it doesn't) would
+  // otherwise reproduce the exact same squeeze the mount effect fixes for a fresh landscape load. Only
   // ever clamps DOWN (`clampTimelineHeight` never returns more than its input), so it never overrides
   // a height the user deliberately chose via `beginTimelineResize` unless the viewport genuinely no
   // longer fits it.
@@ -465,6 +603,67 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
         // against — Preview is just `minmax(0,1fr)`, same as desktop.
         const dy = start.y - point.y;
         setTimelineHeight(Math.min(window.innerHeight * MAX_TIMELINE_HEIGHT_RATIO, Math.max(MIN_TIMELINE_HEIGHT, startTimelineHeight + dy)));
+      },
+      () => removeListeners()
+    );
+  }
+
+  // Media/Properties column widths — `lg`+ only, same fixed-panel-vs-flexible-Preview shape
+  // `timelineHeight` already established for the horizontal divider, just along the other axis. Seeded
+  // to the pixel values these two columns used before either was resizable (240px/260px), UNCONDITIONALLY
+  // — same reasoning as `timelineHeight`'s own initializer comment above: reading `window.innerWidth`
+  // right here would make the client's own first render disagree with the server's, not just the
+  // server-vs-nothing case a `typeof window` guard alone protects against. The `useLayoutEffect` below
+  // corrects both to their real clamped values synchronously after mount, before paint.
+  const [mediaWidth, setMediaWidth] = useState(240);
+  const [propertiesWidth, setPropertiesWidth] = useState(260);
+  // Read inside the resize-listener effect below, which (like `timelineHeight`'s own) stays mount-only
+  // (`[]` deps) — a ref is what lets it see each width's LATEST value without re-subscribing the
+  // `resize` listener on every drag pixel the way depending on the state directly would.
+  const mediaWidthRef = useRef(mediaWidth);
+  mediaWidthRef.current = mediaWidth;
+  const propertiesWidthRef = useRef(propertiesWidth);
+  propertiesWidthRef.current = propertiesWidth;
+
+  useLayoutEffect(() => {
+    setMediaWidth(clampSideWidth(240, 260, window.innerWidth));
+    setPropertiesWidth(clampSideWidth(260, 240, window.innerWidth));
+  }, []);
+
+  useEffect(() => {
+    function onResize() {
+      setMediaWidth((w) => clampSideWidth(w, propertiesWidthRef.current, window.innerWidth));
+      setPropertiesWidth((w) => clampSideWidth(w, mediaWidthRef.current, window.innerWidth));
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  function beginMediaResize(startEvent: React.MouseEvent | React.TouchEvent) {
+    preventDefaultIfMouse(startEvent);
+    const start = clientPoint(startEvent);
+    const startWidth = mediaWidth;
+    const removeListeners = addDragListeners(
+      (moveEvent) => {
+        const point = clientPoint(moveEvent);
+        // Media is the LEFT column — dragging its right edge further right grows it.
+        const dx = point.x - start.x;
+        setMediaWidth(clampSideWidth(startWidth + dx, propertiesWidthRef.current, window.innerWidth));
+      },
+      () => removeListeners()
+    );
+  }
+
+  function beginPropertiesResize(startEvent: React.MouseEvent | React.TouchEvent) {
+    preventDefaultIfMouse(startEvent);
+    const start = clientPoint(startEvent);
+    const startWidth = propertiesWidth;
+    const removeListeners = addDragListeners(
+      (moveEvent) => {
+        const point = clientPoint(moveEvent);
+        // Properties is the RIGHT column — dragging its left edge further left grows it.
+        const dx = start.x - point.x;
+        setPropertiesWidth(clampSideWidth(startWidth + dx, mediaWidthRef.current, window.innerWidth));
       },
       () => removeListeners()
     );
@@ -500,7 +699,7 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
       if (modifier && event.key.toLowerCase() === "s") {
         event.preventDefault();
         void state.save();
-        state.setStatus("Project saved");
+        state.setStatus(translateText(state.language, "Project saved"));
         return;
       }
       if (modifier && event.key.toLowerCase() === "z") {
@@ -513,6 +712,12 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
       if (modifier && event.key.toLowerCase() === "y") {
         event.preventDefault();
         state.redo();
+        return;
+      }
+      if (modifier && event.key.toLowerCase() === "d") {
+        // Standard NLE shortcut (Premiere, Final Cut, CapCut all use Ctrl/⌘+D for this).
+        event.preventDefault();
+        state.duplicateSelectedClips();
         return;
       }
       // Standard zoom shortcuts, matching every editor: Ctrl/⌘ +/- steps, Ctrl/⌘ 0 resets. "=" is
@@ -606,7 +811,7 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center bg-[#0a0c10] text-xs text-white/40">
-        Opening VStudio…
+        {t("Opening VStudio…")}
       </div>
     );
   }
@@ -614,29 +819,58 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
   if (loadError || !project) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 bg-[#0a0c10] p-6 text-center">
-        <p className="text-sm font-medium text-rose-300">VStudio couldn&apos;t open this project</p>
+        <p className="text-sm font-medium text-rose-300">{t("VStudio couldn't open this project")}</p>
         <p className="max-w-md text-xs leading-relaxed text-white/50">{loadError}</p>
         <button
           onClick={() => void load(projectId)}
           className="rounded-md bg-white/10 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/20"
         >
-          Try again
+          {t("Try again")}
         </button>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[#0a0c10] text-white">
+    // "VStudio" is a product name — never translated. `vstudio-lang-km` (see studios/vstudio's
+    // globals.css) swaps the whole chrome's font-family to a Khmer-capable face via inheritance —
+    // one place, cascades to every descendant, no per-component font changes needed.
+    <div className={`flex h-full min-h-0 min-w-0 flex-col bg-[#0a0c10] text-white ${language === "km" ? "vstudio-lang-km" : ""}`}>
       <header className="flex min-w-0 shrink-0 items-center gap-2 border-b border-white/10 px-3 py-2">
-        <span className="shrink-0 text-sm font-semibold tracking-tight">VStudio</span>
+        {onHome ? (
+          <button
+            onClick={onHome}
+            title={t("Back to projects")}
+            aria-label={t("Back to projects")}
+            className="flex shrink-0 items-center gap-1.5 text-sm font-semibold tracking-tight text-white transition hover:text-sky-400"
+          >
+            {/* An arrow (not a plain "X") — "X" reads as close/discard, which this isn't; this
+                genuinely navigates back to the projects list, so an unambiguous back arrow is the
+                more literal affordance for what actually happens on click. Prefixed onto the existing
+                "VStudio" wordmark rather than replacing it — keeps the brand visible while editing,
+                the arrow alone already makes the button's clickability/destination obvious without
+                needing to sacrifice one for the other. */}
+            <ArrowLeft size={16} />
+            VStudio
+          </button>
+        ) : (
+          <span className="shrink-0 text-sm font-semibold tracking-tight">VStudio</span>
+        )}
         <EditableProjectTitle />
         <SaveStatus />
         <button
-          onClick={() => setExportOpen(true)}
-          className="ml-auto shrink-0 rounded-md bg-sky-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-sky-400"
+          onClick={() => setLanguage(language === "en" ? "km" : "en")}
+          title={t("Switch language")}
+          aria-label={t("Switch language")}
+          className="ml-auto shrink-0 rounded-md px-2 py-1 text-[11px] font-medium text-white/60 transition hover:bg-white/10 hover:text-white"
         >
-          Export
+          {language === "en" ? "ខ្មែរ" : "EN"}
+        </button>
+        <button
+          onClick={() => setExportOpen(true)}
+          className="shrink-0 rounded-md bg-sky-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-sky-400"
+        >
+          {t("Export")}
         </button>
       </header>
 
@@ -658,11 +892,25 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
           are natively focusable) made the browser auto-scroll that hidden width into view, yanking
           the whole page sideways. That was the actual "still not functional" bug. */}
       <div
-        className="relative grid min-h-0 min-w-0 flex-1 grid-rows-[minmax(0,1fr)_224px] lg:grid-cols-[240px_minmax(0,1fr)_260px] lg:grid-rows-[minmax(0,1fr)_320px]"
-        // The Tailwind class above is the PRE-HYDRATION fallback only, matched almost exactly by this
-        // inline style (which takes over the instant `timelineHeight` state exists, i.e. immediately
-        // on the client) — one shared 2-row shape now, not a breakpoint-dependent one.
-        style={{ gridTemplateRows: `minmax(0,1fr) ${timelineHeight}px` }}
+        className="relative grid min-h-0 min-w-0 flex-1 grid-rows-[minmax(0,1fr)_224px] lg:grid-cols-[var(--vs-media-w)_minmax(0,1fr)_var(--vs-props-w)] lg:grid-rows-[minmax(0,1fr)_320px]"
+        // The Tailwind row class above is the PRE-HYDRATION fallback only, matched almost exactly by
+        // the `gridTemplateRows` inline style (which takes over the instant `timelineHeight` state
+        // exists, i.e. immediately on the client) — one shared 2-row shape now, not a
+        // breakpoint-dependent one. Columns can't take that same "inline style always wins" shortcut,
+        // though: below `lg` there are only ever 1-2 real tracks (Media/Properties don't render at
+        // all there — see the comment above), so an unconditional `gridTemplateColumns` override would
+        // force 3 columns onto the mobile layout too and squeeze Preview/Timeline into a sliver.
+        // Routing the two widths through CSS custom properties instead keeps the `lg:` media query
+        // doing the gating in real CSS, same as it already does for every other `lg:`-prefixed class
+        // here — the custom properties themselves are harmless to set unconditionally since nothing
+        // below `lg` ever references them.
+        style={
+          {
+            gridTemplateRows: `minmax(0,1fr) ${timelineHeight}px`,
+            "--vs-media-w": `${mediaWidth}px`,
+            "--vs-props-w": `${propertiesWidth}px`,
+          } as React.CSSProperties
+        }
       >
         <div className="row-start-1 min-h-0 min-w-0 lg:order-2 lg:col-start-2 lg:row-start-1">
           <Preview />
@@ -679,14 +927,18 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
           <Inspector />
         </div>
 
-        {/* The one row Timeline shares with Media/Properties below `lg` — `mobileSheet` stays `null`
-            at `lg`+ (nothing there ever sets it), so this always renders Timeline once the permanent
-            side columns above are visible. */}
+        {/* The one row Timeline shares with Media/Properties below `lg`, and with Mixer at every
+            breakpoint — `mobileSheet` stays `null` at `lg`+ (nothing there ever sets it), so this falls
+            through to `bottomPanel` (Timeline vs. Mixer) once the permanent side columns above are
+            visible. See `bottomPanel`'s own comment for why it's a separate concept from
+            `mobileSheet`. */}
         <div className="row-start-2 min-h-0 min-w-0 lg:col-span-3 lg:row-start-2">
           {mobileSheet === "media" ? (
             <MediaLibrary onAssetAdded={() => setMobileSheet(null)} />
           ) : mobileSheet === "inspector" ? (
             <Inspector />
+          ) : bottomPanel === "mixer" ? (
+            <MixerPanel />
           ) : (
             <Timeline />
           )}
@@ -706,15 +958,56 @@ export function VStudioApp({ projectId, projectName }: { projectId: string; proj
           onTouchStart={beginTimelineResize}
           role="separator"
           aria-orientation="horizontal"
-          aria-label="Resize timeline"
+          aria-label={t("Resize timeline")}
           className="absolute inset-x-0 z-20 block h-2.5 -translate-y-1/2 cursor-row-resize touch-none"
           style={{ bottom: timelineHeight }}
         />
+
+        {/* Media|Preview and Preview|Properties dividers — `lg`+ only, same reasoning as the columns
+            they resize (see the grid's own comment above): below `lg` neither side column renders, so
+            there's nothing here to drag. Positioned/centered exactly like the timeline divider above,
+            just along X instead of Y — `left`/`right` (not `translate-x` alone) anchors each to the
+            actual column boundary, which is a real pixel value here (unlike Preview's own width,
+            which is never known ahead of time — it's `minmax(0,1fr)`), and the half-width translate
+            centers the grabbable strip ON that boundary rather than starting flush against it. */}
+        <div
+          onMouseDown={beginMediaResize}
+          onTouchStart={beginMediaResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={t("Resize media panel")}
+          className="absolute inset-y-0 z-20 hidden w-2.5 -translate-x-1/2 cursor-col-resize touch-none lg:block"
+          style={{ left: mediaWidth }}
+        />
+        <div
+          onMouseDown={beginPropertiesResize}
+          onTouchStart={beginPropertiesResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={t("Resize properties panel")}
+          className="absolute inset-y-0 z-20 hidden w-2.5 translate-x-1/2 cursor-col-resize touch-none lg:block"
+          style={{ right: propertiesWidth }}
+        />
       </div>
 
-      <StatusBar mobileSheet={mobileSheet} setMobileSheet={setMobileSheet} />
+      <StatusBar mobileSheet={mobileSheet} setMobileSheet={setMobileSheet} bottomPanel={bottomPanel} setBottomPanel={setBottomPanel} />
       <StatusToast />
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
     </div>
+  );
+}
+
+/** The real export — wraps `VStudioAppInner` in an `ErrorBoundary` from the OUTSIDE, not as the
+ *  first thing inside its own return, specifically so the boundary also catches errors thrown by
+ *  `VStudioAppInner`'s own top-level hooks (a boundary can never catch an error thrown by itself, only
+ *  by its children — putting it inside `VStudioAppInner`'s own return would miss anything that throws
+ *  before that return is ever reached). This protects the editor regardless of who mounts it — the
+ *  standalone page, BP Studio's `<iframe>` embed, or any future embedder — without relying on every
+ *  call site remembering to add a boundary of its own. */
+export function VStudioApp(props: VStudioAppProps) {
+  return (
+    <ErrorBoundary>
+      <VStudioAppInner {...props} />
+    </ErrorBoundary>
   );
 }

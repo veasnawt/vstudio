@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { cancelExport, exportAvailable, exportUrl, startExport, watchExport } from "../api/client.ts";
 import { nativeExportUrl, nativeSaveExportToGallery } from "../api/nativeExport.ts";
 import { trimProjectToRange } from "../export/trimForExport.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { sequenceDuration } from "../project/createProject.ts";
 import { FPS_PRESETS, RESOLUTION_PRESETS } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
@@ -15,6 +16,7 @@ import { Dropdown } from "./Dropdown.tsx";
 type Phase = "idle" | "running" | "done" | "failed" | "cancelled";
 
 export function ExportDialog({ onClose }: { onClose: () => void }) {
+  const t = useTranslation();
   const project = useEditorStore((s) => s.project);
   const projectId = useEditorStore((s) => s.projectId);
   const save = useEditorStore((s) => s.save);
@@ -102,7 +104,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
             if (isNative) void autoSaveToGallery(started.fileName);
           } else if (update.status === "failed") {
             setPhase("failed");
-            setError(update.error ?? "Export failed");
+            setError(update.error ?? t("Export failed"));
           } else if (update.status === "cancelled") setPhase("cancelled");
         },
         (message) => {
@@ -130,7 +132,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       // `files` (a real attachment another app can read), not `url` — `url` is for sharing a WEB
       // link/text, and silently degrades to just the `title` text when handed a local file:// path
       // instead, which is exactly what looked like "sharing only copies the text, not the video."
-      await Share.share({ files: [url], title: fileName, dialogTitle: "Save or share video" });
+      await Share.share({ files: [url], title: fileName, dialogTitle: t("Save or share video") });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -148,25 +150,26 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       }}
       role="dialog"
       aria-modal="true"
-      aria-label="Export video"
+      aria-label={t("Export video")}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         className="w-full max-w-md rounded-xl border border-white/10 bg-[#12151c] p-5 shadow-2xl"
       >
-        <h2 className="text-sm font-semibold text-white">Export</h2>
+        <h2 className="text-sm font-semibold text-white">{t("Export")}</h2>
 
         {available === false ? (
           <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-200">
-            FFmpeg isn&apos;t available on this machine, so VStudio can&apos;t render a file. Reinstall dependencies
-            (<code className="font-mono">pnpm install</code>) to restore it.
+            {t("FFmpeg isn't available on this machine, so VStudio can't render a file. Reinstall dependencies")} (
+            <code className="font-mono">pnpm install</code>
+            {t(") to restore it.")}
           </p>
         ) : (
           <>
             {hasRange && (
               <div className="mt-4 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
                 <span>
-                  Exporting range {formatTimecode(Math.min(exportRangeStart ?? 0, exportRangeEnd ?? total), fps)}{" "}
+                  {t("Exporting range")} {formatTimecode(Math.min(exportRangeStart ?? 0, exportRangeEnd ?? total), fps)}{" "}
                   – {formatTimecode(Math.max(exportRangeStart ?? 0, exportRangeEnd ?? total), fps)}
                 </span>
                 <button
@@ -174,7 +177,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                   onClick={clearExportRange}
                   className="font-medium text-amber-100 underline decoration-amber-100/40 underline-offset-2 transition hover:text-white disabled:opacity-50"
                 >
-                  Reset to full timeline
+                  {t("Reset to full timeline")}
                 </button>
               </div>
             )}
@@ -182,11 +185,11 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
             <div className="mt-4 space-y-3">
               <label className="block">
                 <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
-                  Resolution
+                  {t("Resolution")}
                 </span>
                 <Dropdown
                   disabled={busy}
-                  ariaLabel="Resolution"
+                  ariaLabel={t("Resolution")}
                   value={`${width}x${height}`}
                   onChange={(next) => {
                     const [w, h] = next.split("x").map(Number);
@@ -203,32 +206,32 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
               <div className="grid grid-cols-2 gap-3">
                 <label className="block">
                   <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
-                    Frame rate
+                    {t("Frame rate")}
                   </span>
                   <Dropdown
                     disabled={busy}
-                    ariaLabel="Frame rate"
+                    ariaLabel={t("Frame rate")}
                     value={String(fps)}
                     onChange={(next) => setFps(Number(next))}
-                    options={FPS_PRESETS.map((value) => ({ value: String(value), label: `${value} fps` }))}
+                    options={FPS_PRESETS.map((value) => ({ value: String(value), label: t("{value} fps", { value }) }))}
                   />
                 </label>
 
                 <label className="block">
                   <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-white/50">
-                    Quality
+                    {t("Quality")}
                   </span>
                   {/* CRF is inverted (lower = better), which is unintuitive — the labels say what the
                       user actually cares about and keep the numbers out of the way. */}
                   <Dropdown
                     disabled={busy}
-                    ariaLabel="Quality"
+                    ariaLabel={t("Quality")}
                     value={String(crf)}
                     onChange={(next) => setCrf(Number(next))}
                     options={[
-                      { value: "18", label: "High" },
-                      { value: "20", label: "Balanced" },
-                      { value: "26", label: "Small file" },
+                      { value: "18", label: t("High") },
+                      { value: "20", label: t("Balanced") },
+                      { value: "26", label: t("Small file") },
                     ]}
                   />
                 </label>
@@ -246,17 +249,17 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                   />
                 </div>
                 <p className="mt-2 text-[11px] text-white/60">
-                  {phase === "running" && `Rendering… ${Math.round(progress * 100)}%`}
-                  {phase === "done" && "Export complete"}
-                  {phase === "cancelled" && "Export cancelled"}
+                  {phase === "running" && t("Rendering… {percent}%", { percent: Math.round(progress * 100) })}
+                  {phase === "done" && t("Export complete")}
+                  {phase === "cancelled" && t("Export cancelled")}
                   {phase === "failed" && <span className="text-rose-300">{error}</span>}
                 </p>
                 {phase === "done" && isNative && (
                   <p className="mt-1 text-[11px] text-white/40">
-                    {gallerySave === "saving" && "Saving to Gallery…"}
-                    {gallerySave === "done" && "Saved to Gallery"}
+                    {gallerySave === "saving" && t("Saving to Gallery…")}
+                    {gallerySave === "done" && t("Saved to Gallery")}
                     {gallerySave === "failed" && (
-                      <span className="text-amber-300">Couldn&apos;t auto-save — use Save / Share below</span>
+                      <span className="text-amber-300">{t("Couldn't auto-save — use Save / Share below")}</span>
                     )}
                   </p>
                 )}
@@ -271,7 +274,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                     disabled={sharing}
                     className="mr-auto rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30 disabled:opacity-50"
                   >
-                    {sharing ? "Sharing…" : "Save / Share"}
+                    {sharing ? t("Sharing…") : t("Save / Share")}
                   </button>
                 ) : (
                   <a
@@ -279,7 +282,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                     download={fileName}
                     className="mr-auto rounded-md bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30"
                   >
-                    Save video
+                    {t("Save video")}
                   </a>
                 )
               )}
@@ -289,7 +292,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                   onClick={() => void stop()}
                   className="rounded-md bg-white/10 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-white/20"
                 >
-                  Cancel export
+                  {t("Cancel export")}
                 </button>
               ) : (
                 <>
@@ -297,14 +300,14 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                     onClick={onClose}
                     className="rounded-md px-3 py-1.5 text-xs font-medium text-white/60 transition hover:bg-white/10 hover:text-white"
                   >
-                    Close
+                    {t("Close")}
                   </button>
                   <button
                     onClick={() => void begin()}
                     disabled={available === null}
                     className="rounded-md bg-sky-500 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-400 disabled:opacity-50"
                   >
-                    {phase === "idle" ? "Export" : "Export again"}
+                    {phase === "idle" ? t("Export") : t("Export again")}
                   </button>
                 </>
               )}

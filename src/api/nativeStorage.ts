@@ -114,7 +114,29 @@ function probeViaMediaElement(kind: AssetKind, objectUrl: string): Promise<{ dur
       // wrongly-absent one would hide real audio behind the mute-toggle UI.
       const audioTracks = (el as unknown as { audioTracks?: { length: number } }).audioTracks;
       const hasAudio = kind === "audio" || noVideoStream || audioTracks === undefined || audioTracks.length > 0;
-      resolve({ duration: Number.isFinite(el.duration) ? el.duration : 0, width, height, hasAudio, noVideoStream });
+      const finish = (duration: number) => resolve({ duration, width, height, hasAudio, noVideoStream });
+
+      if (Number.isFinite(el.duration)) {
+        finish(el.duration);
+        return;
+      }
+      // A MediaRecorder-captured file (any `VoiceoverRecorder` take) has no Duration written into its
+      // container at all — see the server-side `remuxForDuration`'s own comment for the full mechanism
+      // — which WebKit/Blink surface here as `duration === Infinity`, not a normal number. There's no
+      // FFmpeg on this code path to remux with (see this module's own doc comment on why), but seeking
+      // to a huge out-of-range time forces the decoder to scan for the real end of the stream and fire
+      // `durationchange` with the actual value — the standard browser-side workaround for this exact
+      // MediaRecorder quirk. Falls back to the old `0` (import rejected) if that scan somehow never
+      // resolves, so a genuinely broken file still fails the same way it always did rather than hanging.
+      const fallback = setTimeout(() => finish(0), 4000);
+      el.ondurationchange = () => {
+        if (!Number.isFinite(el.duration)) return;
+        clearTimeout(fallback);
+        el.ondurationchange = null;
+        el.currentTime = 0;
+        finish(el.duration);
+      };
+      el.currentTime = 1e101;
     };
     el.onerror = () => reject(new Error("That file couldn't be read as media"));
     el.src = objectUrl;

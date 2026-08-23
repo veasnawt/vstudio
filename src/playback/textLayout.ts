@@ -27,6 +27,12 @@ export const TEXT_BOX_PADDING = 12;
 export interface TextBlockLayout {
   lines: string[];
   lineHeight: number;
+  /** Vertical distance from the block's own top edge down to the FIRST line's baseline — derived from
+   *  the browser's own real font metrics, not a fontSize-based guess (see `computeTextBlock`'s own
+   *  comment on why: Khmer's tall vowel signs and deep subscript consonant stacks give it a much
+   *  larger, far-from-symmetric ascent/descent than Latin has, so a Latin-tuned approximation visibly
+   *  crowds one edge of the text's own background box instead of centering within it). */
+  baselineOffset: number;
   /** Top-left corner and size of the (unrotated) text block, in canvas backing-store (sequence)
    *  pixels — `offsetX`/`offsetY` and the align anchor are already baked in. Rotation, when
    *  `style.rotationDeg` is nonzero, happens AROUND this box's own center — see `PlaybackEngine
@@ -68,8 +74,28 @@ export function computeTextBlock(
   context.textAlign = "left"; // always left — `blockLeft` below already encodes the align setting.
 
   const lineHeight = style.fontSize * style.lineHeightMultiplier;
-  const blockWidth = Math.max(...lines.map((line) => context.measureText(line).width));
   const blockHeight = lineHeight * lines.length;
+
+  // Real ink metrics of the ACTUAL rendered glyphs (not a fontSize-based guess) for where the
+  // baseline sits within its own line. Deliberately `actualBoundingBox*`, not `fontBoundingBox*`: the
+  // latter reports the FONT's own worst-case design metrics — generous enough to fit any character the
+  // face could ever render, descenders included, whether or not this string has any — so an all-caps,
+  // no-descender line like "BEYOND PERSPECTIVE" still got padded as if it had one, visibly shoving the
+  // text toward the bottom of its own background box (confirmed live, not just from spec: a red-boxed
+  // logo wordmark with zero descenders showed a large gap above the text and almost none below).
+  // `actualBoundingBox*` measures the tight ink extent of THIS specific text instead, which is what
+  // "equal padding around what I can actually see" means. Taken as the max across every line (not
+  // just the first) so a multi-line block with, say, one all-caps line and one with a Khmer subscript
+  // stack centers on whichever line is genuinely tallest/deepest, not whichever happens to be first.
+  // Any EXTRA leading `lineHeightMultiplier` adds beyond that real ink height is split evenly
+  // above/below, the same way CSS `line-height` distributes leading around a font's own box.
+  // Measured once per line and reused for `blockWidth` below too — no reason to call `measureText`
+  // twice per line for two different pieces of the same result.
+  const lineMetrics = lines.map((line) => context.measureText(line || " "));
+  const blockWidth = Math.max(...lineMetrics.map((m) => m.width));
+  const ascent = Math.max(...lineMetrics.map((m) => m.actualBoundingBoxAscent ?? 0)) || style.fontSize * 0.8;
+  const descent = Math.max(...lineMetrics.map((m) => m.actualBoundingBoxDescent ?? 0)) || style.fontSize * 0.2;
+  const baselineOffset = ascent + (lineHeight - (ascent + descent)) / 2;
 
   // The align anchor: left/right hug their frame edge (inset by the shared margin), center sits on
   // the frame's own center — `offsetX`/`offsetY` then nudge from THAT point, in every case.
@@ -82,5 +108,5 @@ export function computeTextBlock(
   const blockLeft = style.align === "left" ? anchorX : style.align === "right" ? anchorX - blockWidth : anchorX - blockWidth / 2;
   const blockTop = canvasHeight / 2 + style.offsetY - blockHeight / 2;
 
-  return { lines, lineHeight, blockLeft, blockTop, blockWidth, blockHeight };
+  return { lines, lineHeight, baselineOffset, blockLeft, blockTop, blockWidth, blockHeight };
 }

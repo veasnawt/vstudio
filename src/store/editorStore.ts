@@ -1,8 +1,11 @@
 import { create } from "zustand";
 import * as api from "../api/client.ts";
-import type { SourceRect } from "../api/client.ts";
+import type { CaptionSegment, SourceRect } from "../api/client.ts";
 import type { Command } from "../commands/index.ts";
-import { AddClipCommand, AddTrackCommand } from "../commands/index.ts";
+import { AddCaptionsCommand, AddClipCommand, AddTrackCommand, DuplicateClipsCommand } from "../commands/index.ts";
+import type { Language } from "../i18n/translations.ts";
+import { translateText } from "../i18n/translations.ts";
+import type { PlaybackEngine } from "../playback/PlaybackEngine.ts";
 import { createTextAsset, sequenceDuration } from "../project/createProject.ts";
 import type { Asset, Project } from "../project/types.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
@@ -10,6 +13,22 @@ import { defaultClipDuration, EditError, trackKindForAsset } from "../timeline/o
 import { nonOverlappingPointStart, nonOverlappingStart } from "../timeline/queries.ts";
 import { snapToFrame } from "../timeline/time.ts";
 import { UndoStack } from "../undo/UndoStack.ts";
+
+const LANGUAGE_STORAGE_KEY = "vstudio-language";
+
+/** SSR-safe: this module's very first render (server, or the first client tick before hydration) has
+ *  no `window` — same guard pattern `VStudioApp.tsx`'s own `timelineHeight` initializer already uses
+ *  for the same reason. Falls back to English on any unexpected read error (a disabled/private-mode
+ *  localStorage throwing is a real possibility, not just theoretical) rather than crashing the app
+ *  over a UI-language preference. */
+function readStoredLanguage(): Language {
+  if (typeof window === "undefined") return "en";
+  try {
+    return window.localStorage.getItem(LANGUAGE_STORAGE_KEY) === "km" ? "km" : "en";
+  } catch {
+    return "en";
+  }
+}
 
 /** How long after the last edit an autosave fires. Long enough that a burst of edits (dragging a
  *  clip produces many) collapses into one write, short enough that little is at risk if the app
@@ -56,6 +75,51 @@ export interface EditorState {
    *  — purely a live rendering hint, cleared the instant the drag ends. */
   livePreviewOverrides: ClipOverride[];
 
+  /** Seconds every OTHER selected clip should shift by, live, while ONE of them is being dragged along
+   *  the Timeline's own time axis — `null` when no such drag is in progress. `TimelineClip`'s own
+   *  local-preview-then-single-commit pattern already moves the clip actually under the pointer (its
+   *  own component-local `preview` state), but every OTHER selected clip is a SEPARATE component
+   *  instance with no way to know a group drag is happening at all — without this, only the one clip
+   *  under the pointer visibly moved during the drag itself, with the rest snapping into place all at
+   *  once only once the mouse was released, which reads as "only one clip can be moved" even though the
+   *  committed result (via the `BatchCommand` `TimelineClip`'s own `onUp` already builds) was always
+   *  correct. Same "ephemeral view state, not part of `project`, not persisted" precedent as
+   *  `livePreviewOverrides` above — this is its Timeline-space (1D, seconds) counterpart to that one's
+   *  canvas-space (2D, pixels) `ClipOverride[]`; kept as a separate, simpler field rather than folding
+   *  into `livePreviewOverrides` since every group member shifts by the exact same delta (no per-clip
+   *  position to track), and `TimelineClip` needs to read it independent of whether `PlaybackEngine`
+   *  is even attached. */
+  groupMoveDelta: number | null;
+
+  /** Live value of an in-progress Mixer track-fader drag — `null` when no track fader is being
+   *  dragged. Same "ephemeral view state, not part of `project`, not persisted, cleared on commit"
+   *  precedent as `livePreviewOverrides`, just scoped to gain rather than transform: `MixerDialog`
+   *  wires a `NumberField`'s `onPreview` to this (continuous, no undo entry) and `onCommit` to
+   *  `run(new SetTrackGainCommand(...))` (once, on release) — `PlaybackEngine`'s
+   *  `getLiveTrackGainPreview` host getter reads it once per tick so the audio actually changes while
+   *  you drag, not just once you let go. Kept as its own field rather than folding into
+   *  `livePreviewOverrides` (which is clip-keyed, for the canvas) since only one fader can ever be
+   *  dragged at a time — no array needed. */
+  livePreviewTrackGain: { trackId: string; gain: number } | null;
+  /** Same relationship as `livePreviewTrackGain`, for the Mixer's master fader. */
+  livePreviewMasterGain: number | null;
+  /** Same relationship as `livePreviewTrackGain`, for an in-progress Mixer pan-knob drag. */
+  livePreviewTrackPan: { trackId: string; pan: number } | null;
+
+  /** The live `PlaybackEngine` instance itself — set once by `Preview.tsx`'s engine-creation effect,
+   *  cleared back to `null` in that same effect's cleanup (alongside its existing `engine.detach()`
+   *  call). This is the first time anything outside `Preview.tsx` has ever needed to read FROM the
+   *  engine rather than only write to it via `livePreviewTrackGain`-style fields — the Mixer's level
+   *  meters need a live per-track/master dB reading every animation frame, which has no sensible
+   *  "store field the engine polls and writes into" shape the way a preview override does (that would
+   *  mean writing to Zustand state 60 times a second, forcing a re-render on every meter tick).
+   *  Instead, `LevelMeter` reads THIS field once (cheap — it only changes once per mount, not every
+   *  frame) to get a reference to the engine, then calls `engine.getTrackLevelDb`/`getMasterLevelDb`
+   *  directly from its own self-contained `requestAnimationFrame` loop, writing straight to a DOM ref —
+   *  completely outside React's render cycle, the same way `PlaybackEngine`/`AudioMixEngine` themselves
+   *  already operate. */
+  playbackEngine: PlaybackEngine | null;
+
   dirty: boolean;
   saving: boolean;
   lastSavedAt: number | null;
@@ -67,6 +131,12 @@ export interface EditorState {
 
   status: { message: string; tone: StatusTone } | null;
   importing: boolean;
+
+  /** UI chrome language — the first persisted (localStorage) preference in this store; everything
+   *  else here is explicitly session-only. Never affects `project` (a text clip's own font/content is
+   *  unrelated project data, not UI chrome), matching how a theme choice would be scoped. */
+  language: Language;
+  setLanguage: (language: Language) => void;
 
   load: (projectId: string, projectName?: string) => Promise<void>;
   run: (command: Command) => void;
@@ -97,6 +167,11 @@ export interface EditorState {
   toggleSelect: (clipId: string) => void;
   setActiveTrack: (trackId: string) => void;
   setLivePreviewOverrides: (overrides: ClipOverride[]) => void;
+  setGroupMoveDelta: (delta: number | null) => void;
+  setLivePreviewTrackGain: (value: { trackId: string; gain: number } | null) => void;
+  setLivePreviewMasterGain: (value: number | null) => void;
+  setLivePreviewTrackPan: (value: { trackId: string; pan: number } | null) => void;
+  setPlaybackEngine: (engine: PlaybackEngine | null) => void;
 
   /** Live "recording in progress" indicator for `VoiceoverRecorder` — a growing placeholder in the
    *  target track's lane while capturing, since there's no real `Clip`/asset to render yet (the asset
@@ -164,6 +239,11 @@ export interface EditorState {
    *  deliberate manual placement (double-click a library asset) doesn't. Defaults to false, preserving
    *  today's exact-playhead placement for that manual path. */
   addAssetAtPlayhead: (assetId: string, trackId?: string, options?: { avoidOverlap?: boolean }) => void;
+  /** Duplicates every currently-selected clip (see `DuplicateClipsCommand`'s own doc comment for
+   *  exactly where each copy lands and why) as one undo-able step, then selects the fresh copies —
+   *  the same "the thing you just created is what's now selected" behavior `addTextAtPlayhead` and a
+   *  freshly-imported/dropped asset both already give. */
+  duplicateSelectedClips: () => void;
   /** Creates a text asset AND immediately places it as a clip at the playhead — auto-creating a text
    *  track first if the project doesn't have an unlocked one yet, so "Text" in the toolbar always
    *  lands the result somewhere visible (timeline + preview) in one action, never just adding a
@@ -186,6 +266,12 @@ export interface EditorState {
    *  drags it in themselves, same as any freshly-imported asset (a deliberate v1 scope cut — there's
    *  no single obviously-correct "replace this clip" behavior to automate yet). */
   landInpaintedAsset: (asset: Asset) => void;
+  /** Lands an Auto Captions job's finished segments as real text assets + clips on a new text track —
+   *  unlike `landInpaintedAsset`, this genuinely goes through `run()` (see `AddCaptionsCommand`'s own
+   *  doc comment for why): a caption pass creates its assets AND places them in one user-facing
+   *  action, so it undoes as one step too, rather than the asset-creation-is-permanent convention
+   *  every other asset-adding action here follows. */
+  landCaptions: (captions: CaptionSegment[]) => void;
 
   setStatus: (message: string | null, tone?: StatusTone) => void;
   duration: () => number;
@@ -247,6 +333,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
     selectedClipIds: [],
     activeTrackId: null,
     livePreviewOverrides: [],
+    groupMoveDelta: null,
+    livePreviewTrackGain: null,
+    livePreviewMasterGain: null,
+    livePreviewTrackPan: null,
+    playbackEngine: null,
     recording: null,
     assetDrag: null,
     resolveTimelineDropTarget: null,
@@ -263,6 +354,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     redoLabel: null,
 
     status: null,
+    language: readStoredLanguage(),
     importing: false,
 
     async load(projectId, projectName) {
@@ -298,7 +390,11 @@ export const useEditorStore = create<EditorState>((set, get) => {
       } catch (err) {
         // An invalid edit (split outside a clip, locked track) is normal user error, not a crash —
         // it becomes a status message and nothing changes.
-        if (err instanceof EditError) return get().setStatus(err.message, "error");
+        // `err.message` is translated here (not at the `EditError`/`Error` throw sites themselves) —
+        // `translateText` is a plain dictionary lookup keyed by the literal English text, so a KM
+        // entry for the exact message string translates it without needing to touch every file that
+        // constructs one.
+        if (err instanceof EditError) return get().setStatus(translateText(get().language, err.message), "error");
         throw err;
       }
     },
@@ -309,7 +405,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
       const label = undoStack.undoLabel;
       applyProject(undoStack.undo(project));
       syncUndoState();
-      get().setStatus(label ? `Undid ${label}` : "Undone");
+      const language = get().language;
+      const translatedLabel = label ? translateText(language, label) : null;
+      get().setStatus(translatedLabel ? translateText(language, "Undid {label}", { label: translatedLabel }) : translateText(language, "Undone"));
     },
 
     redo() {
@@ -318,7 +416,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
       const label = undoStack.redoLabel;
       applyProject(undoStack.redo(project));
       syncUndoState();
-      get().setStatus(label ? `Redid ${label}` : "Redone");
+      const language = get().language;
+      const translatedLabel = label ? translateText(language, label) : null;
+      get().setStatus(translatedLabel ? translateText(language, "Redid {label}", { label: translatedLabel }) : translateText(language, "Redone"));
     },
 
     async save() {
@@ -336,7 +436,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
         }));
       } catch (err) {
         set({ saving: false });
-        get().setStatus(err instanceof Error ? err.message : "Could not save the project", "error");
+        const message = err instanceof Error ? err.message : "Could not save the project";
+        get().setStatus(translateText(get().language, message), "error");
       }
     },
 
@@ -423,6 +524,21 @@ export const useEditorStore = create<EditorState>((set, get) => {
     setLivePreviewOverrides(overrides) {
       set({ livePreviewOverrides: overrides });
     },
+    setGroupMoveDelta(delta) {
+      set({ groupMoveDelta: delta });
+    },
+    setLivePreviewTrackGain(value) {
+      set({ livePreviewTrackGain: value });
+    },
+    setLivePreviewMasterGain(value) {
+      set({ livePreviewMasterGain: value });
+    },
+    setLivePreviewTrackPan(value) {
+      set({ livePreviewTrackPan: value });
+    },
+    setPlaybackEngine(engine) {
+      set({ playbackEngine: engine });
+    },
 
     setActiveTrack(trackId) {
       set({ activeTrackId: trackId });
@@ -475,10 +591,16 @@ export const useEditorStore = create<EditorState>((set, get) => {
       }
 
       set({ importing: false });
+      const language = get().language;
       if (failures.length > 0) {
-        get().setStatus(failures.length === 1 ? failures[0] : `${failures.length} files could not be imported`, "error");
+        get().setStatus(
+          failures.length === 1
+            ? failures[0]
+            : translateText(language, "{n} files could not be imported", { n: failures.length }),
+          "error"
+        );
       } else if (imported.length > 0) {
-        get().setStatus(`Imported ${imported.length} file${imported.length === 1 ? "" : "s"}`);
+        get().setStatus(translateText(language, "Imported {n} file(s)", { n: imported.length }));
       }
       return imported;
     },
@@ -488,7 +610,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
       if (!current) return null;
       const asset = createTextAsset();
       applyProject({ ...current, assets: [...current.assets, asset] });
-      get().setStatus("Added text");
+      get().setStatus(translateText(get().language, "Added text"));
       return asset.id;
     },
 
@@ -499,7 +621,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
       const next = trimmed || "Untitled";
       if (next === current.name) return;
       applyProject({ ...current, name: next });
-      get().setStatus("Renamed project");
+      get().setStatus(translateText(get().language, "Renamed project"));
     },
 
     landInpaintedAsset(asset) {
@@ -507,7 +629,14 @@ export const useEditorStore = create<EditorState>((set, get) => {
       if (!current) return;
       applyProject({ ...current, assets: [...current.assets, asset] });
       get().clearRemoveObject();
-      get().setStatus(`Added "${asset.name}" to the Media Library`);
+      get().setStatus(translateText(get().language, 'Added "{name}" to the Media Library', { name: asset.name }));
+    },
+
+    landCaptions(captions) {
+      const current = get().project;
+      if (!current || captions.length === 0) return;
+      get().run(new AddCaptionsCommand(captions, current.sequence.height));
+      get().setStatus(translateText(get().language, "Added {n} captions", { n: captions.length }));
     },
 
     async removeAsset(asset) {
@@ -516,16 +645,20 @@ export const useEditorStore = create<EditorState>((set, get) => {
 
       const inUse = project.sequence.tracks.some((t) => t.clips.some((c) => c.assetId === asset.id));
       if (inUse) {
-        return get().setStatus("Remove that clip from the timeline before removing its media", "error");
+        return get().setStatus(
+          translateText(get().language, "Remove that clip from the timeline before removing its media"),
+          "error"
+        );
       }
 
       try {
         await api.deleteMedia(projectId, asset);
         const current = get().project;
         if (current) applyProject({ ...current, assets: current.assets.filter((a) => a.id !== asset.id) });
-        get().setStatus(`Removed ${asset.name}`);
+        get().setStatus(translateText(get().language, "Removed {name}", { name: asset.name }));
       } catch (err) {
-        get().setStatus(err instanceof Error ? err.message : "Could not remove that media", "error");
+        const message = err instanceof Error ? err.message : "Could not remove that media";
+        get().setStatus(translateText(get().language, message), "error");
       }
     },
 
@@ -545,7 +678,15 @@ export const useEditorStore = create<EditorState>((set, get) => {
           ? activeTrackId
           : project.sequence.tracks.find((t) => t.kind === wantedKind && !t.locked)?.id);
 
-      if (!target) return get().setStatus(`There is no unlocked ${wantedKind} track to add this to`, "error");
+      if (!target) {
+        const language = get().language;
+        return get().setStatus(
+          translateText(language, "There is no unlocked {kind} track to add this to", {
+            kind: translateText(language, wantedKind),
+          }),
+          "error"
+        );
+      }
 
       const start = options?.avoidOverlap
         ? nonOverlappingStart(
@@ -555,6 +696,23 @@ export const useEditorStore = create<EditorState>((set, get) => {
           )
         : playhead;
       get().run(new AddClipCommand(target, assetId, start));
+    },
+
+    duplicateSelectedClips() {
+      const { selectedClipIds, language } = get();
+      if (selectedClipIds.length === 0) return;
+      const command = new DuplicateClipsCommand(selectedClipIds);
+      get().run(command);
+      const created = command.createdClipIds.length;
+      if (created === 0) {
+        // Every selected clip was on a locked track (or otherwise skipped) — nothing actually got
+        // duplicated; say so rather than claiming success. `run` still pushed a real (no-op) undo
+        // entry either way — every command does, this one included, matching e.g. deleting an
+        // already-gone clip id — so there's nothing extra to clean up here.
+        return get().setStatus(translateText(language, "Nothing to duplicate — every selected clip is on a locked track"), "error");
+      }
+      set({ selectedClipIds: command.createdClipIds });
+      get().setStatus(created === 1 ? translateText(language, "Duplicated clip") : translateText(language, "Duplicated {n} clips", { n: created }));
     },
 
     beginRecordingIndicator(trackId, start) {
@@ -622,6 +780,16 @@ export const useEditorStore = create<EditorState>((set, get) => {
 
     setStatus(message, tone = "info") {
       set({ status: message ? { message, tone } : null });
+    },
+
+    setLanguage(language) {
+      set({ language });
+      try {
+        window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+      } catch {
+        // Private-mode/disabled storage — the toggle still works for this session, it just won't
+        // survive a reload. Not worth surfacing as an error over a UI preference.
+      }
     },
 
     duration() {

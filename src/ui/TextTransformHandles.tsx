@@ -2,21 +2,24 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import type { Command } from "../commands/index.ts";
-import { BatchCommand, SetClipTransformCommand, SetTextCommand } from "../commands/index.ts";
+import { BatchCommand, SetClipTransformCommand, SetClipTextStyleKeyframesCommand, SetTextCommand } from "../commands/index.ts";
 import { findAsset, findClip } from "../project/createProject.ts";
 import type { TextStyle } from "../project/types.ts";
 import { DEFAULT_TEXT_STYLE } from "../project/types.ts";
 import type { AlignBox, AlignmentGuide } from "../playback/alignmentGuides.ts";
 import { computeAlignmentGuides } from "../playback/alignmentGuides.ts";
 import { computeTextBlock } from "../playback/textLayout.ts";
+import { clampPointToRect, rotatedPoint } from "../playback/transformGeometry.ts";
 import { computeVisibleClipBoxes } from "../playback/visibleClips.ts";
 import { fontById, resolveFontVariant } from "../project/fonts.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
 import { computeGroupMoveOverrides } from "../timeline/groupMove.ts";
+import { hasTextStyleKeyframes, resolveTextStyle, upsertKeyframe } from "../timeline/keyframes.ts";
 import { clipAtTime } from "../timeline/queries.ts";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 import { AlignmentGuideOverlay } from "./AlignmentGuideOverlay.tsx";
+import { useTranslation } from "../i18n/useTranslation.ts";
 
 /** Same value, same reasoning as `TransformHandles`' own constant — see there. */
 const ALIGN_SNAP_PIXELS = 8;
@@ -24,8 +27,10 @@ const ALIGN_SNAP_PIXELS = 8;
 // Same constants, same drag pattern, same thresholds as `TransformHandles` (video/image clips) — see
 // that file's own comments for the reasoning behind each. Text gets its own component rather than a
 // shared/generalized one because the underlying model differs too much to unify cleanly: a text
-// block's "size" IS `fontSize` (no separate scale multiplier, no crop), and its box comes from
-// measuring rendered glyphs (`computeTextBlock`) rather than a source asset's own width/height.
+// block's "size" IS `fontSize` (no separate scale multiplier), and its box comes from measuring
+// rendered glyphs (`computeTextBlock`) rather than a source asset's own width/height. `TextCrop`
+// (Inspector-only, like `ClipTransform.crop` itself) is a separate frame-space mask over the frame,
+// not a repositioning of this block — it doesn't change any of the geometry these handles manipulate.
 const DRAG_THRESHOLD = 3;
 // Kept in sync with TransformHandles.tsx's own identical constant and its comment: 16px was too
 // small to reliably hit on a touch device, 24px roughly doubles the actual hit area.
@@ -60,11 +65,19 @@ const CORNERS: { x: number; y: number; cursor: string; label: string }[] = [
  *  when exactly one clip is selected, it's on a text track, AND it's the clip actually under the
  *  playhead right now (same "don't float over content you don't belong to" reasoning as
  *  `TransformHandles`). */
-export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | null }) {
+export function TextTransformHandles({
+  canvas,
+  stageEl,
+}: {
+  canvas: HTMLCanvasElement | null;
+  /** Same as `TransformHandles`' own `stageEl` prop — see its doc comment there. */
+  stageEl?: HTMLDivElement | null;
+}) {
   const project = useEditorStore((s) => s.project);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const playhead = useEditorStore((s) => s.playhead);
   const run = useEditorStore((s) => s.run);
+  const t = useTranslation();
 
   const [preview, setPreview] = useState<TextStyle | null>(null);
   const previewRef = useRef<TextStyle | null>(null);
@@ -122,11 +135,19 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
       if (clipAtTime(found.track, playhead)?.id !== found.clip.id) continue;
       const asset = project.assets.find((a) => a.id === found.clip.assetId);
       if (!asset || asset.kind !== "text") continue;
+      // Resolved at the CURRENT PLAYHEAD, not the asset's raw static `textStyle` — same reasoning as
+      // `TransformHandles`' identical comment on its own `savedTransform`: for a keyframed clip this is
+      // the interpolated value for whatever frame is actually showing, so the handles draw/drag from
+      // where the box visually IS. Zero behavior change for a never-keyframed clip: `resolveTextStyle`
+      // falls back to `baseStyle` right back.
+      const baseStyle = asset.textStyle ?? DEFAULT_TEXT_STYLE;
       return {
         clipId: found.clip.id,
         assetId: asset.id,
         content: asset.textContent ?? "",
-        savedStyle: asset.textStyle ?? DEFAULT_TEXT_STYLE,
+        savedStyle: resolveTextStyle(found.clip, playhead - found.clip.timelineStart, baseStyle),
+        hasKeyframes: hasTextStyleKeyframes(found.clip),
+        timelineStart: found.clip.timelineStart,
         sequence: project.sequence,
       };
     }
@@ -156,6 +177,9 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
   // Every screen measurement (handle position, drag deltas) has to go through this ratio to land in
   // the right place and track the pointer 1:1 — CSS pixels per SEQUENCE pixel, matching `block` above.
   const canvasRect = canvas.getBoundingClientRect();
+  // Same reasoning as `TransformHandles`' own `stageRect` — clamp corner/rotate handles into the
+  // Preview panel's stable stage, not the (possibly zoomed-out) canvas rect itself.
+  const stageRect = stageEl?.getBoundingClientRect() ?? canvasRect;
   const cssScale = resolved.sequence.width > 0 ? canvasRect.width / resolved.sequence.width : 1;
 
   // The box's NATURAL (align-anchored, offset-EXCLUDED) position and size — what actually gets rotated
@@ -326,6 +350,21 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
       setGuides([]);
       if (!drag?.moved || !final) return;
 
+      // Each clip must respect ITS OWN keyframe state — `resolveTextStyle` only reads the asset's
+      // static `textStyle` when the clip has NO keyframes, so a bare SetTextCommand on a keyframed
+      // clip is silently discarded by playback exactly like `TransformHandles`' identical bug (see its
+      // own `commandForTransform` comment) — the canvas shows the move live during the drag
+      // (`livePreviewOverrides` bypasses this entirely) but snaps right back the instant you release.
+      function commandForTextStyle(clipId: string, assetId: string, content: string, nextStyle: TextStyle, ownTimelineStart: number): Command {
+        const found = project ? findClip(project, clipId) : undefined;
+        if (found && hasTextStyleKeyframes(found.clip)) {
+          const elapsed = playhead - ownTimelineStart;
+          const next = upsertKeyframe(found.clip.textStyleKeyframes ?? [], elapsed, nextStyle, resolved!.sequence.fps);
+          return new SetClipTextStyleKeyframesCommand(clipId, next);
+        }
+        return new SetTextCommand(assetId, content, nextStyle);
+      }
+
       // Same group-move mechanism as `TransformHandles` — see its own comment on `onUp` for why this
       // reuses the exact same `computeGroupMoveOverrides` call `onMove` already used to live-preview
       // the group, so what was shown live and what commits can never disagree.
@@ -333,19 +372,19 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
         const deltaX = final.offsetX - drag.origin.offsetX;
         const deltaY = final.offsetY - drag.origin.offsetY;
         const groupOverrides = computeGroupMoveOverrides(project, selectedClipIds, resolved!.clipId, deltaX, deltaY);
-        const commands: Command[] = [new SetTextCommand(drag.assetId, drag.content, final)];
+        const commands: Command[] = [commandForTextStyle(resolved!.clipId, drag.assetId, drag.content, final, resolved!.timelineStart)];
         for (const o of groupOverrides) {
           if (o.textStyle) {
             const found = findClip(project, o.clipId);
             const asset = found && findAsset(project, found.clip.assetId);
-            if (asset) commands.push(new SetTextCommand(asset.id, asset.textContent ?? "", o.textStyle));
+            if (asset && found) commands.push(commandForTextStyle(o.clipId, asset.id, asset.textContent ?? "", o.textStyle, found.clip.timelineStart));
           } else if (o.transform) {
             commands.push(new SetClipTransformCommand(o.clipId, o.transform));
           }
         }
         run(commands.length > 1 ? new BatchCommand("Move Clips", commands) : commands[0]);
       } else {
-        run(new SetTextCommand(drag.assetId, drag.content, final));
+        run(commandForTextStyle(resolved!.clipId, drag.assetId, drag.content, final, resolved!.timelineStart));
       }
     }
 
@@ -361,32 +400,57 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
     if (editText !== resolved!.content) run(new SetTextCommand(resolved!.assetId, editText, resolved!.savedStyle));
   }
 
+  // Corner/rotate handle SCREEN positions, clamped into `stageRect` — same reasoning and same
+  // `rotatedPoint`/`clampPointToRect` helpers as `TransformHandles`' own identical computation, see its
+  // comment for the full "why". The one real difference from that file: text's rotation PIVOT is
+  // `(centerScreenX, centerScreenY)` (the frame's own center, offset applied AFTER rotation — see
+  // `centerScreenX`'s own comment above), NOT the box's geometric center, so each point's local offset
+  // (before rotation) has to be measured from `pivotCssX`/`pivotCssY` — the pivot's position BEFORE the
+  // offset translate — while the rotation itself still happens around `centerScreenX`/`centerScreenY`
+  // (mathematically equivalent to "rotate around pivotCssX/Y, then translate by the offset", the exact
+  // two-stage transform this component's own CSS `transform` above already applies — verified by hand
+  // against that composition before relying on it here, not just assumed).
+  const cornerHandles = CORNERS.map(({ x, y, cursor, label }) => {
+    const naturalX = boxCssLeft + x * cssWidth;
+    const naturalY = boxCssTop + y * cssHeight;
+    const truePoint = rotatedPoint(centerScreenX, centerScreenY, naturalX - pivotCssX, naturalY - pivotCssY, style.rotationDeg);
+    return { x, y, cursor, label, point: clampPointToRect(truePoint, stageRect, HANDLE_SIZE / 2) };
+  });
+  const rotateNaturalX = boxCssLeft + cssWidth / 2;
+  const rotateNaturalY = boxCssTop - ROTATE_HANDLE_OFFSET;
+  const rotateTruePoint = rotatedPoint(centerScreenX, centerScreenY, rotateNaturalX - pivotCssX, rotateNaturalY - pivotCssY, style.rotationDeg);
+  const rotatePoint = clampPointToRect(rotateTruePoint, stageRect, HANDLE_SIZE / 2);
+  const rotateHandleClamped = rotatePoint.x !== rotateTruePoint.x || rotatePoint.y !== rotateTruePoint.y;
+
   return (
     <>
       <AlignmentGuideOverlay guides={guides} canvasRect={canvasRect} cssScale={cssScale} />
-      <div
-      style={{
-        position: "fixed",
-        left: effectiveLeftPx,
-        top: effectiveTopPx,
-        width: effectiveWidth,
-        height: effectiveHeight,
-        transformOrigin: `${originXpx}px ${originYpx}px`,
-        // Rotate FIRST (around the pivot, via transformOrigin above), THEN translate by the offset —
-        // CSS applies a transform function list right-to-left, so this order is what makes the offset
-        // land AFTER rotation, matching `PlaybackEngine.drawText`'s identical two-stage transform.
-        transform: `translate(${offsetCssX}px, ${offsetCssY}px) rotate(${style.rotationDeg}deg)`,
-        zIndex: 40,
-      }}
-      className={isEditing ? "" : "pointer-events-none"}
-    >
+      {/* Editing keeps the box genuinely `position: fixed` against the viewport, UNCLIPPED — the box
+          can be temporarily enlarged for legibility (`editScale`, see its own comment) while editing,
+          and clipping it to the stage the way the non-editing branch below does would risk hiding part
+          of the actual textarea the user is typing into, a real regression, not just a cosmetic one.
+          Editing is also a deliberate, momentary, user-initiated state (double-click), unlike an
+          ordinary large `fontSize` just sitting on the canvas — much less exposed to this fix's own
+          motivating problem. */}
       {isEditing ? (
-        // A plain, always-legible edit box rather than trying to match the text's own font/color/
-        // background pixel-for-pixel — matching would risk invisible-on-invisible (white text on a
-        // white-ish edit box) depending on the style being edited, and this is a transient editing
-        // affordance, not part of the rendered output, so it doesn't need to be. Font size (not a
-        // fixed Tailwind class) is `editFontPx`, computed above alongside the box's own enlargement —
-        // see that comment for why the two have to move together.
+        <div
+          style={{
+            position: "fixed",
+            left: effectiveLeftPx,
+            top: effectiveTopPx,
+            width: effectiveWidth,
+            height: effectiveHeight,
+            transformOrigin: `${originXpx}px ${originYpx}px`,
+            transform: `translate(${offsetCssX}px, ${offsetCssY}px) rotate(${style.rotationDeg}deg)`,
+            zIndex: 40,
+          }}
+        >
+        {/* A plain, always-legible edit box rather than trying to match the text's own font/color/
+            background pixel-for-pixel — matching would risk invisible-on-invisible (white text on a
+            white-ish edit box) depending on the style being edited, and this is a transient editing
+            affordance, not part of the rendered output, so it doesn't need to be. Font size (not a
+            fixed Tailwind class) is `editFontPx`, computed above alongside the box's own enlargement —
+            see that comment for why the two have to move together. */}
         <textarea
           ref={(el) => el?.focus()}
           value={editText}
@@ -415,61 +479,95 @@ export function TextTransformHandles({ canvas }: { canvas: HTMLCanvasElement | n
           }}
           className="h-full w-full resize-none rounded border-2 border-sky-400 bg-black/85 px-2 py-1 text-white outline-none"
         />
+        </div>
       ) : (
-        <>
+        // NOT editing: the box is wrapped in a stage-clipping container — same reasoning as
+        // `TransformHandles`' identical wrapper. `effectiveLeftPx`/`Top`/`Width`/`Height` reduce
+        // exactly to `boxCssLeft`/`Top`/`cssWidth`/`Height` here (no edit-mode enlargement applies),
+        // and `transform-origin` is measured relative to the element's OWN box regardless of how that
+        // box is positioned in the page, so `originXpx`/`originYpx` need no adjustment for the switch
+        // from `fixed` to `absolute`.
+        <div
+          style={{
+            position: "fixed",
+            left: stageRect.left,
+            top: stageRect.top,
+            width: stageRect.right - stageRect.left,
+            height: stageRect.bottom - stageRect.top,
+            overflow: "hidden",
+            zIndex: 40,
+          }}
+          className="pointer-events-none"
+        >
           <div
-            role="button"
-            tabIndex={0}
-            aria-label="Move text"
-            onMouseDown={(e) => beginDrag(e, "move")}
-            onTouchStart={(e) => beginDrag(e, "move")}
-            onDoubleClick={() => {
-              setEditText(resolved!.content);
-              setEditingAssetId(resolved!.assetId);
+            style={{
+              position: "absolute",
+              left: effectiveLeftPx - stageRect.left,
+              top: effectiveTopPx - stageRect.top,
+              width: effectiveWidth,
+              height: effectiveHeight,
+              transformOrigin: `${originXpx}px ${originYpx}px`,
+              transform: `translate(${offsetCssX}px, ${offsetCssY}px) rotate(${style.rotationDeg}deg)`,
             }}
-            className="pointer-events-auto absolute inset-0 touch-none cursor-move border-2 border-sky-400/80"
-          />
+          >
+            <div
+              role="button"
+              tabIndex={0}
+              aria-label={t("Move text")}
+              onMouseDown={(e) => beginDrag(e, "move")}
+              onTouchStart={(e) => beginDrag(e, "move")}
+              onDoubleClick={() => {
+                setEditText(resolved!.content);
+                setEditingAssetId(resolved!.assetId);
+              }}
+              className="pointer-events-auto absolute inset-0 touch-none cursor-move border-2 border-sky-400/80"
+            />
 
-          {/* Resize/rotate hidden for a multi-selection — same reasoning as `TransformHandles`'
-              identical gate: no well-defined group meaning for either yet, only move. Double-click-
-              to-edit on the move handle above stays available regardless — it only ever affects
-              THIS one clip's own text, unrelated to the group. */}
-          {!isGroupSelection && (
-            <>
-              {CORNERS.map(({ x, y, cursor, label }) => (
-                <div
-                  key={label}
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`Resize text (${label})`}
-                  onMouseDown={(e) => beginDrag(e, "resize")}
-                  onTouchStart={(e) => beginDrag(e, "resize")}
-                  style={{ left: `${x * 100}%`, top: `${y * 100}%`, width: HANDLE_SIZE, height: HANDLE_SIZE }}
-                  className={`pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
-                />
-              ))}
-
-              {/* Connecting line is purely visual — decorative, so it's excluded from the
-                  accessibility tree rather than announced as an unlabeled element. */}
+            {/* Connecting line stays nested in this rotated box — same reasoning as `TransformHandles`'
+                identical comment: its own CSS transform already draws it correctly from the box's top
+                edge up to the rotate handle's TRUE (unclamped) position, so it's only shown when that
+                position needs no clamping. Purely visual — excluded from the accessibility tree. */}
+            {!isGroupSelection && !rotateHandleClamped && (
               <div
                 aria-hidden
                 style={{ left: "50%", top: -ROTATE_HANDLE_OFFSET, height: ROTATE_HANDLE_OFFSET }}
                 className="pointer-events-none absolute w-px -translate-x-1/2 bg-white/50"
               />
-              <div
-                role="button"
-                tabIndex={0}
-                aria-label="Rotate text"
-                onMouseDown={(e) => beginDrag(e, "rotate")}
-                onTouchStart={(e) => beginDrag(e, "rotate")}
-                style={{ left: "50%", top: -ROTATE_HANDLE_OFFSET, width: HANDLE_SIZE, height: HANDLE_SIZE }}
-                className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
-              />
-            </>
-          )}
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Resize/rotate hidden for a multi-selection (same reasoning as `TransformHandles`' identical
+          gate) and while editing (the textarea above owns interaction then). Rendered as independent
+          `position: fixed` siblings — not CSS-percentage children of the rotated box — so each one's
+          CLAMPED position can be expressed in plain screen coordinates; see `TransformHandles`' own
+          identical comment for why a rotated parent's `%` positioning can't express that directly. */}
+      {!isEditing && !isGroupSelection && (
+        <>
+          {cornerHandles.map(({ x, y, cursor, label, point }) => (
+            <div
+              key={label}
+              role="button"
+              tabIndex={0}
+              aria-label={t("Resize text ({corner})", { corner: t(label) })}
+              onMouseDown={(e) => beginDrag(e, "resize")}
+              onTouchStart={(e) => beginDrag(e, "resize")}
+              style={{ position: "fixed", left: point.x, top: point.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
+              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
+            />
+          ))}
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label={t("Rotate text")}
+            onMouseDown={(e) => beginDrag(e, "rotate")}
+            onTouchStart={(e) => beginDrag(e, "rotate")}
+            style={{ position: "fixed", left: rotatePoint.x, top: rotatePoint.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
+            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
+          />
         </>
       )}
-      </div>
     </>
   );
 }

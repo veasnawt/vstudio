@@ -401,3 +401,117 @@ export function watchLocalSetup(
 
   return () => source.close();
 }
+
+// ---------------------------------------------------------------------------
+// Auto Captions — same fire-and-track-via-SSE job shape as Remove Object
+// (startInpaint/watchInpaint/cancelInpaint/inpaintAvailable above), against
+// /api/vstudio/captions instead. One provider (OpenAI Whisper), so the
+// key-status/save functions are simpler than Remove Object's own
+// multi-provider equivalents — no provider argument, no "active provider"
+// concept.
+// ---------------------------------------------------------------------------
+
+export interface CaptionsStarted {
+  jobId: string;
+}
+
+export interface CaptionSegment {
+  content: string;
+  /** Absolute sequence-timeline seconds — already offset server-side, ready to place directly. */
+  start: number;
+  end: number;
+}
+
+export interface CaptionsProgress {
+  status: "running" | "done" | "failed" | "cancelled";
+  stage: "extracting-audio" | "transcribing" | "building-captions";
+  progress: number;
+  error?: string;
+  /** Present once `status === "done"` — raw segments, not yet real assets/clips. The caller (Inspector's
+   *  Auto Captions section, the toolbar's Auto Captions dialog) hands these to
+   *  `useEditorStore.getState().landCaptions`, which is what actually creates the text assets and
+   *  places their clips as one undo-able step. */
+  captions?: CaptionSegment[];
+}
+
+/** Starts an Auto Captions job. `clipId` present = transcribe just that clip's own on-screen time
+ *  range; omitted = transcribe the whole sequence. Desktop/browser-server-backed only for v1, same as
+ *  `startInpaint`. */
+export async function startCaptions(projectId: string, clipId?: string): Promise<CaptionsStarted> {
+  if (isNative) throw new ApiRequestError("Auto Captions isn't available on this device yet.", 501, "captions-unavailable");
+  const response = await fetch(`${BASE}/captions?projectId=${encodeURIComponent(projectId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(clipId ? { clipId } : {}),
+  });
+  return unwrap<CaptionsStarted>(response);
+}
+
+export async function cancelCaptions(jobId: string): Promise<void> {
+  if (isNative) return;
+  // A cancel racing the job's own completion is normal, not an error worth surfacing.
+  await fetch(`${BASE}/captions?jobId=${encodeURIComponent(jobId)}`, { method: "DELETE" }).catch(() => {});
+}
+
+/** Subscribes to an Auto Captions job's progress. Identical shape to `watchInpaint`. */
+export function watchCaptions(jobId: string, onUpdate: (progress: CaptionsProgress) => void, onError: (message: string) => void): () => void {
+  if (isNative) {
+    onError("Auto Captions isn't available on this device yet.");
+    return () => {};
+  }
+  const source = new EventSource(`${BASE}/captions?jobId=${encodeURIComponent(jobId)}`);
+
+  source.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(event.data) as CaptionsProgress;
+      onUpdate(payload);
+      if (payload.status !== "running") source.close();
+    } catch {
+      /* a malformed frame is not worth tearing the stream down over */
+    }
+  };
+
+  source.onerror = () => {
+    if (source.readyState !== EventSource.CLOSED) {
+      onError("Lost contact with the captions job. It may still be running.");
+    }
+    source.close();
+  };
+
+  return () => source.close();
+}
+
+/** Whether Auto Captions is usable right now — FFmpeg present AND an OpenAI key saved. */
+export async function captionsAvailable(): Promise<boolean> {
+  if (isNative) return false;
+  try {
+    const response = await fetch(`${BASE}/captions`, { method: "HEAD" });
+    return response.status === 204;
+  } catch {
+    return false;
+  }
+}
+
+export interface CaptionsKeyStatus {
+  configured: boolean;
+}
+
+export async function getCaptionsKeyStatus(): Promise<CaptionsKeyStatus | null> {
+  if (isNative) return null;
+  try {
+    const response = await fetch(`${BASE}/captions/settings`);
+    return unwrap<CaptionsKeyStatus>(response);
+  } catch {
+    return null;
+  }
+}
+
+export async function setCaptionsApiKey(apiKey: string): Promise<void> {
+  if (isNative) throw new ApiRequestError("Not available on this device yet.", 501, "captions-unavailable");
+  const response = await fetch(`${BASE}/captions/settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiKey }),
+  });
+  await unwrap<{ ok: true }>(response);
+}

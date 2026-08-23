@@ -8,6 +8,7 @@ import { IDENTITY_TRANSFORM } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { clipAtTime } from "../timeline/queries.ts";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 
 const DRAG_THRESHOLD = 3;
 
@@ -25,6 +26,7 @@ export function RemoveObjectOverlay({ canvas }: { canvas: HTMLCanvasElement | nu
   const armedClipId = useEditorStore((s) => s.removeObjectArmedClipId);
   const committedRect = useEditorStore((s) => s.removeObjectRect);
   const setRemoveObjectRect = useEditorStore((s) => s.setRemoveObjectRect);
+  const t = useTranslation();
 
   const [liveScreenRect, setLiveScreenRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
   // Mirrors `liveScreenRect` for `onMove`/`onUp` to read — the same pattern `TransformHandles`'
@@ -150,7 +152,7 @@ export function RemoveObjectOverlay({ canvas }: { canvas: HTMLCanvasElement | nu
         <div
           role="button"
           tabIndex={0}
-          aria-label="Draw a region to remove"
+          aria-label={t("Draw a region to remove")}
           onMouseDown={beginDraw}
           onTouchStart={beginDraw}
           style={{ position: "fixed", left: canvasRect.left, top: canvasRect.top, width: canvasRect.width, height: canvasRect.height, zIndex: 45 }}

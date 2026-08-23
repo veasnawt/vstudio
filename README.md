@@ -99,19 +99,19 @@ right edge of the visible timeline.
 
 Stated plainly, because a polished UI hiding missing features is worse than an honest gap:
 
-- **Captions** — no SRT/VTT import, no auto-transcription. Text clips themselves (see above) ARE
-  implemented; captions specifically (importing/generating a synced subtitle track) are not.
-- **Keyframes** — nothing animates over a clip's duration yet. Position/scale/rotation/crop and
-  Brightness/Contrast/Saturation/Blur/Opacity ARE implemented (see above), but each is a single
-  static value per clip.
-- **More transition styles** — crossfade only. Wipes/slides/etc. would additionally need real
-  clip-path masking in the canvas preview to match FFmpeg's other `xfade` styles.
+- **Caption import/export** — no SRT/VTT import or export. Auto-transcription IS implemented (the
+  toolbar's Captions button, Whisper-based) and lands real, editable text clips; SRT/VTT specifically
+  is the gap.
+- **Keyframes** — Transform and Effects are each keyframeable (a stopwatch toggle in their own
+  Inspector section, linear interpolation between however many points you set — export renders it via
+  segment-slicing so scale/crop animate correctly too), but only the whole property-group at once, not
+  independent per-field tracks, and not yet on text clips.
 - **On-canvas crop handles** — crop is numeric-only in the Inspector; only Position/Scale/Rotation have
   draggable handles in the preview.
 - **Blend modes** — a video track's own clip opacity is the only cross-track compositing control;
   there's no multiply/screen/etc. blend mode selector.
 - **Proxy media** — 4K/8K sources are edited directly. There is no proxy generation step.
-- **AI features** — no speech-to-text, scene detection, or smart reframing.
+- **AI features beyond captions/object removal** — no scene detection or smart reframing.
 - **Native file picking** — imported files are *copied* into the project folder (see below).
 
 ## Supported formats

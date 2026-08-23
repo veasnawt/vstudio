@@ -8,6 +8,10 @@ import { computeTransformedBox } from "./transformGeometry.ts";
 
 export interface VisibleClipBox {
   clipId: string;
+  /** Which kind of track this box came from — video/image (`"video"`) or `"text"`. Alignment guides
+   *  (this function's original caller) never needed to tell the two apart; `hitTestClip` below does,
+   *  to replicate the renderer's real z-order rather than just "later in this array." */
+  trackKind: "video" | "text";
   box: AlignBox;
 }
 
@@ -40,6 +44,7 @@ export function computeVisibleClipBoxes(
       if (box) {
         results.push({
           clipId: clip.id,
+          trackKind: "video",
           box: {
             left: box.centerX - box.width / 2,
             right: box.centerX + box.width / 2,
@@ -54,6 +59,7 @@ export function computeVisibleClipBoxes(
       const block = computeTextBlock(context, canvasWidth, canvasHeight, asset.textContent ?? "", asset.textStyle);
       results.push({
         clipId: clip.id,
+        trackKind: "text",
         box: {
           left: block.blockLeft,
           right: block.blockLeft + block.blockWidth,
@@ -67,4 +73,33 @@ export function computeVisibleClipBoxes(
   }
 
   return results;
+}
+
+/** Finds the topmost visible clip whose box contains `point` (sequence-pixel space, same space
+ *  `computeVisibleClipBoxes` returns) — the hit test behind clicking a video/image/text clip directly
+ *  in the Preview canvas, the same way the Timeline already lets you click a clip there.
+ *
+ *  Priority mirrors `PlaybackEngine`'s real draw order, not just "later in this flat array": text
+ *  ALWAYS composites over every video track regardless of how the two kinds of track happen to be
+ *  interleaved in `project.sequence.tracks` (a user can freely reorder tracks; the renderer still
+ *  always draws all video first, then all text over it — see `buildExportPlan`'s own two-pass
+ *  structure), so text boxes are checked as a whole group before any video box. WITHIN each group,
+ *  though, array order genuinely IS z-order (a later video track composites on top of an earlier one,
+ *  and likewise for text) — `computeVisibleClipBoxes` preserves each track's relative array position
+ *  in its own output order, so reverse-iterating each group here reaches the topmost match first.
+ *
+ *  Ignores rotation, same simplification `AlignBox`'s own doc comment already accepts for alignment
+ *  guides — a rotated clip's true silhouette is smaller than its axis-aligned box in the corners, so a
+ *  click just outside the visible (rotated) shape but still inside that box can select it; a minor,
+ *  documented imprecision rather than a full point-in-rotated-rectangle test, consistent with the one
+ *  guides already make. */
+export function hitTestClip(boxes: VisibleClipBox[], point: { x: number; y: number }): string | null {
+  for (const kind of ["text", "video"] as const) {
+    const group = boxes.filter((b) => b.trackKind === kind);
+    for (let i = group.length - 1; i >= 0; i--) {
+      const { box, clipId } = group[i];
+      if (point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom) return clipId;
+    }
+  }
+  return null;
 }

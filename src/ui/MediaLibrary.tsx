@@ -1,15 +1,36 @@
 "use client";
 
 import React, { useMemo, useRef, useState } from "react";
+import { Capacitor } from "@capacitor/core";
 import { Close, Image as ImageIcon, Music, Text as TextIcon, Video } from "@veasnawt/vicons";
 import { thumbnailUrl } from "../api/client.ts";
 import { AddClipCommand } from "../commands/index.ts";
+import { translateText } from "../i18n/translations.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { fontById } from "../project/fonts.ts";
 import type { Asset } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { formatDuration } from "../timeline/time.ts";
 import { Dropdown } from "./Dropdown.tsx";
+import { ImportSourceMenu } from "./ImportSourceMenu.tsx";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
+
+/** True once, at module load — which platform this bundle is running on never changes mid-session, so
+ *  there's no need to re-check it on every render the way `Capacitor.isNativePlatform()` calls
+ *  elsewhere (`client.ts`, `ExportDialog.tsx`) already don't bother to either. */
+const IS_NATIVE = Capacitor.isNativePlatform();
+
+/** Converts one photo/video the OS picker handed back (a `webPath` blob-like URL, per
+ *  `@capacitor/camera`'s own docs) into a plain `File` — the same shape `importFiles`/
+ *  `nativeImportMedia` already accept from the "Files" path, so the whole rest of the import pipeline
+ *  (format sniffing, probing, thumbnailing) needs no native-picker-specific branch at all. */
+async function photoResultToFile(webPath: string, format: string | undefined, fallbackName: string): Promise<File> {
+  const response = await fetch(webPath);
+  const blob = await response.blob();
+  const ext = format ? `.${format}` : "";
+  const name = fallbackName.includes(".") ? fallbackName : `${fallbackName}${ext}`;
+  return new File([blob], name, { type: blob.type });
+}
 
 /** Small kind badge shown on every tile in the mobile grid (see the grid's own comment) — the desktop
  *  list already has room for a text label (`describe()` below) to say "Audio"/"Image"/etc., but a
@@ -57,15 +78,17 @@ function formatSize(bytes: number): string {
  *  label otherwise. Frame rates are rounded for display because sources routinely report 29.97 as
  *  30000/1001, and "29.97 fps" in a library row is noise rather than information. */
 function describe(asset: Asset): string {
-  if (asset.kind === "audio") return "Audio";
-  if (asset.kind === "text") return "Text";
+  const language = useEditorStore.getState().language;
+  if (asset.kind === "audio") return translateText(language, "Audio");
+  if (asset.kind === "text") return translateText(language, "Text");
   const dimensions = asset.width && asset.height ? `${asset.width}×${asset.height}` : "";
-  if (asset.kind === "image") return dimensions || "Image";
-  const fps = asset.fps ? `${Math.round(asset.fps)} fps` : "";
-  return [dimensions, fps].filter(Boolean).join(" · ") || "Video";
+  if (asset.kind === "image") return dimensions || translateText(language, "Image");
+  const fps = asset.fps ? translateText(language, "{fps} fps", { fps: Math.round(asset.fps) }) : "";
+  return [dimensions, fps].filter(Boolean).join(" · ") || translateText(language, "Video");
 }
 
 function AssetThumbnail({ asset, projectId }: { asset: Asset; projectId: string }) {
+  const t = useTranslation();
   // A text asset has no file to generate a thumbnail from — its own content, in its own color, is a
   // more useful preview than a generic placeholder icon would be.
   if (asset.kind === "text") {
@@ -74,7 +97,7 @@ function AssetThumbnail({ asset, projectId }: { asset: Asset; projectId: string 
         className="flex h-full w-full items-center justify-center overflow-hidden bg-[#1a1a2e] p-1 text-center text-[10px] font-semibold leading-tight"
         style={{ color: asset.textStyle?.color ?? "#ffffff", fontFamily: `"${fontById(asset.textStyle?.fontFamily ?? "").cssFamily}"` }}
       >
-        <span className="line-clamp-2 break-words">{asset.textContent || "Text"}</span>
+        <span className="line-clamp-2 break-words">{asset.textContent || t("Text")}</span>
       </div>
     );
   }
@@ -83,7 +106,7 @@ function AssetThumbnail({ asset, projectId }: { asset: Asset; projectId: string 
   if (!url) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-white/5 text-[10px] uppercase tracking-wide text-white/40">
-        {asset.kind}
+        {t(asset.kind)}
       </div>
     );
   }
@@ -91,6 +114,7 @@ function AssetThumbnail({ asset, projectId }: { asset: Asset; projectId: string 
 }
 
 export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {}) {
+  const t = useTranslation();
   const projectId = useEditorStore((s) => s.projectId);
   const project = useEditorStore((s) => s.project);
   const importing = useEditorStore((s) => s.importing);
@@ -101,9 +125,34 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
   const setAssetDrag = useEditorStore((s) => s.setAssetDrag);
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const importButtonRef = useRef<HTMLButtonElement>(null);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("imported");
   const [dragOver, setDragOver] = useState(false);
+  const [showImportMenu, setShowImportMenu] = useState(false);
+
+  /** "Photos" side of the native Import menu — the OS's own photo/video library, via
+   *  `@capacitor/camera`'s multi-picker. Historically an IMAGE-first API (its `pickImages` name is
+   *  literal); videos come back best-effort where the OS picker itself allows mixed selection, so
+   *  "Files" remains the fully-reliable path for video on any device where this falls short. Loaded
+   *  dynamically so web/desktop bundles never pull in a Capacitor plugin they'll never call. */
+  async function pickFromPhotos() {
+    try {
+      const { Camera } = await import("@capacitor/camera");
+      const result = await Camera.pickImages({ quality: 90 });
+      if (result.photos.length === 0) return;
+      const files = await Promise.all(
+        result.photos.map((photo, i) => photoResultToFile(photo.webPath!, photo.format, `photo-${Date.now()}-${i}`))
+      );
+      void importFiles(files);
+    } catch (err) {
+      // A cancelled picker rejects too (no distinct "user cancelled" result) — only surface it as an
+      // error if it doesn't look like a plain dismissal.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/cancel/i.test(message)) return;
+      useEditorStore.getState().setStatus(message, "error");
+    }
+  }
   /** Local mirror of the in-progress drag, purely for this component's own floating label — the
    *  store's `assetDrag` (same values) is what `Timeline` reads to hit-test/highlight; this one just
    *  saves every OTHER subscriber of `assetDrag` from re-rendering on each pointer move. */
@@ -112,6 +161,15 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
   const assets = useMemo(() => {
     const list = (project?.assets ?? [])
       .filter((a) => !a.hiddenFromLibrary)
+      // Text assets never belong here, unconditionally — unlike every other kind, one was never
+      // IMPORTED media to begin with (`relPath` is always `""`, there's no file to preview/re-add),
+      // it's authored directly on the timeline (`addTextAtPlayhead`, Auto Captions, a duplicated text
+      // clip) and stays a purely timeline-scoped thing from then on. A structural exclusion by `kind`,
+      // not another `hiddenFromLibrary: true` at each creation site (`createTextAsset` et al.) —
+      // that flag is for content that's INCIDENTALLY not library-worthy (a quick voiceover take);
+      // "this is text" is a permanent fact about the asset itself, so it can't quietly regress if some
+      // future text-creating path forgets to set the flag.
+      .filter((a) => a.kind !== "text")
       .filter((a) => a.name.toLowerCase().includes(query.trim().toLowerCase()));
     return list.sort((a, b) => {
       if (sortKey === "name") return a.name.localeCompare(b.name);
@@ -206,15 +264,27 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
       }}
     >
       <header className="flex items-center justify-between gap-2 border-b border-white/10 px-3 py-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-white/60">Media</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-white/60">{t("Media")}</h2>
         <div className="flex shrink-0 items-center gap-1.5">
           <button
-            onClick={() => inputRef.current?.click()}
+            ref={importButtonRef}
+            // Native platforms get a choice (Photos vs Files) since there's a real device photo/video
+            // library to offer alongside the file browser; web/desktop only ever had "Files" to begin
+            // with, so the button there keeps going straight to the file input, unchanged.
+            onClick={() => (IS_NATIVE ? setShowImportMenu((v) => !v) : inputRef.current?.click())}
             disabled={importing}
             className="rounded-md bg-white/10 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-white/20 disabled:cursor-default disabled:opacity-50"
           >
-            {importing ? "Importing…" : "Import"}
+            {importing ? t("Importing…") : t("Import")}
           </button>
+          {showImportMenu && (
+            <ImportSourceMenu
+              anchorRef={importButtonRef}
+              onClose={() => setShowImportMenu(false)}
+              onPickPhotos={() => void pickFromPhotos()}
+              onPickFiles={() => inputRef.current?.click()}
+            />
+          )}
         </div>
         <input
           ref={inputRef}
@@ -235,7 +305,7 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search"
+          placeholder={t("Search")}
           // 16px below `lg`, not the desktop 12px (`text-xs`) — iOS Safari auto-zooms the whole page
           // on focusing any text input under 16px, which on a phone means tapping Search yanks the
           // viewport in every time. text-xs only kicks in at `lg`, where that browser behavior doesn't
@@ -245,12 +315,12 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
         <Dropdown
           value={sortKey}
           onChange={(v) => setSortKey(v)}
-          ariaLabel="Sort media"
+          ariaLabel={t("Sort media")}
           className="w-24 shrink-0 text-xs"
           options={[
-            { value: "imported", label: "Recent" },
-            { value: "name", label: "Name" },
-            { value: "duration", label: "Length" },
+            { value: "imported", label: t("Recent") },
+            { value: "name", label: t("Name") },
+            { value: "duration", label: t("Length") },
           ]}
         />
       </div>
@@ -259,9 +329,12 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
         {assets.length === 0 ? (
           <p className="px-2 py-8 text-center text-xs leading-relaxed text-white/40">
             {/* Checked against VISIBLE assets (query aside), not `project.assets.length` directly —
-                otherwise a project holding only hidden voiceover takes (see `hiddenFromLibrary`) would
-                misreport "Nothing matches that search" with no search query even active. */}
-            {project?.assets.some((a) => !a.hiddenFromLibrary) ? "Nothing matches that search." : "Drop video, audio, or images here — or use Import."}
+                otherwise a project holding only hidden voiceover takes or text clips (see the `assets`
+                memo's own filter above) would misreport "Nothing matches that search" with no search
+                query even active. */}
+            {project?.assets.some((a) => !a.hiddenFromLibrary && a.kind !== "text")
+              ? t("Nothing matches that search.")
+              : t("Drop video, audio, or images here — or use Import.")}
           </p>
         ) : (
           // Grid on mobile (2 columns, bigger tiles), the existing single-column list back at `lg`+ —
@@ -296,7 +369,7 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                   onKeyDown={(e) => {
                     if (e.key === "Enter") addAssetAtPlayhead(asset.id);
                   }}
-                  title={`${asset.name}\n${formatSize(asset.sizeBytes)}\nDouble-click to add at the playhead, or drag onto the timeline (press and hold, then drag, on touch)`}
+                  title={`${asset.name}\n${formatSize(asset.sizeBytes)}\n${t("Double-click to add at the playhead, or drag onto the timeline (press and hold, then drag, on touch)")}`}
                   className="group flex w-full cursor-grab flex-col gap-1.5 rounded-lg p-1.5 text-left transition hover:bg-white/10 focus:bg-white/10 focus:outline-none active:cursor-grabbing lg:flex-row lg:items-center lg:gap-2.5"
                 >
                   <div className="relative aspect-video w-full shrink-0 overflow-hidden rounded bg-black lg:h-11 lg:w-16">
@@ -325,8 +398,8 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                         e.stopPropagation();
                         void removeAsset(asset);
                       }}
-                      title="Remove from project"
-                      aria-label={`Remove ${asset.name} from project`}
+                      title={t("Remove from project")}
+                      aria-label={t("Remove {name} from project", { name: asset.name })}
                       className="absolute right-1 top-1 flex items-center rounded bg-black/70 p-1 text-white/70 transition hover:bg-black/90 hover:text-white lg:hidden"
                     >
                       <Close size={12} />
@@ -335,15 +408,15 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                   <div className="min-w-0 w-full lg:flex-1">
                     <p className="truncate text-xs font-medium text-white/90">{asset.name}</p>
                     <p className="truncate text-[11px] text-white/45">{describe(asset)}</p>
-                    {asset.offline && <p className="text-[11px] font-medium text-amber-400">Media Offline</p>}
+                    {asset.offline && <p className="text-[11px] font-medium text-amber-400">{t("Media Offline")}</p>}
                   </div>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
                       void removeAsset(asset);
                     }}
-                    title="Remove from project"
-                    aria-label={`Remove ${asset.name} from project`}
+                    title={t("Remove from project")}
+                    aria-label={t("Remove {name} from project", { name: asset.name })}
                     // Desktop-row-only (see the mobile-grid overlay button above) — hover-reveal only
                     // makes sense where a mouse actually exists.
                     className="hidden shrink-0 items-center rounded px-1.5 py-1 text-white/30 transition hover:bg-white/10 hover:text-white/80 lg:flex lg:opacity-0 lg:focus:opacity-100 lg:group-hover:opacity-100"

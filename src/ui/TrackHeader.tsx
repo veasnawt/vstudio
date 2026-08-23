@@ -3,6 +3,7 @@
 import React, { useRef, useState } from "react";
 import { Delete, Lock, Music, Text as TextIcon, Unlock, Video, Visibility, VisibilityOff } from "@veasnawt/vicons";
 import { RemoveTrackCommand, SetTrackFlagCommand } from "../commands/index.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import type { Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { ConfirmDialog } from "./ConfirmDialog.tsx";
@@ -98,6 +99,7 @@ export function TrackHeader({
   onDropRow: (sourceTrackId: string, targetTrackId: string, position: "before" | "after") => void;
   onDragEndRow: () => void;
 }) {
+  const t = useTranslation();
   const run = useEditorStore((s) => s.run);
   const activeTrackId = useEditorStore((s) => s.activeTrackId);
   const setActiveTrack = useEditorStore((s) => s.setActiveTrack);
@@ -129,8 +131,8 @@ export function TrackHeader({
       <div
         style={{ height }}
         onClick={() => setActiveTrack(track.id)}
-        title={`${track.name} — tap to expand`}
-        aria-label={`${track.name} track, collapsed — tap to expand`}
+        title={t("{name} — tap to expand", { name: track.name })}
+        aria-label={t("{name} track, collapsed — tap to expand", { name: track.name })}
         // Drag-TO-reorder-onto still works (another track's own expanded drag handle can target this
         // row) — only the reorder-FROM affordance (the "⋮⋮" handle) is dropped, along with everything
         // else, in favor of a single glanceable icon.
@@ -199,8 +201,8 @@ export function TrackHeader({
           }}
           onDragEnd={onDragEndRow}
           onClick={(e) => e.stopPropagation()}
-          title="Drag to reorder"
-          aria-label={`Reorder ${track.name}`}
+          title={t("Drag to reorder")}
+          aria-label={t("Reorder {name}", { name: track.name })}
           className="shrink-0 cursor-grab select-none text-[10px] leading-none text-white/25 transition hover:text-white/60 active:cursor-grabbing"
         >
           ⋮⋮
@@ -222,8 +224,8 @@ export function TrackHeader({
                 importInputRef.current?.click();
               }}
               disabled={importing}
-              title={`Import ${track.kind} onto ${track.name}`}
-              aria-label={`Import ${track.kind} onto ${track.name}`}
+              title={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
+              aria-label={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
               className="ml-auto inline-flex min-h-[26px] min-w-[26px] shrink-0 items-center justify-center rounded text-[15px] font-semibold leading-none text-white/35 transition hover:bg-white/10 hover:text-white/70 disabled:cursor-default disabled:opacity-40"
             >
               +
@@ -260,8 +262,8 @@ export function TrackHeader({
             e.stopPropagation();
             setConfirmOpen(true);
           }}
-          title="Remove track"
-          aria-label={`Remove ${track.name}`}
+          title={t("Remove track")}
+          aria-label={t("Remove {name}", { name: track.name })}
           className="ml-auto flex shrink-0 items-center rounded px-1 py-0.5 text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300 lg:text-white/0 lg:group-hover:text-white/35 lg:focus-visible:text-white/35"
         >
           <Delete size={14} />
@@ -273,7 +275,7 @@ export function TrackHeader({
           <FlagButton
             active={track.locked}
             onClick={() => run(new SetTrackFlagCommand(track.id, "locked", !track.locked))}
-            label={track.locked ? "Unlock track" : "Lock track"}
+            label={track.locked ? t("Unlock track") : t("Lock track")}
             activeClass="bg-amber-500/25 text-amber-300"
           >
             {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
@@ -285,7 +287,7 @@ export function TrackHeader({
             <FlagButton
               active={!track.visible}
               onClick={() => run(new SetTrackFlagCommand(track.id, "visible", !track.visible))}
-              label={track.visible ? "Hide track" : "Show track"}
+              label={track.visible ? t("Hide track") : t("Show track")}
               activeClass="bg-white/15 text-white/80"
             >
               {track.visible ? <Visibility size={13} /> : <VisibilityOff size={13} />}
@@ -295,7 +297,7 @@ export function TrackHeader({
               <FlagButton
                 active={track.muted}
                 onClick={() => run(new SetTrackFlagCommand(track.id, "muted", !track.muted))}
-                label={track.muted ? "Unmute track" : "Mute track"}
+                label={track.muted ? t("Unmute track") : t("Mute track")}
                 activeClass="bg-rose-500/25 text-rose-300"
               >
                 M
@@ -303,7 +305,7 @@ export function TrackHeader({
               <FlagButton
                 active={track.solo}
                 onClick={() => run(new SetTrackFlagCommand(track.id, "solo", !track.solo))}
-                label={track.solo ? "Unsolo track" : "Solo track"}
+                label={track.solo ? t("Unsolo track") : t("Solo track")}
                 activeClass="bg-emerald-500/25 text-emerald-300"
               >
                 S
@@ -315,13 +317,13 @@ export function TrackHeader({
 
       {confirmOpen && (
         <ConfirmDialog
-          title={`Remove ${track.name}?`}
+          title={t("Remove {name}?", { name: track.name })}
           message={
             track.clips.length > 0
-              ? `This deletes ${track.clips.length} clip${track.clips.length === 1 ? "" : "s"} on this track. You can undo it with Ctrl/⌘+Z.`
-              : "This track is empty. You can undo it with Ctrl/⌘+Z."
+              ? t("This deletes {n} clip(s) on this track. You can undo it with Ctrl/⌘+Z.", { n: track.clips.length })
+              : t("This track is empty. You can undo it with Ctrl/⌘+Z.")
           }
-          confirmLabel="Remove track"
+          confirmLabel={t("Remove track")}
           onConfirm={() => {
             setConfirmOpen(false);
             run(new RemoveTrackCommand(track.id));

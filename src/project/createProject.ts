@@ -84,7 +84,11 @@ export function createSequence(preset: { width: number; height: number; fps: num
   };
 }
 
-export function createProject(bpProjectId: string, name = "Untitled", preset = SHORT_PRESET): Project {
+export function createProject(
+  bpProjectId: string,
+  name = "Untitled",
+  preset: { width: number; height: number; fps: number } = SHORT_PRESET
+): Project {
   const now = Date.now();
   return {
     schemaVersion: PROJECT_SCHEMA_VERSION,

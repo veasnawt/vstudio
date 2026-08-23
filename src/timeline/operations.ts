@@ -1,6 +1,6 @@
 import { clipDuration, clipEnd, createClip, findAsset, findClip, findTrack, newId } from "../project/createProject.ts";
-import type { Asset, Clip, ClipEffects, ClipTransform, Project, TextStyle, Track, TrackKind } from "../project/types.ts";
-import { IMAGE_DEFAULT_DURATION, isIdentityEffects, isIdentityTransform, TEXT_DEFAULT_DURATION } from "../project/types.ts";
+import type { ChromaKeySettings, Asset, Clip, ClipEffects, ClipTransform, ColorCurve, ColorGrading, Project, TextCrop, TextStyle, Track, TrackKind } from "../project/types.ts";
+import { IMAGE_DEFAULT_DURATION, isIdentityColorGrading, isIdentityEffects, isIdentityTextCrop, isIdentityTransform, TEXT_DEFAULT_DURATION } from "../project/types.ts";
 import { frameDuration, snapToFrame } from "./time.ts";
 
 /** Every operation here is PURE: it takes a project and returns a NEW project, never mutating the
@@ -195,6 +195,48 @@ export function splitClip(project: Project, clipId: string, atTime: number, newC
     });
     if (newClipId) tail.id = newClipId;
 
+    // Both resulting pieces are the SAME original clip, just cut in two — a clip's own
+    // Transform/Effects/animation/audio settings describe its CONTENT, not its position on the
+    // timeline, so both halves keep them identically. Only `transitionOut` MOVES rather than copies:
+    // it was describing the fade at the original clip's own END, which is now the tail's end, not the
+    // (shortened) head's — leaving it on the head too would fade out mid-content at the cut, which is
+    // never what splitting a clip means. `transitionIn` stays on the head only (unchanged — its own
+    // start never moved) and is deliberately NOT given to the tail: a split creates an ordinary hard
+    // cut between the two pieces, not a new crossfade neither side asked for.
+    if (clip.transform) tail.transform = clip.transform;
+    if (clip.effects) tail.effects = clip.effects;
+    if (clip.textAnimation) tail.textAnimation = clip.textAnimation;
+    if (clip.mutedAudio !== undefined) tail.mutedAudio = clip.mutedAudio;
+    if (clip.gain !== undefined) tail.gain = clip.gain;
+    if (clip.transitionOut) {
+      tail.transitionOut = clip.transitionOut;
+      delete clip.transitionOut;
+    }
+
+    // Keyframe times are CLIP-WINDOW-relative (0 = this clip's own `timelineStart` — see
+    // `Keyframe.time`'s own doc comment), so a straight copy would be wrong on both sides: the head
+    // keeps its own `timelineStart`, so its keyframes stay valid as-is (just no longer reaching past
+    // its new, shorter duration); the tail's `timelineStart` moved to `at`, so ITS keyframes need
+    // re-basing by `offsetIntoSource` — the same value already computed above for the source-time cut.
+    // Split AT a keyframe's own time keeps that keyframe on BOTH sides (at time 0 for the tail) so the
+    // value is continuous right at the cut, rather than silently jumping.
+    if (clip.transformKeyframes) {
+      tail.transformKeyframes = clip.transformKeyframes
+        .filter((k) => k.time >= offsetIntoSource)
+        .map((k) => ({ ...k, time: k.time - offsetIntoSource }));
+      clip.transformKeyframes = clip.transformKeyframes.filter((k) => k.time <= offsetIntoSource);
+      if (clip.transformKeyframes.length === 0) delete clip.transformKeyframes;
+      if (tail.transformKeyframes.length === 0) delete tail.transformKeyframes;
+    }
+    if (clip.effectsKeyframes) {
+      tail.effectsKeyframes = clip.effectsKeyframes
+        .filter((k) => k.time >= offsetIntoSource)
+        .map((k) => ({ ...k, time: k.time - offsetIntoSource }));
+      clip.effectsKeyframes = clip.effectsKeyframes.filter((k) => k.time <= offsetIntoSource);
+      if (clip.effectsKeyframes.length === 0) delete clip.effectsKeyframes;
+      if (tail.effectsKeyframes.length === 0) delete tail.effectsKeyframes;
+    }
+
     clip.sourceOut = splitSourceTime;
     track.clips.push(tail);
     sortClips(track);
@@ -319,6 +361,58 @@ export function setTrackFlag(
     const track = findTrack(draft, trackId);
     if (!track) throw new EditError("That track no longer exists");
     track[flag] = value;
+  });
+}
+
+/** Sets a track's own gain (linear — see `Track.gain`'s own doc comment), applying uniformly to
+ *  every clip on the track on top of each clip's individual `gain`. Same "delete rather than store
+ *  the identity value" convention as `setClipGain`, and the SAME `[0,4]` (400%) clamp applied at BOTH
+ *  write time (here) and parse time (`parseTrack`) — unlike `Clip.gain`, whose parse-time clamp is
+ *  `[0,1]` while its write-time clamp is `[0,4]`, a pre-existing inconsistency not worth repeating on
+ *  a brand new field. Not gated on `track.locked` — `setTrackFlag` doesn't gate its own flag writes on
+ *  lock either, and a track's own mixer fader is exactly that kind of track-level control, not a
+ *  timeline edit `locked` is meant to guard (moving/trimming/deleting what's ON the track). */
+export function setTrackGain(project: Project, trackId: string, gain: number): Project {
+  return edit(project, (draft) => {
+    const track = findTrack(draft, trackId);
+    if (!track) throw new EditError("That track no longer exists");
+    const clamped = Math.min(4, Math.max(0, gain));
+    if (clamped === 1) {
+      delete track.gain;
+    } else {
+      track.gain = clamped;
+    }
+  });
+}
+
+/** Sets a track's own stereo pan (see `Track.pan`'s own doc comment) — same clamp/delete-at-identity
+ *  shape as `setTrackGain`, just a `[-1,1]` range around a `0` (center) identity instead of `[0,4]`
+ *  around `1`. Not gated on `track.locked` — same reasoning as `setTrackGain`: a mixer control, not a
+ *  timeline edit `locked` is meant to guard. */
+export function setTrackPan(project: Project, trackId: string, pan: number): Project {
+  return edit(project, (draft) => {
+    const track = findTrack(draft, trackId);
+    if (!track) throw new EditError("That track no longer exists");
+    const clamped = Math.min(1, Math.max(-1, pan));
+    if (clamped === 0) {
+      delete track.pan;
+    } else {
+      track.pan = clamped;
+    }
+  });
+}
+
+/** Sets the sequence's overall master gain (see `Sequence.masterGain`'s own doc comment) — same
+ *  clamp/delete-at-identity shape as `setTrackGain`, just addressed by the project's one sequence
+ *  instead of a `trackId`, so there's no "not found" case to guard. */
+export function setMasterGain(project: Project, gain: number): Project {
+  return edit(project, (draft) => {
+    const clamped = Math.min(4, Math.max(0, gain));
+    if (clamped === 1) {
+      delete draft.sequence.masterGain;
+    } else {
+      draft.sequence.masterGain = clamped;
+    }
   });
 }
 
@@ -509,6 +603,45 @@ export function setClipTransform(project: Project, clipId: string, transform: Cl
   });
 }
 
+/** Same edge-PAIR rebalancing `clampTransform`'s own nested `clampPair` uses — `TextCrop` behaves like
+ *  `ClipTransform.crop` (two independent axes, each pair must together leave `MIN_VISIBLE_FRACTION`
+ *  visible), not like `ClipEffects`'s independently-clamped fields. Duplicated rather than extracted
+ *  from `clampTransform`'s own closure — small enough that a shared top-level helper isn't worth the
+ *  extra indirection for two call sites. */
+function clampTextCrop(crop: TextCrop): TextCrop {
+  function clampPair(a: number, b: number): [number, number] {
+    const cap = 1 - MIN_VISIBLE_FRACTION;
+    let ca = Math.min(cap, Math.max(0, a));
+    let cb = Math.min(cap, Math.max(0, b));
+    const over = ca + cb - cap;
+    if (over > 0) {
+      const factor = cap / (ca + cb);
+      ca *= factor;
+      cb *= factor;
+    }
+    return [ca, cb];
+  }
+  const [top, bottom] = clampPair(crop.top, crop.bottom);
+  const [left, right] = clampPair(crop.left, crop.right);
+  return { top, right, bottom, left };
+}
+
+/** Sets a text clip's crop wholesale — mirrors `setClipTransform`'s identity-collapse shape exactly
+ *  (not `setClipChromaKey`'s presence-toggle one — see `TextCrop`'s own doc comment for why). */
+export function setClipTextCrop(project: Project, clipId: string, crop: TextCrop): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    const clamped = clampTextCrop(crop);
+    if (isIdentityTextCrop(clamped)) {
+      delete found.clip.textCrop;
+    } else {
+      found.clip.textCrop = clamped;
+    }
+  });
+}
+
 const MIN_BRIGHTNESS = -1;
 const MAX_BRIGHTNESS = 1;
 const MIN_CONTRAST = 0;
@@ -551,6 +684,159 @@ export function setClipEffects(project: Project, clipId: string, effects: ClipEf
   });
 }
 
+function clampCurve(curve: ColorCurve): ColorCurve {
+  return curve
+    .map((p) => ({ x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) }))
+    .sort((a, b) => a.x - b.x);
+}
+
+function clampColorGrading(grading: ColorGrading): ColorGrading {
+  return {
+    master: clampCurve(grading.master),
+    red: clampCurve(grading.red),
+    green: clampCurve(grading.green),
+    blue: clampCurve(grading.blue),
+  };
+}
+
+/** Sets a clip's RGB curves color grading wholesale — mirrors `setClipEffects` exactly (identity-collapse,
+ *  not a presence-toggle the way `setClipChromaKey` is, since color grading has an unambiguous identity
+ *  value — the flat diagonal — the same way effects' 0/1 values do). Deliberately does NOT enforce "the
+ *  two endpoints must stay at x=0/x=1" here — that invariant belongs to `CurveEditor.tsx`'s own drag
+ *  logic (endpoints are Y-only draggable in the UI), the same "some invariants enforced here, others left
+ *  to the UI that produces well-formed input" split `clampTransform`'s own crop clamp already follows. */
+export function setClipColorGrading(project: Project, clipId: string, grading: ColorGrading): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    const clamped = clampColorGrading(grading);
+    if (isIdentityColorGrading(clamped)) {
+      delete found.clip.colorGrading;
+    } else {
+      found.clip.colorGrading = clamped;
+    }
+  });
+}
+
+/** Mirrors `setClipEffectsKeyframes`, for `ColorGrading`. */
+export function setClipColorGradingKeyframes(project: Project, clipId: string, keyframes: Clip["colorGradingKeyframes"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!keyframes || keyframes.length === 0) {
+      delete found.clip.colorGradingKeyframes;
+      return;
+    }
+    const duration = clipDuration(found.clip);
+    found.clip.colorGradingKeyframes = keyframes
+      .map((k) => ({ id: k.id, time: Math.min(duration, Math.max(0, k.time)), value: clampColorGrading(k.value) }))
+      .sort((a, b) => a.time - b.time);
+  });
+}
+
+function clampChromaKey(settings: ChromaKeySettings): ChromaKeySettings {
+  const isHex = /^#[0-9a-fA-F]{6}$/.test(settings.color);
+  return {
+    color: isHex ? settings.color : "#00ff00",
+    similarity: Math.min(1, Math.max(0, settings.similarity)),
+    smoothness: Math.min(1, Math.max(0, settings.smoothness)),
+  };
+}
+
+/** Sets or clears a clip's chroma key (`null` clears it — no identity-sentinel collapse the way
+ *  `setClipTransform`'s does, matching `setClipTransitionIn`'s "no chroma key" shape: unlike a
+ *  transform, there's no "chroma key value that's secretly a no-op" to collapse toward, only present
+ *  or absent). See `ChromaKeySettings`'s own doc comment for why the fields mirror FFmpeg's `colorkey`
+ *  filter so closely. */
+export function setClipChromaKey(project: Project, clipId: string, settings: ChromaKeySettings | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!settings) {
+      delete found.clip.chromaKey;
+    } else {
+      found.clip.chromaKey = clampChromaKey(settings);
+    }
+  });
+}
+
+/** Sets or clears a clip's Transform keyframes wholesale (`null`/empty clears them, matching
+ *  `setClipTransitionIn`'s "no identity sentinel, absent/null is itself meaningful" shape — an empty
+ *  keyframe list is a distinct, meaningful state, "not keyframed," not a value to collapse toward like
+ *  `setClipTransform`'s identity check does). Each keyframe's own `value` is clamped through the same
+ *  `clampTransform` `setClipTransform` already uses (no new clamping logic), and `time` is clamped to
+ *  `[0, clipDuration(clip)]` before the whole array is re-sorted — callers (the Inspector's auto-key
+ *  helper, `TransformHandles`' drag commit) always pass the FULL next array, never a single point to
+ *  merge in here. */
+export function setClipTransformKeyframes(project: Project, clipId: string, keyframes: Clip["transformKeyframes"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!keyframes || keyframes.length === 0) {
+      delete found.clip.transformKeyframes;
+      return;
+    }
+    const duration = clipDuration(found.clip);
+    found.clip.transformKeyframes = keyframes
+      .map((k) => ({ id: k.id, time: Math.min(duration, Math.max(0, k.time)), value: clampTransform(k.value) }))
+      .sort((a, b) => a.time - b.time);
+  });
+}
+
+/** Mirrors `setClipTransformKeyframes`, for `ClipEffects`. */
+export function setClipEffectsKeyframes(project: Project, clipId: string, keyframes: Clip["effectsKeyframes"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!keyframes || keyframes.length === 0) {
+      delete found.clip.effectsKeyframes;
+      return;
+    }
+    const duration = clipDuration(found.clip);
+    found.clip.effectsKeyframes = keyframes
+      .map((k) => ({ id: k.id, time: Math.min(duration, Math.max(0, k.time)), value: clampEffects(k.value) }))
+      .sort((a, b) => a.time - b.time);
+  });
+}
+
+/** Same clamps `setTextAsset` applies to a static `TextStyle` — reused here so a keyframed value can
+ *  never smuggle in an out-of-range font size/stroke width/line height that direct editing would have
+ *  rejected. `fontSize`/`strokeWidth`/`lineHeightMultiplier` are the only TextStyle fields with a
+ *  natural bound; the rest (offsetX/offsetY/rotationDeg/shadowOffsetX/Y) are deliberately unclamped,
+ *  same reasoning as `clampTransform`'s own offset/rotation fields. */
+function clampTextStyle(style: TextStyle): TextStyle {
+  return {
+    ...style,
+    fontSize: Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, style.fontSize)),
+    strokeWidth: Math.min(MAX_STROKE_WIDTH, Math.max(MIN_STROKE_WIDTH, style.strokeWidth)),
+    lineHeightMultiplier: Math.min(MAX_LINE_HEIGHT_MULTIPLIER, Math.max(MIN_LINE_HEIGHT_MULTIPLIER, style.lineHeightMultiplier)),
+  };
+}
+
+/** Mirrors `setClipTransformKeyframes`, for a text clip's `TextStyle` — see `Clip.textStyleKeyframes`'s
+ *  own doc comment for why this lives on the clip rather than alongside `setTextAsset`'s own static-
+ *  value path. */
+export function setClipTextStyleKeyframes(project: Project, clipId: string, keyframes: Clip["textStyleKeyframes"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!keyframes || keyframes.length === 0) {
+      delete found.clip.textStyleKeyframes;
+      return;
+    }
+    const duration = clipDuration(found.clip);
+    found.clip.textStyleKeyframes = keyframes
+      .map((k) => ({ id: k.id, time: Math.min(duration, Math.max(0, k.time)), value: clampTextStyle(k.value) }))
+      .sort((a, b) => a.time - b.time);
+  });
+}
+
 /** Sets or clears a clip's `transitionIn` (`null` clears it, matching `setClipMuted`'s `false`
  *  convention for a boolean-shaped optional field). Only `duration` is clamped — floored at one
  *  frame so a transition can never collapse to a zero-length no-op that still occupies a field; no
@@ -571,6 +857,37 @@ export function setClipTransitionIn(project: Project, clipId: string, transition
   });
 }
 
+/** Sets or clears a clip's `transitionOut` — same shape/clamping as `setClipTransitionIn` above, just
+ *  the tail-fade field instead of the head-blend one. */
+export function setClipTransitionOut(project: Project, clipId: string, transitionOut: Clip["transitionOut"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!transitionOut) {
+      delete found.clip.transitionOut;
+    } else {
+      const min = frameDuration(draft.sequence.fps);
+      found.clip.transitionOut = { ...transitionOut, duration: Math.max(min, transitionOut.duration) };
+    }
+  });
+}
+
+/** Sets or clears a clip's `textAnimation` — no clamping needed (unlike the transitions above, there's
+ *  no duration field to floor against a minimum frame). */
+export function setClipTextAnimation(project: Project, clipId: string, textAnimation: Clip["textAnimation"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!textAnimation) {
+      delete found.clip.textAnimation;
+    } else {
+      found.clip.textAnimation = { ...textAnimation };
+    }
+  });
+}
+
 /** Mutes or unmutes a clip's own embedded audio. Like `transform`, `false` deletes the field rather
  *  than storing it explicitly — an unmuted clip's JSON stays exactly as small as it was before this
  *  feature existed, and undoing a mute toggle restores a truly absent field. */
@@ -587,16 +904,19 @@ export function setClipMuted(project: Project, clipId: string, muted: boolean): 
   });
 }
 
-/** Sets a clip's own audio gain (linear, 0..1 — see `Clip.gain`'s own doc comment for why not
- *  higher). Same "delete rather than store the identity value" convention as `transform`/`effects`:
- *  an untouched clip's JSON stays exactly as small as before this feature existed, and undoing a gain
- *  change restores a truly absent field rather than an explicit `1`. */
+/** Sets a clip's own audio gain (linear — see `Clip.gain`'s own doc comment). Routed through
+ *  `AudioMixEngine`'s `GainNode`s rather than a media element's native `.volume`, so this can
+ *  genuinely amplify, not just attenuate; the `4` ceiling (400%) is ordinary input-sanity clamping for
+ *  the UI, not an architectural limit — `GainNode` itself has no ceiling. Same "delete rather than
+ *  store the identity value" convention as `transform`/`effects`: an untouched clip's JSON stays
+ *  exactly as small as before this feature existed, and undoing a gain change restores a truly absent
+ *  field rather than an explicit `1`. */
 export function setClipGain(project: Project, clipId: string, gain: number): Project {
   return edit(project, (draft) => {
     const found = findClip(draft, clipId);
     if (!found) throw new EditError("That clip no longer exists");
     if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
-    const clamped = Math.min(1, Math.max(0, gain));
+    const clamped = Math.min(4, Math.max(0, gain));
     if (clamped === 1) {
       delete found.clip.gain;
     } else {

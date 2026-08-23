@@ -1,6 +1,9 @@
-import type { Asset, Clip, ClipEffects, ClipTransform, Project, Sequence, TextStyle, Track } from "./types.ts";
-import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION } from "./types.ts";
+import { newId } from "./createProject.ts";
+import type { Asset, ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorCurve, ColorGrading, Project, Sequence, TextCrop, TextStyle, Track } from "./types.ts";
+import { DEFAULT_TEXT_STYLE, IDENTITY_CURVE, PROJECT_SCHEMA_VERSION } from "./types.ts";
 import { FONT_REGISTRY } from "./fonts.ts";
+import { TRANSITION_TYPE_OPTIONS } from "../timeline/transitions.ts";
+import { TEXT_ANIMATION_TYPE_OPTIONS } from "../timeline/textAnimation.ts";
 
 /** Thrown when a project file can't be trusted. Callers surface the message to the user rather than
  *  loading a half-understood project and letting the damage show up later as a corrupted edit. */
@@ -126,6 +129,19 @@ function parseClipTransform(raw: unknown): ClipTransform | undefined {
   };
 }
 
+/** Same leniency as `parseClipTransform` above, and for the same reason: a text clip's crop is purely
+ *  additive enhancement data. */
+function parseTextCrop(raw: unknown): TextCrop | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  return {
+    top: num(r.top, "text crop", 0),
+    right: num(r.right, "text crop", 0),
+    bottom: num(r.bottom, "text crop", 0),
+    left: num(r.left, "text crop", 0),
+  };
+}
+
 /** Same leniency as `parseClipTransform` above, and for the same reason: `effects` is purely
  *  additive enhancement data, not something that defines what a clip fundamentally IS. */
 function parseClipEffects(raw: unknown): ClipEffects | undefined {
@@ -140,18 +156,170 @@ function parseClipEffects(raw: unknown): ClipEffects | undefined {
   };
 }
 
-/** Same leniency as `parseClipEffects` above, and for the same reason: `transitionIn` is purely
- *  additive relationship data toward the preceding clip, not something that defines what a clip
- *  fundamentally IS — see `Clip.transitionIn`'s own doc comment. A non-positive/malformed duration
- *  drops the field entirely rather than storing a transition that would never render anything
- *  (`findTransitionPartner` already treats `duration <= 0` as "no transition"). `type` is forced to
- *  `"crossfade"` regardless of what's stored, since it's the only valid value this pass. */
-function parseClipTransitionIn(raw: unknown): Clip["transitionIn"] {
+/** Same leniency as `parseClipEffects` above, and for the same reason: `transitionIn`/`transitionOut`
+ *  are purely additive relationship data, not something that defines what a clip fundamentally IS —
+ *  see `Clip.transitionIn`'s own doc comment. A non-positive/malformed duration drops the field
+ *  entirely rather than storing a transition that would never render anything (`findTransitionPartner`/
+ *  `findTransitionOut` already treat `duration <= 0` as "no transition"). `type` falls back to
+ *  `"crossfade"` when missing or not one of `TRANSITION_TYPE_OPTIONS`'s real values — a project file
+ *  from a newer build (or hand-edited) naming a type this build doesn't know falls back rather than
+ *  storing a value nothing here can render. */
+function parseClipTransitionSpec(raw: unknown): { duration: number; type: (typeof TRANSITION_TYPE_OPTIONS)[number] } | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const r = raw as Record<string, unknown>;
   const duration = num(r.duration, "clip transition duration", 0);
   if (duration <= 0) return undefined;
-  return { duration, type: "crossfade" };
+  const type = TRANSITION_TYPE_OPTIONS.find((t) => t === r.type) ?? "crossfade";
+  return { duration, type };
+}
+
+/** Same leniency as `parseClipTransform`/`parseClipEffects` above, for a clip's Transform keyframe
+ *  list — additive animation data, not something that defines what a clip fundamentally IS. A
+ *  malformed individual keyframe (a non-finite `time`, or a `value` that isn't even an object) is
+ *  dropped rather than failing the whole array — `parseClipTransform` itself already falls back
+ *  field-by-field for a partially-malformed value object, so only a genuinely absent/non-object
+ *  `value` drops the entry here. An array that ends up empty after dropping bad entries is treated as
+ *  absent, matching `setClipTransformKeyframes`'s own "empty means not keyframed" convention, rather
+ *  than storing a pointless zero-length array. Sorted by time, same invariant `setClipTransformKeyframes`
+ *  itself maintains. A missing/non-string `id` is regenerated rather than dropping the whole keyframe —
+ *  the id only needs to be a stable, unique handle for the UI, not meaningful data worth losing the
+ *  keyframe over. */
+function parseTransformKeyframes(raw: unknown): Clip["transformKeyframes"] {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): NonNullable<Clip["transformKeyframes"]>[number] | undefined => {
+      if (!entry || typeof entry !== "object") return undefined;
+      const r = entry as Record<string, unknown>;
+      if (typeof r.time !== "number" || !Number.isFinite(r.time)) return undefined;
+      if (!r.value || typeof r.value !== "object") return undefined;
+      return { id: str(r.id, "keyframe id", newId("kf")), time: r.time, value: parseClipTransform(r.value)! };
+    })
+    .filter((k): k is NonNullable<Clip["transformKeyframes"]>[number] => k !== undefined)
+    .sort((a, b) => a.time - b.time);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+/** Mirrors `parseTransformKeyframes`, for a clip's Effects keyframe list. */
+function parseEffectsKeyframes(raw: unknown): Clip["effectsKeyframes"] {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): NonNullable<Clip["effectsKeyframes"]>[number] | undefined => {
+      if (!entry || typeof entry !== "object") return undefined;
+      const r = entry as Record<string, unknown>;
+      if (typeof r.time !== "number" || !Number.isFinite(r.time)) return undefined;
+      if (!r.value || typeof r.value !== "object") return undefined;
+      return { id: str(r.id, "keyframe id", newId("kf")), time: r.time, value: parseClipEffects(r.value)! };
+    })
+    .filter((k): k is NonNullable<Clip["effectsKeyframes"]>[number] => k !== undefined)
+    .sort((a, b) => a.time - b.time);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+/** Same field-by-field fallback spirit as `parseTextStyle`, applied to one `ColorCurve`: a malformed
+ *  individual point is dropped (never drops the whole curve for one bad point), and the whole curve
+ *  falls back to `IDENTITY_CURVE` only if fewer than 2 valid points survive — a curve needs at least its
+ *  two endpoints to mean anything. */
+function parseColorCurve(raw: unknown): ColorCurve {
+  if (!Array.isArray(raw) || raw.length < 2) return IDENTITY_CURVE;
+  const points = raw
+    .map((p): { x: number; y: number } | undefined => {
+      if (!p || typeof p !== "object") return undefined;
+      const r = p as Record<string, unknown>;
+      if (typeof r.x !== "number" || !Number.isFinite(r.x)) return undefined;
+      if (typeof r.y !== "number" || !Number.isFinite(r.y)) return undefined;
+      return { x: Math.min(1, Math.max(0, r.x)), y: Math.min(1, Math.max(0, r.y)) };
+    })
+    .filter((p): p is { x: number; y: number } => p !== undefined)
+    .sort((a, b) => a.x - b.x);
+  return points.length >= 2 ? points : IDENTITY_CURVE;
+}
+
+/** Same leniency as `parseClipEffects` above, and for the same reason: color grading is purely
+ *  additive enhancement data. Each of the four curves falls back independently via `parseColorCurve` —
+ *  a malformed `red` curve doesn't lose an otherwise-valid `master` curve. */
+function parseColorGrading(raw: unknown): ColorGrading | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  return {
+    master: parseColorCurve(r.master),
+    red: parseColorCurve(r.red),
+    green: parseColorCurve(r.green),
+    blue: parseColorCurve(r.blue),
+  };
+}
+
+/** Mirrors `parseTransformKeyframes`, for a clip's ColorGrading keyframe list. `parseColorGrading`
+ *  itself never fails (field-by-field fallback), so — like `parseTextStyleKeyframes` — only a genuinely
+ *  absent/non-object `value` drops the entry here. */
+function parseColorGradingKeyframes(raw: unknown): Clip["colorGradingKeyframes"] {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): NonNullable<Clip["colorGradingKeyframes"]>[number] | undefined => {
+      if (!entry || typeof entry !== "object") return undefined;
+      const r = entry as Record<string, unknown>;
+      if (typeof r.time !== "number" || !Number.isFinite(r.time)) return undefined;
+      if (!r.value || typeof r.value !== "object") return undefined;
+      return { id: str(r.id, "keyframe id", newId("kf")), time: r.time, value: parseColorGrading(r.value)! };
+    })
+    .filter((k): k is NonNullable<Clip["colorGradingKeyframes"]>[number] => k !== undefined)
+    .sort((a, b) => a.time - b.time);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+/** Mirrors `parseTransformKeyframes`, for a TEXT clip's TextStyle keyframe list — see
+ *  `Clip.textStyleKeyframes`'s own doc comment for why this is a third, clip-scoped keyframe track
+ *  rather than living alongside `parseTextStyle`'s own asset-scoped static path. `parseTextStyle`
+ *  itself never fails (missing/malformed fields fall back field-by-field to `DEFAULT_TEXT_STYLE`), so
+ *  unlike `parseTransformKeyframes`/`parseEffectsKeyframes` there's no non-null assertion needed on
+ *  its result — only a genuinely absent/non-object `value` drops the entry here. */
+function parseTextStyleKeyframes(raw: unknown): Clip["textStyleKeyframes"] {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): NonNullable<Clip["textStyleKeyframes"]>[number] | undefined => {
+      if (!entry || typeof entry !== "object") return undefined;
+      const r = entry as Record<string, unknown>;
+      if (typeof r.time !== "number" || !Number.isFinite(r.time)) return undefined;
+      if (!r.value || typeof r.value !== "object") return undefined;
+      return { id: str(r.id, "keyframe id", newId("kf")), time: r.time, value: parseTextStyle(r.value) };
+    })
+    .filter((k): k is NonNullable<Clip["textStyleKeyframes"]>[number] => k !== undefined)
+    .sort((a, b) => a.time - b.time);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+/** Same leniency as `parseClipTransform`/`parseClipEffects` above: chroma key is purely additive
+ *  enhancement data. A malformed/missing `color` falls back to `DEFAULT_CHROMA_KEY`'s green rather than
+ *  dropping the whole setting — same field-by-field fallback `parseTextStyle` already uses. */
+function parseChromaKey(raw: unknown): ChromaKeySettings | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const color = typeof r.color === "string" && /^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : "#00ff00";
+  return {
+    color,
+    similarity: num(r.similarity, "chroma key similarity", 0.4),
+    smoothness: num(r.smoothness, "chroma key smoothness", 0.1),
+  };
+}
+
+/** Same leniency as `parseClipTransitionSpec` above, for `textAnimation` — an unknown/malformed `type`
+ *  drops the field entirely (unlike a transition, there's no sensible "fall back to a default type"
+ *  here — an animation with the wrong TYPE is just a different, still-fine-looking motion, but there's
+ *  no single "safe default" motion the way `crossfade` is for transitions, so absent is the honest
+ *  fallback instead of silently picking one). */
+function parseClipTextAnimation(raw: unknown): Clip["textAnimation"] {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const type = TEXT_ANIMATION_TYPE_OPTIONS.find((t) => t === r.type);
+  if (!type) return undefined;
+  return {
+    type,
+    ...(typeof r.highlightColor === "string" ? { highlightColor: r.highlightColor } : null),
+    // Non-positive/absurd speeds would make the animation appear frozen or flash unusably fast —
+    // clamped to a sane range rather than trusted verbatim from a hand-edited file.
+    ...(typeof r.speed === "number" && Number.isFinite(r.speed) && r.speed > 0
+      ? { speed: Math.min(10, Math.max(0.1, r.speed)) }
+      : null),
+  };
 }
 
 function parseClip(raw: Record<string, unknown>): Clip {
@@ -162,7 +330,16 @@ function parseClip(raw: Record<string, unknown>): Clip {
   }
   const transform = parseClipTransform(raw.transform);
   const effects = parseClipEffects(raw.effects);
-  const transitionIn = parseClipTransitionIn(raw.transitionIn);
+  const colorGrading = parseColorGrading(raw.colorGrading);
+  const chromaKey = parseChromaKey(raw.chromaKey);
+  const transitionIn = parseClipTransitionSpec(raw.transitionIn);
+  const transitionOut = parseClipTransitionSpec(raw.transitionOut);
+  const textAnimation = parseClipTextAnimation(raw.textAnimation);
+  const textCrop = parseTextCrop(raw.textCrop);
+  const transformKeyframes = parseTransformKeyframes(raw.transformKeyframes);
+  const effectsKeyframes = parseEffectsKeyframes(raw.effectsKeyframes);
+  const colorGradingKeyframes = parseColorGradingKeyframes(raw.colorGradingKeyframes);
+  const textStyleKeyframes = parseTextStyleKeyframes(raw.textStyleKeyframes);
   return {
     id: str(raw.id, "clip id"),
     assetId: str(raw.assetId, "clip asset reference"),
@@ -171,7 +348,16 @@ function parseClip(raw: Record<string, unknown>): Clip {
     timelineStart: Math.max(0, num(raw.timelineStart, "clip position")),
     ...(transform ? { transform } : null),
     ...(effects ? { effects } : null),
+    ...(colorGrading ? { colorGrading } : null),
+    ...(chromaKey ? { chromaKey } : null),
+    ...(transformKeyframes ? { transformKeyframes } : null),
+    ...(effectsKeyframes ? { effectsKeyframes } : null),
+    ...(colorGradingKeyframes ? { colorGradingKeyframes } : null),
+    ...(textStyleKeyframes ? { textStyleKeyframes } : null),
     ...(transitionIn ? { transitionIn } : null),
+    ...(transitionOut ? { transitionOut } : null),
+    ...(textAnimation ? { textAnimation } : null),
+    ...(textCrop ? { textCrop } : null),
     ...(raw.mutedAudio === true ? { mutedAudio: true } : null),
     ...(typeof raw.gain === "number" && Number.isFinite(raw.gain) && raw.gain !== 1
       ? { gain: Math.min(1, Math.max(0, raw.gain)) }
@@ -198,6 +384,15 @@ function parseTrack(raw: Record<string, unknown>): Track {
     visible: bool(raw.visible, true),
     muted: bool(raw.muted, false),
     solo: bool(raw.solo, false),
+    // Same [0,4] clamp `setTrackGain` uses at write time — unlike `Clip.gain` just above, this field
+    // is deliberately kept consistent between parse-time and write-time bounds.
+    ...(typeof raw.gain === "number" && Number.isFinite(raw.gain) && raw.gain !== 1
+      ? { gain: Math.min(4, Math.max(0, raw.gain)) }
+      : null),
+    // Same [-1,1] clamp `setTrackPan` uses at write time — consistent parse/write bounds, same as `gain`.
+    ...(typeof raw.pan === "number" && Number.isFinite(raw.pan) && raw.pan !== 0
+      ? { pan: Math.min(1, Math.max(-1, raw.pan)) }
+      : null),
   };
 }
 
@@ -209,6 +404,9 @@ function parseSequence(raw: Record<string, unknown>): Sequence {
     height: num(raw.height, "sequence height", 1920),
     fps: num(raw.fps, "sequence frame rate", 30),
     tracks: Array.isArray(raw.tracks) ? raw.tracks.map((t) => parseTrack(t as Record<string, unknown>)) : [],
+    ...(typeof raw.masterGain === "number" && Number.isFinite(raw.masterGain) && raw.masterGain !== 1
+      ? { masterGain: Math.min(4, Math.max(0, raw.masterGain)) }
+      : null),
   };
 }
 

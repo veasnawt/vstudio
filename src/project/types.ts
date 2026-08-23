@@ -199,6 +199,32 @@ export function isIdentityTransform(transform: ClipTransform | undefined): boole
   );
 }
 
+/** Static, non-keyframed, frame-space rectangular crop for a TEXT clip — CSS `overflow: hidden` over
+ *  the rendered text, NOT `ClipTransform.crop`'s pre-scale source-pixel crop (text has no source pixels
+ *  to crop from). Shaped identically to `ClipTransform.crop` (4 edge-inset fractions, 0..1 — but of the
+ *  SEQUENCE FRAME's own width/height, not the text's own dynamically-measured bounding box) purely
+ *  because that's the closest existing UI/data precedent in this codebase, not because the two mean the
+ *  same thing: text keeps rendering at its normal computed position (`TextStyle.offsetX/offsetY`/
+ *  `align`), and this crop is an independent mask over the FRAME on top of that, not a repositioning of
+ *  the text block itself. Not keyframed — mirrors `ChromaKeySettings`'s own "static per-clip data, not
+ *  keyframed" precedent. */
+export interface TextCrop {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** The untransformed default — full frame visible, no clipping. Mirrors `IDENTITY_TRANSFORM`. */
+export const IDENTITY_TEXT_CROP: TextCrop = { top: 0, right: 0, bottom: 0, left: 0 };
+
+/** Mirrors `isIdentityTransform` — both `setClipTextCrop` (identity-collapse) and `buildExportPlan`
+ *  (plain vs. isolate/crop/pad/overlay filter chain) key off this. */
+export function isIdentityTextCrop(crop: TextCrop | undefined): boolean {
+  if (!crop) return true;
+  return crop.top === 0 && crop.right === 0 && crop.bottom === 0 && crop.left === 0;
+}
+
 /** Static (non-animating) per-clip color/blur adjustments. Video/image clips only — text has its own
  *  separate `TextStyle` system.
  *
@@ -246,6 +272,178 @@ export function isIdentityEffects(effects: ClipEffects | undefined): boolean {
   );
 }
 
+/** Chroma key (green/blue screen) settings for a video/image clip — makes pixels near `color`
+ *  transparent so whatever's on the track(s) beneath shows through. Mirrors FFmpeg's own `colorkey`
+ *  filter parameters closely (`similarity`→`similarity`, `smoothness`→`blend`) rather than inventing a
+ *  different model, specifically so preview (Canvas2D, `PlaybackEngine.applyChromaKey`) and export
+ *  (`buildExportPlan`'s `colorkey=` filter) agree as exactly as possible — same "state the algorithm,
+ *  don't just approximate it" spirit `ClipEffects`'s own doc comment already follows for
+ *  brightness/blur. Static per-clip data, not keyframed — a green screen's key color doesn't need to
+ *  animate over a clip's own duration the way position/effects sometimes do, same "not everything needs
+ *  a keyframe track" reasoning `textAnimation`/`transitionIn` already follow. */
+export interface ChromaKeySettings {
+  /** Hex, e.g. "#00ff00" — the color to key OUT (make transparent). */
+  color: string;
+  /** 0..1, FFmpeg's own `similarity` convention: a pixel within this normalized color-distance of
+   *  `color` is keyed out entirely. Larger keys out more shades/lighting variation around `color`, at
+   *  the risk of also eating into the subject if it shares that color. */
+  similarity: number;
+  /** 0..1, FFmpeg's own `blend` convention: pixels JUST beyond `similarity`'s cutoff ramp from fully
+   *  transparent to fully opaque over this additional distance, instead of a hard edge — the standard
+   *  "feather the key's boundary" control every chroma-key tool exposes, just named for what it does
+   *  (how smooth the cutoff is) rather than FFmpeg's more implementation-flavored `blend`. */
+  smoothness: number;
+}
+
+/** The default a freshly-enabled chroma key starts with — standard green screen, FFmpeg's own
+ *  similarity default (0.01) nudged up to 0.4 since that default keys out almost nothing in practice
+ *  (real green-screen footage has far more color variation than a studio-perfect 0x00FF00 sample), plus
+ *  a touch of smoothness so the cutout edge isn't a hard, aliased line by default. */
+export const DEFAULT_CHROMA_KEY: ChromaKeySettings = {
+  color: "#00ff00",
+  similarity: 0.4,
+  smoothness: 0.1,
+};
+
+/** One control point of a `ColorCurve`, both axes normalized 0..1 (input level → output level). */
+export interface CurvePoint {
+  x: number;
+  y: number;
+}
+
+/** Control points for one tone curve, sorted ascending by `x`. Always includes the two fixed endpoint
+ *  anchors (x=0 and x=1) — the UI (`CurveEditor`) never lets those be deleted, only dragged vertically;
+ *  interior points are optional. This type only stores the raw editable points — `timeline/colorCurves.ts`'s
+ *  spline evaluator is what turns a `ColorCurve` into an actually renderable/appliable LUT. */
+export type ColorCurve = CurvePoint[];
+
+/** The untransformed default — a flat diagonal, (0,0) to (1,1), no adjustment. */
+export const IDENTITY_CURVE: ColorCurve = [
+  { x: 0, y: 0 },
+  { x: 1, y: 1 },
+];
+
+/** Per-clip RGB curves color grading — four independently-editable curves (the combined "master" tab
+ *  plus one per channel), composed per-channel as `master(channel(input))` — see
+ *  `timeline/colorCurves.ts`'s `composeLuts` for why that specific order (channel first, master on top),
+ *  verified against FFmpeg's own `libavfilter/vf_curves.c` composition loop. This order matters because
+ *  export hands these SAME control points straight to FFmpeg's `curves=` filter (`export/curvesFilter.ts`)
+ *  rather than a precomputed LUT, so preview and export need to agree on composition order to actually
+ *  look the same. */
+export interface ColorGrading {
+  master: ColorCurve;
+  red: ColorCurve;
+  green: ColorCurve;
+  blue: ColorCurve;
+}
+
+/** The untransformed default — every channel a flat diagonal. Mirrors `IDENTITY_EFFECTS`. */
+export const IDENTITY_COLOR_GRADING: ColorGrading = {
+  master: IDENTITY_CURVE,
+  red: IDENTITY_CURVE,
+  green: IDENTITY_CURVE,
+  blue: IDENTITY_CURVE,
+};
+
+/** Mirrors `isIdentityEffects` — both `setClipColorGrading` (identity-collapse) and `buildExportPlan`
+ *  (plain vs. curves-aware filter chain) key off this. A curve counts as identity only when it's EXACTLY
+ *  the two-point diagonal `IDENTITY_CURVE` is. */
+export function isIdentityColorGrading(grading: ColorGrading | undefined): boolean {
+  if (!grading) return true;
+  const isIdentity = (c: ColorCurve) =>
+    c.length === 2 && c[0].x === 0 && c[0].y === 0 && c[1].x === 1 && c[1].y === 1;
+  return (
+    isIdentity(grading.master) &&
+    isIdentity(grading.red) &&
+    isIdentity(grading.green) &&
+    isIdentity(grading.blue)
+  );
+}
+
+/** One point in a keyframed animation for a clip property-group (`ClipTransform`, `ClipEffects`, or
+ *  `ColorGrading` — never a single field of any of them — see `Clip.transformKeyframes`'s own doc
+ *  comment for why). `time` is CLIP-WINDOW-relative seconds (0 = this clip's own `timelineStart`) — the
+ *  same "elapsed" space `timeline/textAnimation.ts`'s `elapsedSeconds` and `PlaybackEngine`'s own
+ *  repeated inline `time - clip.timelineStart` already use, NOT source-media time. `value` is the FULL
+ *  object, never a sparse per-field patch — matches this codebase's pervasive "whole value stored, never
+ *  a partial patch" convention (`ClipOverride`, `patchTransform`'s merge-then-replace-whole-object
+ *  shape). `id` is a stable identifier (`newId("kf")`) so the UI can select/drag/delete one keyframe
+ *  without relying on array index, which shifts under insert. */
+export interface Keyframe<T> {
+  id: string;
+  time: number;
+  value: T;
+}
+export type TransformKeyframe = Keyframe<ClipTransform>;
+export type EffectsKeyframe = Keyframe<ClipEffects>;
+export type TextStyleKeyframe = Keyframe<TextStyle>;
+/** Held (never interpolated) between keyframes — see `Clip.colorGradingKeyframes`'s own doc comment for
+ *  why smoothly cross-fading between two differently-shaped curves isn't attempted in v1. */
+export type ColorGradingKeyframe = Keyframe<ColorGrading>;
+
+/** Every transition style either renderer can produce. Kept to the subset of FFmpeg's own `xfade`
+ *  filter's transition names (see `TRANSITION_XFADE_NAME` in `export/buildExportPlan.ts`) that's been
+ *  part of that filter since its ORIGINAL introduction (FFmpeg 4.3) — a newer name like `xfade`'s own
+ *  `"zoomin"` (added in 6.1) risks failing export outright against an older bundled `ffmpeg-static`
+ *  build, which a name this old can't. `PlaybackEngine`'s canvas preview groups these into FOUR
+ *  rendering families (dissolve, wipe, slide, circle — see its own `transitionFamily`), not ten
+ *  independent implementations; export always renders the exact distinct FFmpeg filter regardless of
+ *  which family the preview approximated it with. */
+export type TransitionType =
+  | "crossfade"
+  | "dissolve"
+  | "wipeLeft"
+  | "wipeRight"
+  | "wipeUp"
+  | "wipeDown"
+  | "slideLeft"
+  | "slideRight"
+  | "slideUp"
+  | "slideDown"
+  | "circleOpen"
+  | "circleClose";
+
+/** A continuous MOTION effect for a text clip, distinct from `transitionIn`/`transitionOut` — those
+ *  are one-shot events at a clip's own edges (a cut blended/wiped/dissolved into or out of), rendered
+ *  identically in preview and export; this is a periodic or progressive effect that plays across the
+ *  clip's own ENTIRE visible duration, exactly like the "Bounce"/"Pulse"/"Typewriter" text presets a
+ *  captioning or short-form-video tool would offer. `timeline/textAnimation.ts` is the one place the
+ *  actual motion math lives (`computeTextAnimationTransform`/`typewriterVisibleContent`) — kept as pure
+ *  functions of elapsed time so they're directly unit-testable without a canvas, the same reasoning
+ *  `PlaybackEngine.transitionFamily` already follows.
+ *
+ *  `bounce`/`pulse`/`wiggle`/`typewriter` all render for real in export (see `buildExportPlan.ts`'s
+ *  `buildDrawTextFilter`/`buildRotatedDrawTextFilter`) — `bounce`/`pulse` as time-varying `y=`/
+ *  `fontsize=` FFmpeg expressions (verified: `x`/`y` there are already `text_w`/`text_h`-relative
+ *  expressions FFmpeg re-evaluates every frame, so they re-center correctly on their own as the size/
+ *  position animates), `wiggle` via the same ROTATED-text pipeline a static `style.rotationDeg` already
+ *  uses (a time-varying `rotate` angle with a FIXED worst-case buffer size — `rotate`'s own `ow=`/`oh=`
+ *  can't themselves depend on `t`), and `typewriter` via one chained `drawtext` per revealed-prefix
+ *  state (`buildTypewriterDrawTextCalls`), gated to its own `enable=` window. A nonzero STATIC
+ *  `style.rotationDeg` combined with `bounce`/`pulse`/`typewriter` is a documented scope cut — that
+ *  combination renders as plain static rotated text, animation ignored (the rotated path's frame-center
+ *  pivot and the plain path's `text_w`-relative centering are mutually exclusive constructions).
+ *
+ *  `wordHighlight` renders for real too, but through an entirely different FFmpeg filter —
+ *  `subtitles=` (libass), not `drawtext` — since coloring individual WORDS within one string is beyond
+ *  what `drawtext` can express, and there's no way to feed one `drawtext` call's measured `text_w` into
+ *  another's `x=` (confirmed by re-deriving the filtergraph's actual data-flow model). libass already
+ *  links HarfBuzz/FreeType/FriBidi, so it shapes Khmer's complex script (subscript consonants, vowel-
+ *  sign reordering) correctly — the reason this reuses libass rather than this app computing its own
+ *  glyph advance widths, which would NOT reproduce that shaping correctly. See
+ *  `buildWordHighlightSubtitlesFilter`'s own comment for the full reasoning, and `AssFontMetrics` in
+ *  `project/fonts.ts` for how a font's real (non-`cssFamily`) name and correct on-screen size are
+ *  resolved for libass specifically. Falls back to plain static full text (same as before this existed)
+ *  when the exporter hasn't wired up ASS support — currently true only for native/mobile export, where
+ *  the bundled FFmpeg engine's own libass support hasn't been confirmed.
+ *
+ *  `wordHighlight` is the odd one out here: a karaoke/lyrics-style effect where exactly one word is
+ *  drawn in a highlight color at a time, jumping word-to-word left-to-right as the clip plays, timed to
+ *  spread evenly across the clip's own duration (see `timeline/textAnimation.ts`'s `activeWordIndex`).
+ *  Its highlight color is genuinely configurable (`Clip.textAnimation.highlightColor`) — the other four
+ *  are fixed motion curves with nothing meaningful to expose as a setting yet. */
+export type TextAnimationType = "bounce" | "pulse" | "wiggle" | "typewriter" | "wordHighlight";
+
 /** One clip on a track. The heart of non-destructive editing: a clip is a *reference* to a slice of
  *  a source asset plus a position, never a copy of media. Trimming a 10-minute source down to 15
  *  seconds only moves `sourceIn`/`sourceOut` — the file on disk is never touched. */
@@ -264,19 +462,101 @@ export interface Clip {
   transform?: ClipTransform;
   /** Absent means `IDENTITY_EFFECTS` — same reasoning as `transform`. */
   effects?: ClipEffects;
-  /** A crossfade FROM whatever clip immediately precedes this one on the same track, INTO this one.
-   *  Absent means a plain hard cut — same "small JSON, cheap default path" reasoning as `transform`.
+  /** Absent means `IDENTITY_COLOR_GRADING` — same reasoning as `transform`/`effects`. Video/image clips
+   *  only, same gating as `effects`. See `ColorGrading`'s own doc comment for the master/channel
+   *  composition order this relies on. */
+  colorGrading?: ColorGrading;
+  /** Present only when Transform keyframing is ARMED for this clip — ordered ascending by `time`, each
+   *  `time` clamped to `[0, clipDuration(clip)]`. When present and non-empty, this — NOT `transform` —
+   *  is what both renderers resolve, via `timeline/keyframes.ts`'s `resolveClipTransform`. `transform`
+   *  itself is left untouched underneath (never read nor deleted while keyframes exist) specifically so
+   *  disarming keyframing has a well-defined static value to bake down to. Absent means "not
+   *  keyframed" — the existing single-`transform` behavior, completely unchanged; every clip that never
+   *  uses this feature sees zero difference. One keyframe = the FULL `ClipTransform` moving together
+   *  (all of offsetX/offsetY/scale/rotationDeg/crop at once), not independent per-field sub-tracks —
+   *  matches this codebase's "whole object, never a sparse patch stored" convention and keeps the
+   *  Inspector UI to one mini-timeline per property-group rather than nine. Video/image clips only,
+   *  same gating as `transform` itself. */
+  transformKeyframes?: TransformKeyframe[];
+  /** Mirrors `transformKeyframes`, for `ClipEffects` — see its own doc comment for the full reasoning. */
+  effectsKeyframes?: EffectsKeyframe[];
+  /** Mirrors `transformKeyframes`, for `ColorGrading` — same "present+non-empty is what both renderers
+   *  resolve, absent means not keyframed" contract, EXCEPT interpolation: unlike transform/effects
+   *  (plain numeric `lerp()`), a keyframed curve is HELD, not blended, between keyframes —
+   *  `resolveClipColorGrading` (`timeline/keyframes.ts`) just picks whichever keyframe currently applies.
+   *  Control points have no natural pointwise correspondence between two differently-shaped curves
+   *  (different point counts/positions), so cross-fading control points (or blending the derived LUTs,
+   *  which can't be re-edited back into control points for the UI) isn't attempted in v1 — mirrors
+   *  `resolveTextStyle`'s own existing precedent of holding non-numeric fields rather than interpolating
+   *  them. A clip with two very different curve keyframes will visibly SNAP at the keyframe boundary
+   *  rather than crossfade — a deliberate v1 simplification, not an oversight. */
+  colorGradingKeyframes?: ColorGradingKeyframe[];
+  /** Mirrors `transformKeyframes`, for a TEXT clip's `TextStyle` — same "present+non-empty is what both
+   *  renderers resolve, absent means not keyframed" contract. Lives on the CLIP (not the `Asset`, where
+   *  the rest of `TextStyle` lives) for the same reason `transformKeyframes` does: `Keyframe.time` is
+   *  clip-window-relative, a placement concept, not an asset one — if the same text asset were ever
+   *  placed as two clips, each placement needs its own independent keyframe timeline. `resolveTextStyle`
+   *  (`timeline/keyframes.ts`) only animates TextStyle's numeric fields (offsetX/offsetY/fontSize/
+   *  rotationDeg/strokeWidth/shadowOffsetX/shadowOffsetY/lineHeightMultiplier) — font/color/bold/italic/
+   *  align/backgroundColor/strokeColor/shadowColor have no sensible continuous interpolation, so a
+   *  bracketing pair holds the EARLIER keyframe's value for those, same "lerp what's numeric, hold what
+   *  isn't" split `resolveTextStyle`'s own comment documents. Video/image clips never carry this field —
+   *  same gating as `transformKeyframes` itself. */
+  textStyleKeyframes?: TextStyleKeyframe[];
+  /** Absent means no chroma key (plain opaque video) — same "small JSON, cheap default path"
+   *  reasoning as `transform`. Video/image clips only, same gating as `transform`/`effects` — see
+   *  `ChromaKeySettings`'s own doc comment for the full reasoning and the preview/export parity goal. */
+  chromaKey?: ChromaKeySettings;
+  /** A crossfade FROM whatever clip immediately precedes this one on the same track, INTO this one —
+   *  or, when there's no such predecessor (this clip opens the track, or a gap opened up before it),
+   *  a fade in from black (video/image), from fully transparent (text), or from silence (audio)
+   *  instead. Absent means a plain hard cut — same "small JSON, cheap default path" reasoning as
+   *  `transform`.
    *
    *  Deliberately NOT validated or repaired by any edit operation (`moveClip`/`trimClip`/`splitClip`/
-   *  `carveRange` all stay completely unaware of this field) — a transition only actually renders
-   *  when `timeline/transitions.ts`'s `findTransitionPartner` confirms, AT USE TIME, that the
-   *  preceding clip is still genuinely adjacent (`clipEnd(prev) === this.timelineStart`, zero gap)
-   *  and `duration` still fits within both clips' CURRENT lengths. An edit that breaks either
-   *  precondition (dragging a gap open, trimming a clip too short) just makes the transition stop
-   *  applying — falls back to a plain cut — rather than needing cleanup logic threaded through every
-   *  existing edit path. `type` is a real field, not hardcoded, so a future style is just a new union
-   *  member — but `"crossfade"` is the only value worth setting today. */
-  transitionIn?: { duration: number; type: "crossfade" };
+   *  `carveRange` all stay completely unaware of this field) — `timeline/transitions.ts`'s
+   *  `findTransitionPartner` resolves it fresh, AT USE TIME, into whichever of the two shapes above
+   *  currently applies: adjacent (`clipEnd(prev) === this.timelineStart`, zero gap) resolves to a
+   *  real blend partner; anything else (no predecessor, or one that's since drifted away) resolves to
+   *  a solo fade — `duration` is clamped to fit the CURRENT clip length either way, never dropped
+   *  outright. So an edit that breaks adjacency (dragging a gap open, trimming a clip too short)
+   *  doesn't need cleanup logic threaded through every existing edit path — the transition just
+   *  quietly becomes a solo fade instead of erroring or vanishing. Also valid on a TEXT or AUDIO clip,
+   *  not just video/image — `findTransitionPartner` itself is track-kind-agnostic, and every renderer
+   *  blends an adjacent pair the same way it blends video ones (text: see
+   *  `PlaybackEngine.drawTextLayer`'s own comment; audio: `buildExportPlan.ts`'s
+   *  `buildAudioTrackStream`, which always renders `type` as a plain FFmpeg `acrossfade` regardless of
+   *  which of the 12 `TransitionType` values is stored — the video-only wipe/slide/circle shapes have
+   *  no audio analog, so the Inspector's Style picker doesn't even offer them for an audio clip). */
+  transitionIn?: { duration: number; type: TransitionType };
+  /** A fade OUT to black (video/image), to fully transparent (text), or to silence (audio), over this
+   *  clip's own final `duration` seconds. Unlike `transitionIn`, there is no "blend into the next
+   *  clip" shape here — that boundary is already fully described by the NEXT clip's own
+   *  `transitionIn` (see its doc comment), so `transitionOut` is ALWAYS a solo effect:
+   *  `timeline/transitions.ts`'s `findTransitionOut` resolves it to `null` — same as absent —
+   *  whenever a genuine successor exists at all on this track, whether or not that successor actually
+   *  set a `transitionIn` of its own. Meaningful only when nothing follows this clip (it's the last
+   *  one on the track, or a gap opens up right after it). Absent means no fade-out, same "small JSON,
+   *  cheap default path" reasoning as `transform`. Also valid on a TEXT or AUDIO clip, not just
+   *  video/image — same reasoning as `transitionIn`. */
+  transitionOut?: { duration: number; type: TransitionType };
+  /** A continuous motion effect over this clip's own visible duration — see `TextAnimationType`'s own
+   *  doc comment for what it is and its preview-only export scope cut. Meaningful only on a TEXT clip
+   *  (a video/image clip can carry the field structurally, same "never validated up front" reasoning
+   *  as `transitionIn`, but `PlaybackEngine`/`buildExportPlan` only ever look at it on the text render
+   *  path). Absent means no animation, same "small JSON, cheap default path" reasoning as `transform`.
+   *  `highlightColor` only means anything for `type: "wordHighlight"` (see its own doc comment) —
+   *  structurally present-but-ignored for the other four, same "valid but inert" shape `strokeWidth`
+   *  already has when `strokeColor` is unset. `speed` is a multiplier on elapsed time (absent/1 = the
+   *  animation's own normal pace, 2 = twice as fast, 0.5 = half) applied uniformly by
+   *  `PlaybackEngine.drawAnimatedText` BEFORE calling any of `timeline/textAnimation.ts`'s pure
+   *  functions — so none of them need their own notion of speed, they just see a bigger or smaller
+   *  elapsed-time number than the clip's real playhead position. */
+  textAnimation?: { type: TextAnimationType; highlightColor?: string; speed?: number };
+  /** Meaningful only on a TEXT clip, same gating as `textAnimation`. Absent means no crop (full frame
+   *  visible), same "small JSON, cheap default path" reasoning as `transform`. See `TextCrop`'s own doc
+   *  comment for why this is a separate, frame-space mask rather than reusing `ClipTransform.crop`. */
+  textCrop?: TextCrop;
   /** Silences this clip's OWN embedded audio, independent of the track it's on. Distinct from a
    *  video track's `visible` flag (which already silences a hidden clip's audio as a side effect of
    *  hiding it — muting a clip you can still SEE is a genuinely different thing to ask for) and from
@@ -284,12 +564,12 @@ export interface Clip {
    *  means audible, same "small JSON, cheap default path" reasoning as `transform`. */
   mutedAudio?: boolean;
   /** Linear volume multiplier for this clip's OWN embedded audio, applied independently of
-   *  `mutedAudio` (a hard override — a muted clip stays silent regardless of `gain`, the browser's own
-   *  `element.muted`/`.volume` semantics, so toggling mute never loses a gain setting). `0..1`, not a
-   *  wider amplification range: the preview plays this back through a plain `<video>`/`<audio>`
-   *  element's native `.volume`, which the browser itself caps at 1 — going higher would need routing
-   *  through a Web Audio gain node, a real architecture change genuinely out of scope here. Absent
-   *  means `1` (unchanged), same "small JSON, cheap default path" reasoning as `transform`/`effects`. */
+   *  `mutedAudio` (a hard override — a muted clip stays silent regardless of `gain`; see
+   *  `AudioMixEngine.syncVideoClipAudio`, which folds both into one target on a dedicated `GainNode`).
+   *  Routed through Web Audio (`AudioMixEngine`), not a `<video>`/`<audio>` element's native `.volume`
+   *  (which the browser caps at 1) — so this can genuinely exceed 1 for real amplification, not just
+   *  attenuation; see `setClipGain`'s own ceiling for the UI-facing bound. Absent means `1` (unchanged),
+   *  same "small JSON, cheap default path" reasoning as `transform`/`effects`. */
   gain?: number;
 }
 
@@ -304,6 +584,29 @@ export interface Track {
   /** Audio tracks only. */
   muted: boolean;
   solo: boolean;
+  /** Linear volume multiplier for every clip on this track, on top of each clip's OWN `Clip.gain` —
+   *  the two multiply together (see `PlaybackEngine.activeAudioClips`), the same "track fader on top
+   *  of a per-clip trim" relationship a real mixing console has. Audio tracks only, same scope cut as
+   *  `muted`/`solo` — structurally present-but-ignored on a video/text track. Routed through a
+   *  dedicated per-track `GainNode` in `AudioMixEngine`, not folded into each clip's own node,
+   *  specifically so dragging this fader live doesn't restart any `AudioBufferSourceNode` — only the
+   *  one scalar on the shared node moves. Absent means `1` (unchanged), same "small JSON, cheap
+   *  default path" reasoning as `Clip.gain`; the `[0,4]` clamp `setTrackGain` applies is an ordinary
+   *  input-sanity bound, not a `GainNode` ceiling. */
+  gain?: number;
+  /** Stereo pan for every clip on this track, applied via the equal-power law (a plain crossfade
+   *  between L/R, not a simple L/R gain split — the same algorithm a native Web Audio `StereoPannerNode`
+   *  computes, and what `AudioMixEngine`'s per-track `StereoPannerNode` uses directly for live preview).
+   *  -1 is hard left, 0 is center, 1 is hard right. Applied AFTER `gain` in the signal chain — see
+   *  `AudioMixEngine`'s own per-track node-chain comment for why panning sits downstream of the fader
+   *  rather than upstream of it. Audio tracks only, same scope cut as `muted`/`solo`/`gain` —
+   *  structurally present-but-ignored on a video/text track. Absent means `0` (center), same "small
+   *  JSON, cheap default path" reasoning as `Clip.gain`/`Track.gain`; the `[-1,1]` clamp `setTrackPan`
+   *  applies is an ordinary input-sanity bound matching `StereoPannerNode.pan`'s own natural range. Not
+   *  applied to the master bus — see `Sequence.masterGain`'s sibling comment on why there's no
+   *  `Sequence.masterPan`: panning the whole mix isn't a per-channel routing question the same way it is
+   *  for an individual track, so the Mixer's Master strip has a fader but no pan knob. */
+  pan?: number;
 }
 
 export interface Sequence {
@@ -313,6 +616,14 @@ export interface Sequence {
   height: number;
   fps: number;
   tracks: Track[];
+  /** Overall mix level — the single master fader in the Mixer dialog, multiplying every audio track's
+   *  already-track-gained, already-clip-gained signal. Lives here (not a separate mixer-settings
+   *  object) because there's exactly one per sequence, same cardinality as `width`/`height`/`fps`.
+   *  Absent means `1`, same convention as `Track.gain`/`Clip.gain`. Applied live via
+   *  `AudioMixEngine.setMasterGain` (its `masterGain` node has existed since the engine's own
+   *  constructor, reserved for exactly this) and at export time as a final `volume=` stage after the
+   *  last `amix`, in both `buildExportPlan.ts` and `buildAudioOnlyExportPlan.ts`. */
+  masterGain?: number;
 }
 
 export interface ExportSettings {

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { describe, it } from "node:test";
-import { FONT_REGISTRY, fontById, fontFileFor, resolveFontVariant } from "../src/project/fonts.ts";
+import { FONT_REGISTRY, fontById, fontFileFor, readAssFontMetrics, resolveFontVariant } from "../src/project/fonts.ts";
+
+const FONTS_DIR = path.resolve(import.meta.dirname, "..", "assets", "fonts");
+function readFontBuffer(fileName: string): Buffer {
+  return fs.readFileSync(path.join(FONTS_DIR, fileName));
+}
 
 describe("FONT_REGISTRY", () => {
   it("every entry has a real regular file and a unique id/cssFamily", () => {
@@ -84,5 +91,43 @@ describe("fontFileFor", () => {
 
   it("moul (single weight) always resolves to its regular file", () => {
     assert.equal(fontFileFor(moul, true, true), "Moul-Regular.ttf");
+  });
+});
+
+describe("readAssFontMetrics", () => {
+  it("reads a font's real family name off its own name table (lato)", () => {
+    const metrics = readAssFontMetrics(readFontBuffer("Lato-Regular.ttf"));
+    assert.equal(metrics?.family, "Lato");
+  });
+
+  it("reads a Khmer font's family name correctly too (battambang)", () => {
+    const metrics = readAssFontMetrics(readFontBuffer("Battambang-Regular.ttf"));
+    assert.equal(metrics?.family, "Battambang");
+  });
+
+  it("every registered font's regular file parses to a non-empty family and a positive fontsize scale", () => {
+    for (const font of FONT_REGISTRY) {
+      const metrics = readAssFontMetrics(readFontBuffer(font.files.regular));
+      assert.ok(metrics, `${font.id} should parse`);
+      assert.ok(metrics!.family.length > 0, `${font.id} should have a non-empty family name`);
+      assert.ok(metrics!.fontsizeScale > 0, `${font.id} should have a positive fontsize scale`);
+    }
+  });
+
+  it("a font's own weight/style files all report the SAME family name (fontconfig groups them by it)", () => {
+    // Only fonts with more than one file are meaningful here — a single-weight font has nothing to
+    // compare against. Confirmed empirically for the whole registry before this feature was built; this
+    // guards against a future font addition silently breaking that assumption.
+    for (const font of FONT_REGISTRY) {
+      const variants = Object.values(font.files).filter((f): f is string => Boolean(f));
+      if (variants.length < 2) continue;
+      const names = variants.map((file) => readAssFontMetrics(readFontBuffer(file))?.family);
+      const unique = new Set(names);
+      assert.equal(unique.size, 1, `${font.id}'s weight/style files should share one family name, got ${JSON.stringify(names)}`);
+    }
+  });
+
+  it("returns null for bytes that aren't a well-formed font", () => {
+    assert.equal(readAssFontMetrics(new Uint8Array([1, 2, 3, 4])), null);
   });
 });

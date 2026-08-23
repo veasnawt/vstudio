@@ -2,12 +2,14 @@
 
 import React, { useRef, useState } from "react";
 import { filmstripUrl, thumbnailUrl, waveformUrl } from "../api/client.ts";
-import { BatchCommand, MoveClipCommand, TrimClipCommand } from "../commands/index.ts";
+import { BatchCommand, MoveClipCommand, SetClipTransitionCommand, SetClipTransitionOutCommand, TrimClipCommand } from "../commands/index.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { clipDuration, findClip } from "../project/createProject.ts";
 import type { Clip, Project, Track } from "../project/types.ts";
 import { useEditorStore } from "../store/editorStore.ts";
 import { snapPoints, snapTime } from "../timeline/queries.ts";
 import { formatDuration } from "../timeline/time.ts";
+import { DEFAULT_TRANSITION } from "../timeline/transitions.ts";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 
 /** Pixels the pointer must travel before a press turns into a drag. Without it, a slightly-shaky
@@ -74,10 +76,21 @@ function TimelineClipComponent({
   resolveTrackAt,
   onTargetTrackChange,
 }: Props) {
+  const t = useTranslation();
   const run = useEditorStore((s) => s.run);
   const select = useEditorStore((s) => s.select);
   const toggleSelect = useEditorStore((s) => s.toggleSelect);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
+  const setGroupMoveDelta = useEditorStore((s) => s.setGroupMoveDelta);
+  // Live seconds-delta broadcast by whichever OTHER selected clip is currently being drag-moved (see
+  // `groupMoveDelta`'s own doc comment in editorStore.ts) — read only when THIS clip is itself part of
+  // the current selection; the selector returns `null` otherwise, so an unselected clip's Zustand
+  // subscription never actually changes value while some unrelated clip is being group-dragged, and
+  // this component never re-renders for it. `preview` (this clip's OWN in-progress drag, set below)
+  // always wins over this when both would apply — a clip can't simultaneously be the one being
+  // dragged AND a passenger of someone else's drag.
+  const isSelected = selectedClipIds.includes(clip.id);
+  const groupMoveDelta = useEditorStore((s) => (isSelected ? s.groupMoveDelta : null));
 
   // A filmstrip backdrop for video/image clips, tiled across the clip's width via CSS rather than JS
   // — cheap, since it costs nothing beyond what the browser already does for any repeating background
@@ -145,6 +158,15 @@ function TimelineClipComponent({
   // A ref is the correct place for a value that mouse handlers need to read imperatively.
   const previewRef = useRef<{ start: number; duration: number; sourceIn: number; sourceOut: number; snapped: boolean } | null>(null);
   const dragRef = useRef<{ mode: DragMode; startX: number; origin: Clip; moved: boolean } | null>(null);
+  // Live feedback for an in-progress transition-duration drag (the amber handles at the edge of a
+  // clip that already has a transition set) — same local-state-plus-ref-mirror split as `preview`
+  // above and for the exact same reason: `beginTransitionDrag`'s mouse handlers run outside React and
+  // need to read the CURRENT value imperatively, not the one captured when the drag started. Kept
+  // entirely separate from `preview`/`beginDrag` rather than folded into `DragMode`, since this never
+  // touches the clip's own start/duration/sourceIn/sourceOut — only `transitionIn.duration`/
+  // `transitionOut.duration`, a completely different field.
+  const [transitionDrag, setTransitionDrag] = useState<{ side: "in" | "out"; duration: number } | null>(null);
+  const transitionDragRef = useRef<{ side: "in" | "out"; duration: number } | null>(null);
   /** The clip's own root element — see `beginDrag`'s long-press gate for why this needs direct,
    *  synchronous DOM access rather than going through React state/className (a React re-render is one
    *  tick too late to matter here, the same reasoning `VStudioApp`'s drag-block overlay uses elsewhere
@@ -168,7 +190,22 @@ function TimelineClipComponent({
   }
 
   const duration = preview?.duration ?? clipDuration(clip);
-  const start = preview?.start ?? clip.timelineStart;
+  // `preview` (this clip's OWN drag) wins outright when set; otherwise, a live `groupMoveDelta`
+  // shifts this clip along with whichever OTHER selected clip is currently being dragged — see
+  // `groupMoveDelta`'s own doc comment for why this is a separate mechanism from `preview` (a
+  // different component instance's local state can't reach this one directly).
+  const start = preview?.start ?? clip.timelineStart + (groupMoveDelta ?? 0);
+  // Live-drag values for the transition handles below — the in-flight `transitionDrag` value while
+  // actively dragging that specific side, else the last-committed duration from the clip itself.
+  // Clamped to this clip's own current on-screen `duration`: `clip.transitionIn`/`transitionOut`'s
+  // stored duration doesn't automatically shrink when the clip itself is trimmed shorter than its own
+  // transition (nothing round-trips through `findTransitionPartner`/`findTransitionOut`'s own
+  // authoritative clamp just from a plain trim), so without this the wedge/handle stayed sized to the
+  // OLD, longer duration — visibly overflowing past the clip's own shrunk right/left edge and
+  // overlapping whatever sits next to it, both mid-drag and after. Confirmed live: trimming a clip
+  // below its own transition length left the fade triangle hanging out over the gap indefinitely.
+  const transitionInDuration = Math.min((transitionDrag?.side === "in" ? transitionDrag.duration : clip.transitionIn?.duration) ?? 0, duration);
+  const transitionOutDuration = Math.min((transitionDrag?.side === "out" ? transitionDrag.duration : clip.transitionOut?.duration) ?? 0, duration);
 
   function beginDrag(event: React.MouseEvent | React.TouchEvent, mode: DragMode) {
     if (track.locked) return;
@@ -180,6 +217,16 @@ function TimelineClipComponent({
       // `lastTouchAtRef`'s own comment. Bail out completely: no selection change, no drag.
       return;
     }
+    // Alt+drag starting on a clip's BODY forces a marquee instead of a move — deliberately NOT
+    // intercepted here at all, just let it bubble to the lanes container's own `onMouseDown=
+    // {beginMarquee}` untouched (no `stopPropagation`/`preventDefault`, no selection change of our
+    // own). Without this, marquee-select is only reachable from genuinely empty lane space — fine on
+    // a sparse timeline, but a track packed edge-to-edge with clips (the common case once a project
+    // has more than a couple of cuts) leaves nowhere empty to START a rectangle from at all. Trim
+    // handles keep their own separate `mode` values and are deliberately excluded — "rubber-band
+    // select while grabbing a trim handle" isn't a meaningful gesture, and this would otherwise steal
+    // Alt+drag from any future trim-handle modifier behavior.
+    if (!isTouchEvent && mode === "move" && "altKey" in event && event.altKey) return;
     event.stopPropagation();
     preventDefaultIfMouse(event);
 
@@ -229,6 +276,12 @@ function TimelineClipComponent({
     const start = clientPoint(event);
     dragRef.current = { mode, startX: start.x, origin: { ...clip }, moved: false };
     targetTrackRef.current = track.id;
+    // Frozen once at drag start, reused by both `onMove` (to broadcast `groupMoveDelta` for the other
+    // group members' own live preview) and `onUp` (to build the final `BatchCommand`) — same "is this
+    // clip part of a bigger selection" resolution either already relies on: a clip not already selected
+    // before this drag started falls back to a solo `[clip.id]`, matching `applyTapSelection`'s own
+    // "starting a drag on an unselected clip replaces the selection" behavior above.
+    const groupIds = mode === "move" && selectedClipIds.includes(clip.id) ? selectedClipIds : [clip.id];
     // Read imperatively rather than via a reactive subscription — this only needs the CURRENT
     // playhead at the instant a drag starts, not a value that re-renders every clip on the timeline
     // 30-60 times a second during playback (which is exactly what a `useEditorStore((s) => s.playhead)`
@@ -293,6 +346,11 @@ function TimelineClipComponent({
         // waveform's own window into the source stays exactly what it already was. `best !== rawStart`
         // is a cheap, exact way to tell "did this land on a snap point" apart from "just where the
         // finger happens to be" — see `preview.snapped`'s own comment on why that distinction matters.
+        // Broadcast to every OTHER selected clip's own component instance (see `groupMoveDelta`'s own
+        // doc comment) so they visibly glide along with this one during the drag, instead of sitting
+        // frozen until the final commit snaps them into place all at once — this clip's OWN preview
+        // (just below) already moves it directly, so this is purely for the passengers.
+        if (groupIds.length > 1) setGroupMoveDelta(Math.max(0, best) - origin.timelineStart);
         updatePreview({
           start: Math.max(0, best),
           duration: originDuration,
@@ -356,31 +414,122 @@ function TimelineClipComponent({
       updatePreview(null);
       onTargetTrackChange(null);
       targetTrackRef.current = track.id;
+      // Stop broadcasting — every OTHER selected clip's own instance falls back to its plain
+      // committed `clip.timelineStart` again the instant `run(...)` below lands the real move anyway,
+      // but this is what stops them rendering the in-progress delta a frame early/if the drag is
+      // cancelled (`drag?.moved` false, nothing committed at all).
+      if (groupIds.length > 1) setGroupMoveDelta(null);
 
       if (drag?.moved && final) {
         // moveClip rejects a video↔audio track mismatch itself, surfacing a status message rather
         // than silently dropping the clip somewhere it can never render.
         if (drag.mode === "move") {
           const deltaSeconds = final.start - drag.origin.timelineStart;
-          const groupIds = selectedClipIds.includes(clip.id) ? selectedClipIds : [clip.id];
           if (groupIds.length > 1 && deltaSeconds !== 0) {
             // Every OTHER selected clip moves by the SAME time delta and stays on its OWN track —
             // only the clip actually under the pointer can change tracks; there's no single
             // meaningful "destination track" for clips that started on different ones. A clip on a
             // locked track is left out entirely rather than failing the whole group move.
-            const moves = [new MoveClipCommand(clip.id, targetTrackId, final.start)];
+            const targets: { id: string; trackId: string; targetStart: number }[] = [
+              { id: clip.id, trackId: targetTrackId, targetStart: final.start },
+            ];
             for (const id of groupIds) {
               if (id === clip.id) continue;
               const found = findClip(project, id);
               if (!found || found.track.locked) continue;
-              moves.push(new MoveClipCommand(id, found.track.id, found.clip.timelineStart + deltaSeconds));
+              targets.push({ id, trackId: found.track.id, targetStart: found.clip.timelineStart + deltaSeconds });
             }
+            // `moveClip` carves/trims/deletes whatever's already sitting in a clip's OWN destination
+            // range — correct for a single clip landing on top of unrelated ones, but a real hazard
+            // for a GROUP move applied one command at a time: an earlier command in the batch can
+            // carve straight into a groupmate that hasn't moved yet (still sitting in its OLD spot),
+            // corrupting or deleting it before its own move even runs — `findClip` then fails for
+            // that now-gone clip, the whole `BatchCommand` throws, and the ENTIRE group move silently
+            // reverts (confirmed directly: two adjacent selected clips dragged together came back
+            // completely unmoved). Every group member shifts by the exact SAME delta, so the group's
+            // own relative gaps never actually change — any mid-batch "collision" is purely an
+            // artifact of processing order, not a real one. Fixed by moving in the direction of
+            // travel: whichever clip's OWN destination is furthest along that direction is committed
+            // first, so by the time an earlier-in-travel-order clip's move runs, nothing still-
+            // unmoved is left sitting in the space it's about to occupy. Sorting the whole group by
+            // target position in one pass is safe across different tracks too — carving only ever
+            // affects clips sharing the SAME track, so cross-track ordering can't introduce new
+            // interference either way.
+            targets.sort((a, b) => (deltaSeconds > 0 ? b.targetStart - a.targetStart : a.targetStart - b.targetStart));
+            const moves = targets.map((target) => new MoveClipCommand(target.id, target.trackId, target.targetStart));
             run(new BatchCommand("Move Clips", moves));
           } else {
             run(new MoveClipCommand(clip.id, targetTrackId, final.start));
           }
         } else if (drag.mode === "trim-in") run(new TrimClipCommand(clip.id, "in", final.start));
         else run(new TrimClipCommand(clip.id, "out", final.start + final.duration));
+      }
+    }
+
+    const removeListeners = addDragListeners(onMove, onUp);
+  }
+
+  /** Drags the small handle at a transition's own boundary (see the JSX below) to change how long it
+   *  lasts, directly on the timeline — the on-canvas counterpart to the Inspector's numeric Duration
+   *  field, which stays as the precise-entry option. Deliberately NOT folded into `beginDrag`/
+   *  `DragMode` above: this never touches the clip's own start/duration/sourceIn/sourceOut, has no
+   *  snapping-to-other-clips or touch long-press-gating concern (there's no meaningful "multi-select a
+   *  transition handle" or "pan past it" gesture to disambiguate), and only ever runs on a clip that
+   *  already has this transition enabled (the corner-mark condition below) — there's no drag-to-create
+   *  gesture here, only drag-to-resize.
+   *
+   *  `side === "in"` grows by dragging RIGHTWARD (into the clip, lengthening the blend from the
+   *  previous clip); `side === "out"` grows by dragging LEFTWARD (into the clip, lengthening the fade
+   *  toward the next). Clamped loosely against this clip's own current on-screen `duration` purely so
+   *  the handle can't be dragged absurdly far past what's visible — the AUTHORITATIVE clamp against a
+   *  real partner's length or this clip's own trimmed length already happens at read time, in
+   *  `findTransitionPartner`/`findTransitionOut`, regardless of what ends up stored here. */
+  function beginTransitionDrag(event: React.MouseEvent | React.TouchEvent, side: "in" | "out") {
+    if (track.locked) return;
+    const existing = side === "in" ? clip.transitionIn : clip.transitionOut;
+    if (!existing) return;
+    const isTouch = "touches" in event;
+    if (isTouch) {
+      lastTouchAtRef.current = Date.now();
+    } else if (Date.now() - lastTouchAtRef.current < SYNTHETIC_MOUSE_GRACE_MS) {
+      // The browser's own ghost mousedown following the touch this handle just handled — see
+      // `beginDrag`'s identical check for the full reasoning.
+      return;
+    }
+    event.stopPropagation();
+    preventDefaultIfMouse(event);
+
+    const startPoint = clientPoint(event);
+    const startDuration = existing.duration;
+    const minDuration = 1 / project.sequence.fps;
+    let moved = false;
+
+    function onMove(moveEvent: MouseEvent | TouchEvent) {
+      const point = clientPoint(moveEvent);
+      const dx = point.x - startPoint.x;
+      const threshold = isTouch ? TOUCH_DRAG_THRESHOLD : DRAG_THRESHOLD;
+      if (!moved && Math.abs(dx) < threshold) return;
+      moved = true;
+
+      const deltaSeconds = (side === "in" ? dx : -dx) / pixelsPerSecond;
+      const next = Math.min(Math.max(minDuration, startDuration + deltaSeconds), duration);
+      transitionDragRef.current = { side, duration: next };
+      setTransitionDrag({ side, duration: next });
+    }
+
+    function onUp(upEvent: MouseEvent | TouchEvent) {
+      removeListeners();
+      if ("touches" in upEvent) lastTouchAtRef.current = Date.now();
+      const final = transitionDragRef.current;
+      transitionDragRef.current = null;
+      setTransitionDrag(null);
+
+      if (moved && final) {
+        if (side === "in") {
+          run(new SetClipTransitionCommand(clip.id, { ...(clip.transitionIn ?? DEFAULT_TRANSITION), duration: final.duration }));
+        } else {
+          run(new SetClipTransitionOutCommand(clip.id, { ...(clip.transitionOut ?? DEFAULT_TRANSITION), duration: final.duration }));
+        }
       }
     }
 
@@ -394,7 +543,11 @@ function TimelineClipComponent({
       ref={rootRef}
       role="button"
       tabIndex={0}
-      aria-label={`${assetName}, ${formatDuration(duration)}`}
+      // Read by Timeline's own marquee (drag-to-select-several-clips) hit test, which finds every
+      // clip element live via `querySelectorAll` rather than tracking a parallel id→rect map by hand —
+      // see that gesture's own comment in Timeline.tsx for why.
+      data-clip-id={clip.id}
+      aria-label={t("{name}, {duration}", { name: assetName, duration: formatDuration(duration) })}
       onMouseDown={(e) => beginDrag(e, "move")}
       onTouchStart={(e) => beginDrag(e, "move")}
       onClick={(e) => {
@@ -438,11 +591,11 @@ function TimelineClipComponent({
               ? "border-emerald-400/40 bg-emerald-500/20 hover:bg-emerald-500/30"
               : "border-sky-400/40 bg-sky-500/20 hover:bg-sky-500/30"
       } ${
-        // A stronger "picked up" look while any drag is active — a shadow + slight scale + raised
-        // z-index instead of the old plain `opacity-80`, so the clip being moved reads as elevated/
-        // grabbed rather than just faded. `z-20`: above sibling clips and the drop-target highlight
-        // (z-10), below the playhead/export markers (z-30) — never fights either.
-        preview ? "z-20 scale-[1.02] opacity-90 shadow-lg shadow-black/60" : ""
+        // A stronger "picked up" look while an active drag is a MOVE — a shadow + slight scale +
+        // raised z-index instead of the old plain `opacity-80`, so the clip being moved reads as
+        // elevated/grabbed rather than just faded. `z-20`: above sibling clips and the drop-target
+        // highlight (z-10), below the playhead/export markers (z-30) — never fights either.
+        preview ? (dragRef.current?.mode === "move" ? "z-20 scale-[1.02] opacity-90 shadow-lg shadow-black/60" : "z-20 shadow-lg shadow-black/60") : ""
       }`}
     >
       {thumbnail && (
@@ -475,15 +628,95 @@ function TimelineClipComponent({
         />
       )}
       {clip.transitionIn && (
-        // A static corner mark — the only on-timeline sign a transition exists at all, since there's
-        // no drag-to-create gesture yet (Inspector-only for this pass, same as how Effects shipped
-        // before Transform's on-canvas handles arrived later). Pure CSS triangle via border trick,
-        // not an icon, so it never depends on a font/asset load finishing first.
-        <div
-          aria-hidden
-          title="Crossfades from the previous clip"
-          className="pointer-events-none absolute left-0 top-0 z-10 h-0 w-0 border-t-[14px] border-r-[14px] border-t-amber-300/90 border-r-transparent"
-        />
+        <>
+          {/* The classic DAW/NLE fade-triangle: a "/" ramp line over a matching wedge, spanning the
+              blend zone's own width — heaviest at the left edge (gain 0, this clip hasn't faded in
+              yet) tapering to nothing at the right edge (gain 1, fully in). The wedge itself is a
+              plain DIM (near-black, low opacity), not a tinted color — a saturated fill here read as
+              a big ugly blotch sitting on top of the thumbnail/waveform, especially on short clips
+              where the wedge covers a large fraction of the visible box; a neutral scrim reads as
+              "quieter here" against any backdrop instead, the same convention Premiere/Audition use.
+              The diagonal itself is plain white for the same reason, not an accent color — a colored
+              line reads as a UI decoration and can wash out or clash depending on what's underneath
+              (thumbnail, waveform, a text clip's own blue), where white stays legible and neutral
+              against literally anything. Drawn as two overlaid strokes — a soft dark halo, then a
+              crisp white line on top — since a flat white line alone can disappear against a light
+              thumbnail frame; the halo is what keeps it readable there too. An SVG with
+              `preserveAspectRatio="none"` rather than a CSS-triangle/clip-path div: it stretches
+              cleanly to whatever width/height this box ends up at (duration × zoom, row height) with
+              zero JS trig, and `vectorEffect="non-scaling-stroke"` keeps the line a crisp, constant
+              pixel width despite that non-uniform stretch. Tracks `transitionInDuration` live while
+              this side is actively being dragged (see its own comment above). */}
+          <svg
+            aria-hidden
+            className="pointer-events-none absolute left-0 top-0 z-[5]"
+            // `height: "100%"` is NOT redundant with the `absolute` positioning below — an <svg> is a
+            // CSS replaced element with its own intrinsic aspect ratio (1:1, from this 100×100
+            // viewBox), and per the replaced-element sizing rules, a height left at `auto` falls back
+            // to THAT ratio instead of stretching to fill top/bottom, even with both set. Confirmed
+            // live: without this, a wide (long-duration) wedge silently grew as TALL as it was wide,
+            // pushing its own bottom point far past the clip's actual bottom edge — exactly the
+            // "bottom corner isn't pinned" bug this fixes.
+            style={{ width: Math.max(1, transitionInDuration * pixelsPerSecond), height: "100%" }}
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+          >
+            <title>{t("Crossfades from the previous clip")}</title>
+            <polygon points="0,0 100,0 0,100" fill="rgba(0,0,0,0.38)" />
+            <line x1="100" y1="0" x2="0" y2="100" stroke="rgba(0,0,0,0.5)" strokeWidth="3" vectorEffect="non-scaling-stroke" />
+            <line x1="100" y1="0" x2="0" y2="100" stroke="rgba(255,255,255,0.9)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />
+          </svg>
+          {!track.locked && (
+            // Drag-to-resize handle at the blend zone's own boundary — the on-timeline counterpart to
+            // the Inspector's numeric Duration field (see `beginTransitionDrag`'s own comment). No
+            // permanent visible marker (that was tried and looked bad sitting on top of the "/" line
+            // itself) — invisible at rest, same as the trim handles just below, with only a `cursor:
+            // ew-resize` on hover as the discovery cue. Full height, matching the trim handles' own
+            // hit-target width, so it's just as forgiving to grab with a mouse or finger despite being
+            // unmarked.
+            <div
+              role="separator"
+              aria-label={t("Adjust transition duration")}
+              onMouseDown={(e) => beginTransitionDrag(e, "in")}
+              onTouchStart={(e) => beginTransitionDrag(e, "in")}
+              className="absolute inset-y-0 z-10 w-3 touch-none cursor-ew-resize"
+              style={{ left: transitionInDuration * pixelsPerSecond - 6 }}
+            />
+          )}
+        </>
+      )}
+      {clip.transitionOut && (
+        <>
+          {/* `transitionIn`'s own "\" ramp, mirrored to the right edge — heaviest at the right (gain
+              0, the clip has fully faded out by the end) tapering to nothing where the fade-out zone
+              begins (gain 1, still full volume/opacity). Same dim-scrim-plus-thin-line approach, just
+              the diagonal and tapering direction flipped. */}
+          <svg
+            aria-hidden
+            className="pointer-events-none absolute right-0 top-0 z-[5]"
+            // See `transitionIn`'s own SVG above for why `height: "100%"` (not just `inset-y-0`) is
+            // required to keep the bottom point pinned to the clip's actual bottom edge.
+            style={{ width: Math.max(1, transitionOutDuration * pixelsPerSecond), height: "100%" }}
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+          >
+            <title>{t("Fades out at the end of this clip")}</title>
+            <polygon points="100,0 0,0 100,100" fill="rgba(0,0,0,0.38)" />
+            <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(0,0,0,0.5)" strokeWidth="3" vectorEffect="non-scaling-stroke" />
+            <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(255,255,255,0.9)" strokeWidth="1.25" vectorEffect="non-scaling-stroke" />
+          </svg>
+          {!track.locked && (
+            // `transitionIn`'s own handle, mirrored — invisible at rest for the same reason.
+            <div
+              role="separator"
+              aria-label={t("Adjust transition duration")}
+              onMouseDown={(e) => beginTransitionDrag(e, "out")}
+              onTouchStart={(e) => beginTransitionDrag(e, "out")}
+              className="absolute inset-y-0 z-10 w-3 touch-none cursor-ew-resize"
+              style={{ right: transitionOutDuration * pixelsPerSecond - 6 }}
+            />
+          )}
+        </>
       )}
       <span className="pointer-events-none relative z-10 block truncate bg-gradient-to-b from-black/40 to-transparent px-2 py-1 text-[11px] font-medium text-white/90">
         {assetName}
@@ -496,14 +729,14 @@ function TimelineClipComponent({
               of frustration in a timeline, and on touch an 8px hit area is close to ungrabbable. */}
           <div
             role="separator"
-            aria-label="Trim clip start"
+            aria-label={t("Trim clip start")}
             onMouseDown={(e) => beginDrag(e, "trim-in")}
             onTouchStart={(e) => beginDrag(e, "trim-in")}
             className="absolute inset-y-0 left-0 z-10 w-3 touch-none cursor-ew-resize bg-white/0 transition group-hover:bg-white/25 lg:w-2"
           />
           <div
             role="separator"
-            aria-label="Trim clip end"
+            aria-label={t("Trim clip end")}
             onMouseDown={(e) => beginDrag(e, "trim-out")}
             onTouchStart={(e) => beginDrag(e, "trim-out")}
             className="absolute inset-y-0 right-0 z-10 w-3 touch-none cursor-ew-resize bg-white/0 transition group-hover:bg-white/25 lg:w-2"

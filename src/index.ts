@@ -5,6 +5,7 @@
  *  expected to reach for it. */
 
 export { VStudioApp } from "./ui/VStudioApp.tsx";
+export { reportError } from "./api/crashLog.ts";
 
 export type { Asset, AssetKind, Clip, ClipTransform, ExportSettings, Project, Sequence, TextStyle, Track, TrackKind } from "./project/types.ts";
 export {

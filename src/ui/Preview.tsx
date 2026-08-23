@@ -5,7 +5,9 @@ import { Maximize, Pause, Play, Redo, SkipBack, SkipForward, StepBack, StepForwa
 import { mediaUrl } from "../api/client.ts";
 import { sequenceDuration } from "../project/createProject.ts";
 import { PlaybackEngine } from "../playback/PlaybackEngine.ts";
+import { computeVisibleClipBoxes, hitTestClip } from "../playback/visibleClips.ts";
 import { useEditorStore } from "../store/editorStore.ts";
+import { useTranslation } from "../i18n/useTranslation.ts";
 import { TransformHandles } from "./TransformHandles.tsx";
 import { TextTransformHandles } from "./TextTransformHandles.tsx";
 import { RemoveObjectOverlay } from "./RemoveObjectOverlay.tsx";
@@ -86,6 +88,17 @@ export function Preview() {
   // window grew back. Computing the exact letterbox-fit size fresh from the STABLE outer panel's own
   // box (which the canvas's size can never feed back into) sidesteps that feedback loop entirely.
   const [displaySize, setDisplaySizeState] = useState<{ width: number; height: number } | null>(null);
+  // How far the canvas is deliberately under-filling `previewBoxRef`, `1` = "Fit" (today's default,
+  // unchanged behavior). Zoom-OUT only (never above 1) — the point is opening up reachable space
+  // around an oversized (large Transform scale/fontSize) clip's own on-canvas handles, which shrinking
+  // the canvas alone can't do (see `TransformHandles`' own `stageEl` prop comment for why): the canvas
+  // shrinks but `previewBoxRef` stays the same size, so the slack between them is what a clamped
+  // corner/rotate handle actually has room to move into. Local state, not the Zustand store — same
+  // "ephemeral view state" precedent `displaySize` above already sets; nothing outside this component
+  // needs the NUMBER, only `previewBoxRef`'s own (already-DOM) rect, threaded to the handle components
+  // below as `stageEl`.
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const t = useTranslation();
 
   const project = useEditorStore((s) => s.project);
   const playing = useEditorStore((s) => s.playing);
@@ -96,6 +109,13 @@ export function Preview() {
   const canRedo = useEditorStore((s) => s.canRedo);
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
+  // Stable action references (never change identity — see editorStore's own creator), so subscribing
+  // to them costs no extra re-renders; `playhead` itself is read IMPERATIVELY inside the click handler
+  // below instead of via a reactive `useEditorStore((s) => s.playhead)` subscription, which would
+  // otherwise re-render this whole component on every playhead tick during playback for a value only
+  // ever needed at the instant of a click.
+  const select = useEditorStore((s) => s.select);
+  const toggleSelect = useEditorStore((s) => s.toggleSelect);
 
   // The engine is created once and reads live state through getters rather than taking props. If it
   // were re-created whenever the project changed, every edit would tear down and rebuild the media
@@ -106,6 +126,9 @@ export function Preview() {
       getPlayhead: () => useEditorStore.getState().playhead,
       isPlaying: () => useEditorStore.getState().playing,
       getLiveOverrides: () => useEditorStore.getState().livePreviewOverrides,
+      getLiveTrackGainPreview: () => useEditorStore.getState().livePreviewTrackGain,
+      getLiveTrackPanPreview: () => useEditorStore.getState().livePreviewTrackPan,
+      getLiveMasterGainPreview: () => useEditorStore.getState().livePreviewMasterGain,
       onTimeUpdate: (seconds) => useEditorStore.getState().setPlayhead(seconds),
       onEnded: () => useEditorStore.getState().setPlaying(false),
       mediaUrlFor: (assetId) => {
@@ -116,7 +139,14 @@ export function Preview() {
       },
     });
     engineRef.current = engine;
-    return () => engine.detach();
+    useEditorStore.getState().setPlaybackEngine(engine);
+    return () => {
+      // Cleared before `detach()` so `LevelMeter`'s own rAF loop (reading `playbackEngine` via
+      // `getState()`, not a subscription) sees `null` and stops polling before the graph itself tears
+      // down, instead of racing a call into a half-disposed engine.
+      useEditorStore.getState().setPlaybackEngine(null);
+      engine.detach();
+    };
   }, []);
 
   // Separate from engine creation above: this fires once the canvas ref callback has actually run
@@ -140,7 +170,11 @@ export function Preview() {
       const availW = box.clientWidth;
       const availH = box.clientHeight;
       if (availW <= 0 || availH <= 0) return;
-      const scale = Math.min(availW / seqW, availH / seqH);
+      // `previewZoom` under-fills the SAME stable `box` rather than shrinking it — `box` itself never
+      // changes size, so the slack this opens up between the (now smaller) canvas and `box`'s own
+      // edges is exactly what `TransformHandles`/`TextTransformHandles` clamp their handles into via
+      // the `stageEl` prop below. At the default `previewZoom = 1` this is identical to before.
+      const scale = Math.min(availW / seqW, availH / seqH) * previewZoom;
       const width = Math.max(1, Math.round(seqW * scale));
       const height = Math.max(1, Math.round(seqH * scale));
       setDisplaySizeState({ width, height });
@@ -150,15 +184,71 @@ export function Preview() {
     observer.observe(box);
     recompute();
     return () => observer.disconnect();
-  }, [project?.sequence.width, project?.sequence.height]);
+  }, [project?.sequence.width, project?.sequence.height, previewZoom]);
 
   const total = project ? sequenceDuration(project) : 0;
   const empty = total <= 0;
 
+  // Click-to-select directly in the preview — the on-canvas counterpart to clicking a clip on the
+  // Timeline. Deliberately just a plain `onClick` on the canvas itself, not a separate overlay div:
+  // `TransformHandles`/`TextTransformHandles`' own move-handle already covers the CURRENTLY selected
+  // clip's whole box with its own `pointer-events-auto` element (and `stopPropagation`s its mousedown),
+  // and those handles are separate, `position: fixed` siblings rather than DOM descendants of the
+  // canvas — so a click that lands on a handle is never even a candidate to bubble through here, no
+  // coordination needed between the two. This only ever fires for a click whose real target IS the
+  // canvas: empty frame area, or a clip with no handle currently drawn over that exact point.
+  function handleCanvasClick(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (!project || !canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const rect = canvas.getBoundingClientRect();
+    const seqWidth = project.sequence.width;
+    const seqHeight = project.sequence.height;
+    const cssScale = seqWidth > 0 ? rect.width / seqWidth : 0;
+    if (cssScale <= 0) return;
+
+    const point = { x: (event.clientX - rect.left) / cssScale, y: (event.clientY - rect.top) / cssScale };
+    const playhead = useEditorStore.getState().playhead;
+    const boxes = computeVisibleClipBoxes(project, playhead, context, seqWidth, seqHeight);
+    const clipId = hitTestClip(boxes, point);
+    const additive = event.ctrlKey || event.metaKey;
+
+    if (clipId) {
+      if (additive) toggleSelect(clipId);
+      else select([clipId]);
+    } else if (!additive) {
+      // Matches Timeline's own "click empty lane space to deselect" convention (Timeline.tsx's
+      // `lanesRef` onClick) — clicking empty frame area is the canvas equivalent of that.
+      select([]);
+    }
+  }
+
   return (
     <section ref={panelRef} className="flex h-full min-h-0 flex-col bg-[#0a0c10]">
-      <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
-        <div ref={previewBoxRef} className="relative flex h-full w-full items-center justify-center">
+      <div
+        onClick={(e) => {
+          // The thin outer margin (this div's own `p-4`) outside `previewBoxRef` — same direct-click-
+          // only guard, same reasoning, just one layer further out; see that div's own onClick comment.
+          if (e.target === e.currentTarget && !(e.ctrlKey || e.metaKey)) select([]);
+        }}
+        className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4"
+      >
+        <div
+          ref={previewBoxRef}
+          onClick={(e) => {
+            // The letterbox/pillarbox padding around the canvas when the sequence's own aspect ratio
+            // doesn't fill this box — a SEPARATE element from the canvas itself (see the sizing
+            // comment below: this div is `h-full w-full`, the canvas is only ever as big as the
+            // sequence's own proportions allow within it), so `handleCanvasClick`'s own hit-test never
+            // sees a click that lands out here at all. `e.target === e.currentTarget` is what limits
+            // this to a DIRECT click on the padding itself — any click that bubbles up from a real
+            // descendant (the canvas, a transform handle, the empty-state text) is ignored here
+            // regardless of whether that descendant stops propagation on its own, so this can't
+            // double-fire alongside `handleCanvasClick`'s own selection logic.
+            if (e.target === e.currentTarget && !(e.ctrlKey || e.metaKey)) select([]);
+          }}
+          className="relative flex h-full w-full items-center justify-center"
+        >
           {/* Explicit pixel width/height, computed in JS from the STABLE outer box above (see the
               effect) — not CSS `aspect-ratio` + `max-h-full`/`max-w-full` against the canvas's OWN
               attribute. That combination let the canvas's backing-store attribute (now shrunk for
@@ -174,15 +264,16 @@ export function Preview() {
               easy to mistake for each other with only `bg-black` against `bg-[#0a0c10]` before. */}
           <canvas
             ref={setCanvas}
+            onClick={handleCanvasClick}
             className="bg-black shadow-2xl ring-1 ring-white/15"
             style={{ width: `${displaySize?.width ?? 1}px`, height: `${displaySize?.height ?? 1}px` }}
           />
-          <TransformHandles canvas={canvas} />
-          <TextTransformHandles canvas={canvas} />
+          <TransformHandles canvas={canvas} stageEl={previewBoxRef.current} />
+          <TextTransformHandles canvas={canvas} stageEl={previewBoxRef.current} />
           <RemoveObjectOverlay canvas={canvas} />
           {empty && (
             <p className="pointer-events-none absolute text-xs text-white/35">
-              Add a clip to the timeline to see it here
+              {t("Add a clip to the timeline to see it here")}
             </p>
           )}
         </div>
@@ -199,13 +290,19 @@ export function Preview() {
           middle (Preview) column and reachable only under Media/Inspector where nothing else overlaps
           it — exactly the bug this replaced. */}
       <div className="pointer-events-none relative flex items-center border-t border-white/10 px-3 py-2">
-        {/* Undo/redo bookend this row (far left/right) around the centered playback cluster — moved
-            here from the bottom toolbar so they sit directly next to the controls they most often
-            follow (undo a trim, immediately hit play to check it), and so that already-crowded
-            icon-only row (see its own comment on running out of phone width) has two fewer buttons. */}
-        <div className="pointer-events-auto z-30 flex items-center">
-          <ControlButton onClick={undo} label="Undo (Ctrl+Z)" disabled={!canUndo}>
+        {/* Undo/redo sit together at the row's left edge — moved here from the bottom toolbar so they
+            sit directly next to the controls they most often follow (undo a trim, immediately hit
+            play to check it), and so that already-crowded icon-only row (see its own comment on
+            running out of phone width) has two fewer buttons. Kept as a PAIR (not split to bookend
+            the row) — undo/redo are one conceptual control, and reaching for one right after the
+            other is the whole point of the shortcut; splitting them across the bar just made that a
+            wider mouse trip for no benefit. */}
+        <div className="pointer-events-auto z-30 flex items-center gap-1">
+          <ControlButton onClick={undo} label={t("Undo (Ctrl+Z)")} disabled={!canUndo}>
             <Undo size={16} />
+          </ControlButton>
+          <ControlButton onClick={redo} label={t("Redo (Ctrl+Shift+Z)")} disabled={!canRedo}>
+            <Redo size={16} />
           </ControlButton>
         </div>
 
@@ -213,27 +310,58 @@ export function Preview() {
             undo/redo buttons — a plain flex row would only visually center if both sides happened to
             be the same width, which is the left/right-hugging look this fixes. */}
         <div className="pointer-events-auto absolute left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
-          <ControlButton onClick={() => setPlayhead(0)} label="Go to start" disabled={empty}>
+          <ControlButton onClick={() => setPlayhead(0)} label={t("Go to start")} disabled={empty}>
             <SkipBack size={16} />
           </ControlButton>
-          <ControlButton onClick={() => stepFrames(-1)} label="Previous frame" disabled={empty}>
+          <ControlButton onClick={() => stepFrames(-1)} label={t("Previous frame")} disabled={empty}>
             <StepBack size={16} />
           </ControlButton>
-          <ControlButton onClick={togglePlay} label={playing ? "Pause (Space)" : "Play (Space)"} disabled={empty} primary>
+          <ControlButton onClick={togglePlay} label={playing ? t("Pause (Space)") : t("Play (Space)")} disabled={empty} primary>
             {playing ? <Pause size={22} /> : <Play size={22} />}
           </ControlButton>
-          <ControlButton onClick={() => stepFrames(1)} label="Next frame" disabled={empty}>
+          <ControlButton onClick={() => stepFrames(1)} label={t("Next frame")} disabled={empty}>
             <StepForward size={16} />
           </ControlButton>
-          <ControlButton onClick={() => setPlayhead(total)} label="Go to end" disabled={empty}>
+          <ControlButton onClick={() => setPlayhead(total)} label={t("Go to end")} disabled={empty}>
             <SkipForward size={16} />
           </ControlButton>
         </div>
 
-        {/* `ml-auto` on this WRAPPER (not the resolution readout itself) so the fullscreen/redo stay
-            pushed to the right and reachable at every width, even below `xl` where the readout goes
-            `hidden` — see that span's own comment for why it specifically is hidden there. */}
+        {/* `ml-auto` on this WRAPPER (not the resolution readout itself) so fullscreen stays pushed to
+            the right and reachable at every width, even below `xl` where the readout goes `hidden` —
+            see that span's own comment for why it specifically is hidden there. */}
         <div className="pointer-events-auto z-30 ml-auto flex items-center gap-2">
+          {/* Preview canvas zoom — OUT only (never past "Fit"), independent of any clip's own
+              Transform scale/fontSize. Same button style/convention as Timeline's own zoom cluster
+              (`Timeline.tsx`), including the "click the readout to reset" affordance — deliberately
+              NOT the same Ctrl/Cmd +/- shortcut, which is already globally bound to Timeline zoom. */}
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => setPreviewZoom((z) => Math.max(0.25, z / 1.25))}
+              aria-label={t("Zoom preview out")}
+              title={t("Zoom preview out")}
+              className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white"
+            >
+              −
+            </button>
+            <button
+              onClick={() => setPreviewZoom(1)}
+              aria-label={t("Reset preview zoom")}
+              title={t("Reset preview zoom")}
+              className="min-h-[26px] min-w-[3.5ch] rounded px-1 text-center font-mono text-[11px] tabular-nums text-white/45 transition hover:bg-white/10 hover:text-white"
+            >
+              {previewZoom === 1 ? t("Fit") : `${Math.round(previewZoom * 100)}%`}
+            </button>
+            <button
+              onClick={() => setPreviewZoom((z) => Math.min(1, z * 1.25))}
+              disabled={previewZoom >= 1}
+              aria-label={t("Zoom preview in")}
+              title={t("Zoom preview in")}
+              className="flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-default disabled:opacity-30"
+            >
+              +
+            </button>
+          </div>
           {/* Hidden below `xl`, not `lg` — this bar is the PREVIEW column's own width, not the whole
               viewport, and at `lg` (1024px) that column is only ~1024 − 240 − 260 ≈ 520px after Media
               and Inspector take their fixed share: not enough room next to the centered playback
@@ -251,13 +379,10 @@ export function Preview() {
               iPhone Safari has no Fullscreen API for arbitrary elements at all, so a dead button here
               would be actively misleading rather than just inert. */}
           {fullscreenSupported && (
-            <ControlButton onClick={toggleFullscreen} label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+            <ControlButton onClick={toggleFullscreen} label={isFullscreen ? t("Exit fullscreen") : t("Fullscreen")}>
               <Maximize size={16} />
             </ControlButton>
           )}
-          <ControlButton onClick={redo} label="Redo (Ctrl+Shift+Z)" disabled={!canRedo}>
-            <Redo size={16} />
-          </ControlButton>
         </div>
       </div>
     </section>
