@@ -39,7 +39,7 @@ const MAX_TIMELINE_HEIGHT_RATIO = 0.75;
 const CHROME_HEIGHT = 93;
 /** Preview's floor: short of this, a letterboxed frame stops reading as an image at all. Used to
  *  derive how much Timeline is allowed to claim on a short viewport — see `timelineHeight`'s comment
- *  in `VStudioApp` for why this replaced an earlier, looser ratio-of-viewport attempt. */
+ *  in `VCutApp` for why this replaced an earlier, looser ratio-of-viewport attempt. */
 const MIN_PREVIEW_HEIGHT = 120;
 
 /** Shrinks `height` only as far as needed to guarantee Preview keeps `MIN_PREVIEW_HEIGHT`, given how
@@ -194,7 +194,7 @@ function StatusBar({
           horizontal overflow scroll on a phone — see the comment below), and neither of those two
           pieces of text is something a user is trying to TAP; keeping them here only ever cost this
           row space without adding anything reachable. Below `lg`, Media/Properties have no permanent
-          side column anymore (see VStudioApp's own comment on `mobileSheet`) — this is where they're
+          side column anymore (see VCutApp's own comment on `mobileSheet`) — this is where they're
           reached instead, which pushed the button count past what a phone's width can show without
           scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
       <div className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
@@ -259,6 +259,8 @@ function StatusBar({
         {showTransitionMenu && foundForTransition && (
           <TransitionPickerMenu
             anchorRef={transitionButtonRef}
+            isAudioTrack={foundForTransition.track.kind === "audio"}
+            isTextTrack={foundForTransition.track.kind === "text"}
             activeIn={foundForTransition.clip.transitionIn?.type ?? null}
             activeOut={foundForTransition.clip.transitionOut?.type ?? null}
             onChangeIn={(type) => {
@@ -303,7 +305,7 @@ function StatusBar({
         </ToolbarButton>
 
         {/* Media/Properties, mobile-only — desktop keeps its permanent side columns (see
-            VStudioApp's grid) and never sets `mobileSheet`, so these stay irrelevant there regardless
+            VCutApp's grid) and never sets `mobileSheet`, so these stay irrelevant there regardless
             of `lg:hidden`. Toggling: tapping the already-open one returns to Timeline, matching
             `active`'s highlighted state always reflecting what's actually showing below. */}
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10 lg:hidden" />
@@ -333,8 +335,8 @@ function StatusBar({
 }
 
 /** Persistent save-state indicator — "Saving…" / "Unsaved changes" / "All changes saved" — moved into
- *  the header (see VStudioApp's own JSX) out of the toolbar footer, which had no room to spare for
- *  text that isn't a button. The header has exactly three other things in it (the "VStudio" wordmark,
+ *  the header (see VCutApp's own JSX) out of the toolbar footer, which had no room to spare for
+ *  text that isn't a button. The header has exactly three other things in it (the "VCut" wordmark,
  *  the project title, the Export button), so this is genuinely uncrowded space by comparison. */
 function SaveStatus() {
   const dirty = useEditorStore((s) => s.dirty);
@@ -405,11 +407,11 @@ function StatusToast() {
   );
 }
 
-/** Click-to-rename project title, sitting in the header next to "VStudio". `project.name` (not the
+/** Click-to-rename project title, sitting in the header next to "VCut". `project.name` (not the
  *  `projectName` prop a host app like BP Studio passes in) is the only thing this reads or writes —
  *  that prop only ever SEEDS `project.name` at creation time (see `load`'s own comment), so once a
  *  project exists its name lives entirely in the project itself, and a rename here is exactly as
- *  durable/visible as any other edit (autosaved, and reflected back in VStudio's own project list). */
+ *  durable/visible as any other edit (autosaved, and reflected back in VCut's own project list). */
 function EditableProjectTitle() {
   const name = useEditorStore((s) => s.project?.name ?? "");
   const renameProject = useEditorStore((s) => s.renameProject);
@@ -473,17 +475,17 @@ function EditableProjectTitle() {
   );
 }
 
-interface VStudioAppProps {
+interface VCutAppProps {
   projectId: string;
   projectName?: string;
-  // Optional: a host-embedded editor (BP Studio's `<iframe>`, today) has no "VStudio project list" of
-  // its own to go back to, so VStudioApp itself stays agnostic about whether one exists rather than
+  // Optional: a host-embedded editor (BP Studio's `<iframe>`, today) has no "VCut project list" of
+  // its own to go back to, so VCutApp itself stays agnostic about whether one exists rather than
   // assuming "/" is always a valid place to send the user — see `edit/page.tsx`'s own comment on how
   // it decides whether to pass this.
   onHome?: () => void;
 }
 
-function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
+function VCutAppInner({ projectId, projectName, onHome }: VCutAppProps) {
   const load = useEditorStore((s) => s.load);
   const loading = useEditorStore((s) => s.loading);
   const loadError = useEditorStore((s) => s.loadError);
@@ -503,7 +505,7 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   }, []);
 
   // Catches errors OUTSIDE React's own render cycle — `ErrorBoundary` (wrapping this whole component,
-  // see `VStudioApp`'s own export below) only ever sees throws during render; an error inside an event
+  // see `VCutApp`'s own export below) only ever sees throws during render; an error inside an event
   // handler, a `setTimeout`/async callback, or `PlaybackEngine`'s own imperative (non-React) code
   // reaches here instead. Routed through the same `reportError` the boundary uses, so both land in the
   // same crash log regardless of which path caught them.
@@ -530,7 +532,12 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   // and Properties each getting a permanently docked, always-partially-visible slot below Preview)
   // read as too busy and too easy to mis-tap on a real phone — this replaces it entirely rather than
   // adding a third mobile layout mode alongside it.
-  const [mobileSheet, setMobileSheet] = useState<"media" | "inspector" | null>(null);
+  //
+  // Lives in `useEditorStore` (not a plain local `useState` here) specifically so `TimelineClip`'s own
+  // double-tap-a-clip-to-edit gesture can open Properties from deep inside the Timeline tree — see
+  // `EditorState.mobileSheet`'s own doc comment for the full reasoning.
+  const mobileSheet = useEditorStore((s) => s.mobileSheet);
+  const setMobileSheet = useEditorStore((s) => s.setMobileSheet);
 
   // Independent of `mobileSheet` above — that one is deliberately the mobile-only "borrow the bottom
   // row because there's no side column to put this in" concept (see its own comment). This decides
@@ -725,17 +732,17 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
       // keyboard, and the numpad's own +/- report as "+"/"-" directly regardless of Shift.
       if (modifier && (event.key === "+" || event.key === "=")) {
         event.preventDefault();
-        window.dispatchEvent(new CustomEvent("vstudio:zoom", { detail: { factor: 1.4 } }));
+        window.dispatchEvent(new CustomEvent("vcut:zoom", { detail: { factor: 1.4 } }));
         return;
       }
       if (modifier && event.key === "-") {
         event.preventDefault();
-        window.dispatchEvent(new CustomEvent("vstudio:zoom", { detail: { factor: 1 / 1.4 } }));
+        window.dispatchEvent(new CustomEvent("vcut:zoom", { detail: { factor: 1 / 1.4 } }));
         return;
       }
       if (modifier && event.key === "0") {
         event.preventDefault();
-        window.dispatchEvent(new CustomEvent("vstudio:zoom", { detail: { reset: true } }));
+        window.dispatchEvent(new CustomEvent("vcut:zoom", { detail: { reset: true } }));
         return;
       }
 
@@ -811,7 +818,7 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center bg-[#0a0c10] text-xs text-white/40">
-        {t("Opening VStudio…")}
+        {t("Opening VCut…")}
       </div>
     );
   }
@@ -819,7 +826,7 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   if (loadError || !project) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 bg-[#0a0c10] p-6 text-center">
-        <p className="text-sm font-medium text-rose-300">{t("VStudio couldn't open this project")}</p>
+        <p className="text-sm font-medium text-rose-300">{t("VCut couldn't open this project")}</p>
         <p className="max-w-md text-xs leading-relaxed text-white/50">{loadError}</p>
         <button
           onClick={() => void load(projectId)}
@@ -832,10 +839,10 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   }
 
   return (
-    // "VStudio" is a product name — never translated. `vstudio-lang-km` (see studios/vstudio's
+    // "VCut" is a product name — never translated. `vcut-lang-km` (see studios/vcut's
     // globals.css) swaps the whole chrome's font-family to a Khmer-capable face via inheritance —
     // one place, cascades to every descendant, no per-component font changes needed.
-    <div className={`flex h-full min-h-0 min-w-0 flex-col bg-[#0a0c10] text-white ${language === "km" ? "vstudio-lang-km" : ""}`}>
+    <div className={`flex h-full min-h-0 min-w-0 flex-col bg-[#0a0c10] text-white ${language === "km" ? "vcut-lang-km" : ""}`}>
       <header className="flex min-w-0 shrink-0 items-center gap-2 border-b border-white/10 px-3 py-2">
         {onHome ? (
           <button
@@ -847,14 +854,14 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
             {/* An arrow (not a plain "X") — "X" reads as close/discard, which this isn't; this
                 genuinely navigates back to the projects list, so an unambiguous back arrow is the
                 more literal affordance for what actually happens on click. Prefixed onto the existing
-                "VStudio" wordmark rather than replacing it — keeps the brand visible while editing,
+                "VCut" wordmark rather than replacing it — keeps the brand visible while editing,
                 the arrow alone already makes the button's clickability/destination obvious without
                 needing to sacrifice one for the other. */}
             <ArrowLeft size={16} />
-            VStudio
+            VCut
           </button>
         ) : (
-          <span className="shrink-0 text-sm font-semibold tracking-tight">VStudio</span>
+          <span className="shrink-0 text-sm font-semibold tracking-tight">VCut</span>
         )}
         <EditableProjectTitle />
         <SaveStatus />
@@ -997,17 +1004,17 @@ function VStudioAppInner({ projectId, projectName, onHome }: VStudioAppProps) {
   );
 }
 
-/** The real export — wraps `VStudioAppInner` in an `ErrorBoundary` from the OUTSIDE, not as the
+/** The real export — wraps `VCutAppInner` in an `ErrorBoundary` from the OUTSIDE, not as the
  *  first thing inside its own return, specifically so the boundary also catches errors thrown by
- *  `VStudioAppInner`'s own top-level hooks (a boundary can never catch an error thrown by itself, only
- *  by its children — putting it inside `VStudioAppInner`'s own return would miss anything that throws
+ *  `VCutAppInner`'s own top-level hooks (a boundary can never catch an error thrown by itself, only
+ *  by its children — putting it inside `VCutAppInner`'s own return would miss anything that throws
  *  before that return is ever reached). This protects the editor regardless of who mounts it — the
  *  standalone page, BP Studio's `<iframe>` embed, or any future embedder — without relying on every
  *  call site remembering to add a boundary of its own. */
-export function VStudioApp(props: VStudioAppProps) {
+export function VCutApp(props: VCutAppProps) {
   return (
     <ErrorBoundary>
-      <VStudioAppInner {...props} />
+      <VCutAppInner {...props} />
     </ErrorBoundary>
   );
 }

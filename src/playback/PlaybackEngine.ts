@@ -1,22 +1,17 @@
 import { clipDuration, clipEnd } from "../project/createProject.ts";
-import type { ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorGrading, Project, TextStyle, TransitionType, Track } from "../project/types.ts";
+import type { ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorGrading, CustomFontAsset, Project, TextStyle, TransitionType, Track } from "../project/types.ts";
 import { isIdentityColorGrading, isIdentityEffects, isIdentityTextCrop } from "../project/types.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
 import { applyColorGrading, buildCurveLut, composeLuts } from "../timeline/colorCurves.ts";
 import { resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextCrop, resolveTextStyle } from "../timeline/keyframes.ts";
+import { applyLut3D, parseCubeLut } from "../timeline/lut.ts";
+import type { Lut3D } from "../timeline/lut.ts";
+import { applyGlitch, applyWaterRipple } from "../timeline/pixelEffects.ts";
 import { audibleClips, clipAtTime } from "../timeline/queries.ts";
-import {
-  activeWordIndex,
-  computeTextAnimationTransform,
-  DEFAULT_WORD_HIGHLIGHT_COLOR,
-  segmentLine,
-  splitWords,
-  typewriterVisibleContent,
-} from "../timeline/textAnimation.ts";
 import { findTransitionOut, findTransitionPartner, resolveAudioTransitionGain } from "../timeline/transitions.ts";
 import { AudioMixEngine } from "./AudioMixEngine.ts";
 import { computeTransformedBox } from "./transformGeometry.ts";
-import { computeTextBlock, TEXT_BOX_PADDING } from "./textLayout.ts";
+import { drawAnimatedTextFrame, drawTextFrame } from "./textLayout.ts";
 
 /** How far ahead of the playhead `tick()` looks when deciding whether to kick off decoding an
  *  upcoming audio-track clip's asset early — see the prefetch scan in `tick()` itself. */
@@ -35,7 +30,9 @@ export type TransitionFamily =
   | { kind: "dissolve" }
   | { kind: "wipe"; edge: "left" | "right" | "up" | "down" }
   | { kind: "slide"; edge: "left" | "right" | "up" | "down" }
-  | { kind: "circle"; opening: boolean };
+  | { kind: "circle"; opening: boolean }
+  | { kind: "glitch" }
+  | { kind: "waterRipple" };
 
 export function transitionFamily(type: TransitionType): TransitionFamily {
   switch (type) {
@@ -59,11 +56,62 @@ export function transitionFamily(type: TransitionType): TransitionFamily {
       return { kind: "circle", opening: true };
     case "circleClose":
       return { kind: "circle", opening: false };
+    case "glitchCut":
+      return { kind: "glitch" };
+    case "waterRippleCut":
+      return { kind: "waterRipple" };
     case "crossfade":
     case "dissolve":
     default:
       return { kind: "dissolve" };
   }
+}
+
+// Module-level (not per-`PlaybackEngine`-instance) scratch canvases for the glitch/water-ripple
+// transition families below — `compositeTransitionFrame` is a standalone function usable with no live
+// instance at all (see its own doc comment on why: `TransitionPreviewTile.tsx`'s picker thumbnails),
+// so there's no `this` to attach a cache to. Same persistent-buffer-reused-across-calls shape
+// `TransitionPreviewTile.tsx`'s own module-level `outgoingPanel`/`incomingPanel` already use, just two
+// of them (one per side of the blend) so both processed results stay available simultaneously for the
+// final composite below.
+let pixelFxScratchA: HTMLCanvasElement | null = null;
+let pixelFxScratchB: HTMLCanvasElement | null = null;
+
+/** Returns one of the two scratch canvases above, lazily created and resized in place to `width`×
+ *  `height` on demand. */
+function getPixelFxScratchCanvas(which: "a" | "b", width: number, height: number): HTMLCanvasElement {
+  let canvas = which === "a" ? pixelFxScratchA : pixelFxScratchB;
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    if (which === "a") pixelFxScratchA = canvas;
+    else pixelFxScratchB = canvas;
+  }
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return canvas;
+}
+
+/** Draws `source` into one of the two scratch canvases above, runs `apply` over its raw pixels via the
+ *  same `getImageData`/`putImageData` round trip `drawTransformed` already uses for chroma-key/color-
+ *  grading/LUT/pixel-effect, and returns that canvas (now holding the processed result) ready to
+ *  `drawImage` elsewhere. */
+function applyPixelFxToImage(
+  which: "a" | "b",
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+  apply: (imageData: ImageData) => void
+): CanvasImageSource {
+  const canvas = getPixelFxScratchCanvas(which, width, height);
+  const ctx = canvas.getContext("2d")!;
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(source, 0, 0, width, height);
+  const imageData = ctx.getImageData(0, 0, width, height);
+  apply(imageData);
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
 }
 
 /** Blends two ALREADY-FULLY-DRAWN flat images (`outgoing`/`incoming`) onto `context`, per
@@ -142,6 +190,36 @@ export function compositeTransitionFrame(
     return;
   }
 
+  if (family.kind === "glitch" || family.kind === "waterRipple") {
+    // Corruption bursts AT the cut, clean going in/out — a parabola (0 at both ends of the blend,
+    // peaking at the midpoint) rather than a flat full-strength distortion for the whole window,
+    // avoiding any visible seam against the surrounding un-corrupted clip content on either side.
+    const intensity = 4 * progress * (1 - progress);
+    const apply = (imageData: ImageData) => {
+      if (family.kind === "glitch") applyGlitch(imageData, progress, 1, intensity);
+      else applyWaterRipple(imageData, progress, 1, intensity);
+    };
+    const processedOutgoing = applyPixelFxToImage("a", outgoing, frameWidth, frameHeight, apply);
+    const processedIncoming = applyPixelFxToImage("b", incoming, frameWidth, frameHeight, apply);
+    // The scratch canvases above are always rendered at the sequence's full LOGICAL resolution (e.g.
+    // 1080×1920), but the real on-screen canvas is a much smaller PHYSICAL backing store (`tick`'s own
+    // DPR-aware cap, `context`'s own `setTransform` maps logical coordinates down onto it) — a plain
+    // smoothed `drawImage` downscale here blurs away exactly the sparse, sharp-edged corruption that
+    // makes this read as "glitchy" rather than a plain dissolve: a several-source-pixel channel shift
+    // becomes sub-physical-pixel and disappears, and a single noised source pixel gets diluted across
+    // ~20 smoothed neighbors into visual nothing. Nearest-neighbor sampling for just this draw keeps
+    // both as visible blocky artifacts instead of averaging them away; restored right after so every
+    // OTHER transition family's own smooth blend is unaffected.
+    const smoothing = context.imageSmoothingEnabled;
+    context.imageSmoothingEnabled = false;
+    context.drawImage(processedOutgoing, 0, 0, frameWidth, frameHeight);
+    context.globalAlpha = progress;
+    context.drawImage(processedIncoming, 0, 0, frameWidth, frameHeight);
+    context.globalAlpha = 1;
+    context.imageSmoothingEnabled = smoothing;
+    return;
+  }
+
   // dissolve (and crossfade, the default) — a plain alpha cross-dissolve. FFmpeg's real `dissolve`
   // xfade type is a per-pixel randomized reveal rather than a uniform blend; a flat alpha blend is
   // this canvas approximation's stand-in for it, the same "preview approximates, export is exact"
@@ -173,14 +251,20 @@ export function compositeTransitionFrame(
  *  `context.globalAlpha` instead wouldn't work for a video draw, since `drawTransformed` overwrites it
  *  internally with the clip's own `effects.opacity`. `drawText` has no such parameter, but never
  *  touches `globalAlpha` itself, so the ambient value this function sets works fine there — the
- *  argument is simply unused by text callers. */
+ *  argument is simply unused by text callers.
+ *
+ *  `draw` also takes an optional SECOND argument, `targetContext` — every existing caller's callback
+ *  already ignores it (they close over their own outer `context` and always draw there), but the new
+ *  glitch/water-ripple branch below needs to redirect the draw onto an offscreen scratch canvas first
+ *  (to run the pixel effect over the result before it ever reaches the real canvas), which this
+ *  parameter exists to make possible without every caller needing its own conditional. */
 function compositeSoloReveal(
   context: CanvasRenderingContext2D,
   frameWidth: number,
   frameHeight: number,
   type: TransitionType,
   reveal: number,
-  draw: (alphaMultiplier: number) => void
+  draw: (alphaMultiplier: number, targetContext?: CanvasRenderingContext2D) => void
 ): void {
   const family = transitionFamily(type);
   context.save();
@@ -209,6 +293,31 @@ function compositeSoloReveal(
     context.arc(frameWidth / 2, frameHeight / 2, maxRadius * reveal, 0, Math.PI * 2);
     context.clip();
     draw(1);
+  } else if (family.kind === "glitch" || family.kind === "waterRipple") {
+    // `draw()` paints directly onto the OUTER context by default — redirected here onto scratch
+    // canvas "a" instead, so the pixel effect can run over the result before any of it reaches the
+    // real canvas, then composited on with `globalAlpha = reveal` for the overall fade.
+    const scratch = getPixelFxScratchCanvas("a", frameWidth, frameHeight);
+    const scratchContext = scratch.getContext("2d")!;
+    scratchContext.clearRect(0, 0, frameWidth, frameHeight);
+    draw(1, scratchContext);
+    const imageData = scratchContext.getImageData(0, 0, frameWidth, frameHeight);
+    // Peaks at `reveal = 0` (the disappearing/appearing instant) and fades to 0 by `reveal = 1`
+    // (fully visible/stable) — one formula that works for both fade-in (`reveal` rising 0→1) and
+    // fade-out (`reveal` falling 1→0), since it's the boundary itself that should read as corrupted,
+    // not a particular direction of travel.
+    const intensity = 1 - reveal;
+    if (family.kind === "glitch") applyGlitch(imageData, reveal, 1, intensity);
+    else applyWaterRipple(imageData, reveal, 1, intensity);
+    scratchContext.putImageData(imageData, 0, 0);
+    context.globalAlpha = reveal;
+    // Same nearest-neighbor reasoning as `compositeTransitionFrame`'s own glitch/waterRipple branch —
+    // `scratch` is full LOGICAL sequence resolution, drawn down onto a much smaller physical backing
+    // store; a smoothed downscale would blur the corruption away to nothing. `context.restore()` below
+    // (this function's own, at the very end, paired with its `save()` at the top) reverts this along
+    // with every other state change this branch makes, so there's nothing to manually reset here.
+    context.imageSmoothingEnabled = false;
+    context.drawImage(scratch, 0, 0, frameWidth, frameHeight);
   } else {
     // dissolve (and crossfade, the default) — a plain alpha reveal.
     context.globalAlpha = reveal;
@@ -325,6 +434,11 @@ export interface PlaybackHost {
   onEnded: () => void;
   /** Resolves an asset to a streamable URL — injected so this class needs no knowledge of the API. */
   mediaUrlFor: (assetId: string) => string | null;
+  /** Resolves a `LutAsset.id` to a fetchable URL for its raw `.cube` text — mirrors `mediaUrlFor`'s
+   *  own injected-resolver shape. `null` when the id doesn't resolve to a real `LutAsset` (a stale
+   *  reference to a since-deleted LUT); `resolveLut` below treats that exactly like a fetch that
+   *  hasn't finished yet — just skip applying a LUT for this frame. */
+  lutUrlFor: (lutId: string) => string | null;
   /** Every clip `TransformHandles`/`TextTransformHandles` is mid-dragging right now (the actively-
    *  dragged one plus any others moving with it as a multi-select group) — checked on every frame so
    *  the canvas tracks a drag live instead of only updating once it commits. See
@@ -415,6 +529,14 @@ export class PlaybackEngine {
    *  in `timeline/operations.ts` already guarantees that. So recomputing the natural-cubic-spline solve
    *  for all 4 curves only happens on an actual change, not on every tick of steady, un-edited playback. */
   private colorGradingLutCache = new Map<string, { source: ColorGrading; r: Uint8ClampedArray; g: Uint8ClampedArray; b: Uint8ClampedArray }>();
+  /** One entry per `LutAsset.id` this session has needed — either the already-parsed `Lut3D` once
+   *  fetch+parse completes, or the in-flight `Promise` while it's still loading (so two clips sharing
+   *  the same LUT, or two consecutive frames before the first fetch resolves, never trigger a second
+   *  fetch — see `resolveLut`'s own doc comment). Keyed by lutId (not clip id, unlike
+   *  `colorGradingLutCache`): a `.cube` file's parsed lattice depends only on its own bytes, not on
+   *  which clip references it, so this can be shared across every clip using the same LUT — no
+   *  per-clip invalidation rule needed the way `colorGradingLutCache` has for a live-editable curve. */
+  private lutCache = new Map<string, Lut3D | Promise<void>>();
   /** Owns the entire Web Audio mixing graph — see its own doc comment. Composed here rather than
    *  subclassed: this class stays the video/canvas/clock owner, `AudioMixEngine` is a pure audio-output
    *  concern it delegates to, the same way `PlaybackHost` itself is composition rather than inheritance. */
@@ -838,34 +960,58 @@ export class PlaybackEngine {
     time: number
   ): void {
     const asset = project.assets.find((a) => a.id === clip.assetId);
-    const isImage = asset?.kind === "image";
-    const element = this.mediaFor(clip, isImage ? "image" : "video");
-    if (!element) return;
 
+    let element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
     let sourceWidth: number;
     let sourceHeight: number;
 
-    if (element instanceof HTMLImageElement) {
-      // A still has no clock to sync and nothing to pause — it's ready as soon as it has decoded.
-      if (!element.complete || element.naturalWidth === 0) return;
-      sourceWidth = element.naturalWidth;
-      sourceHeight = element.naturalHeight;
-    } else if (element instanceof HTMLVideoElement) {
-      const sourceTime = clip.sourceIn + (time - clip.timelineStart);
-      // The track's own visibility no longer needs checking here: `drawVideoLayer` already skips
-      // hidden tracks entirely before this is ever called.
-      this.syncMedia(clip.id, element, sourceTime, this.host.isPlaying());
-      // A video clip's own audio is silenced/scaled when the clip itself is muted/gained — matching
-      // what export does, so preview and output agree. Routed through `AudioMixEngine` (not
-      // `element.volume`/`.muted`) so it shares the same mixing graph as audio-track clips and can be
-      // ducked around a reseek — see `syncVideoClipAudio`'s own doc comment.
-      this.audioMixEngine.syncVideoClipAudio(clip, element, clip.gain ?? 1, clip.mutedAudio ?? false);
-      // readyState < 2 means no frame is decoded yet; drawing would throw or paint garbage.
-      if (element.readyState < 2) return;
-      sourceWidth = element.videoWidth;
-      sourceHeight = element.videoHeight;
+    if (asset?.kind === "color") {
+      // A color-matte clip has no real media to load or sync — a solid-fill canvas (see
+      // `colorCanvasFor`) stands in as the `drawImage` source below, sized to the FRAME itself (a flat
+      // fill has no intrinsic size of its own) so it fills edge-to-edge before running through the exact
+      // same crop/scale/transform/effects pipeline every other video-track clip already goes through.
+      element = this.colorCanvasFor(asset.color ?? "#000000", frameWidth, frameHeight);
+      sourceWidth = frameWidth;
+      sourceHeight = frameHeight;
     } else {
-      return;
+      const isImage = asset?.kind === "image";
+      const loaded = this.mediaFor(clip, isImage ? "image" : "video");
+      if (!loaded) return;
+      element = loaded;
+
+      if (element instanceof HTMLImageElement) {
+        // A still has no clock to sync and nothing to pause — it's ready as soon as it has decoded.
+        if (!element.complete || element.naturalWidth === 0) return;
+        sourceWidth = element.naturalWidth;
+        sourceHeight = element.naturalHeight;
+      } else if (element instanceof HTMLVideoElement) {
+        const sourceTime = clip.sourceIn + (time - clip.timelineStart);
+        // The track's own visibility no longer needs checking here: `drawVideoLayer` already skips
+        // hidden tracks entirely before this is ever called.
+        this.syncMedia(clip.id, element, sourceTime, this.host.isPlaying());
+        // A video clip's own audio is silenced/scaled when the clip itself is muted/gained, OR when the
+        // whole track it's on is muted — matching what export does (`buildExportPlan.ts`'s own
+        // `buildTrackStreams` folds `track.muted` into the same `hasAudio` check), so preview and output
+        // agree. Routed through `AudioMixEngine` (not `element.volume`/`.muted`) so it shares the same
+        // mixing graph as audio-track clips and can be ducked around a reseek — see `syncVideoClipAudio`'s
+        // own doc comment.
+        //
+        // Also ramped by `resolveAudioTransitionGain` — the same helper `activeAudioClips` already applies
+        // for a pure audio-track clip's own transition (see that method's identical `(clip.gain ?? 1) *
+        // gain` combination) — so a video clip's EMBEDDED audio fades in/out across its own transition
+        // window in preview too, matching what export's `acrossfade` already does. Scoped to just this
+        // clip's own window: a real two-clip video crossfade's OUTGOING partner still isn't wired into
+        // `AudioMixEngine` as a second simultaneously-active source here — see `drawTransitionPartner`'s
+        // own comment on why the partner's audio is deliberately not synced.
+        const { gain: transitionGain } = resolveAudioTransitionGain(track, clip, time);
+        this.audioMixEngine.syncVideoClipAudio(clip, element, (clip.gain ?? 1) * transitionGain, (clip.mutedAudio ?? false) || track.muted);
+        // readyState < 2 means no frame is decoded yet; drawing would throw or paint garbage.
+        if (element.readyState < 2) return;
+        sourceWidth = element.videoWidth;
+        sourceHeight = element.videoHeight;
+      } else {
+        return;
+      }
     }
 
     if (sourceWidth === 0 || sourceHeight === 0) return;
@@ -908,7 +1054,7 @@ export class PlaybackEngine {
         const inCtx = this.transitionCanvas("b", frameWidth, frameHeight);
         const partnerDrawn = outCtx && this.drawTransitionPartner(project, outCtx, frameWidth, frameHeight, transition.partner, transition.duration, elapsed);
         if (partnerDrawn && inCtx) {
-          this.drawTransformed(inCtx, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, clip.chromaKey, colorGrading, clip.id);
+          this.drawTransformed(inCtx, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, clip.chromaKey, colorGrading, clip.id, clip.lutId, clip.pixelEffect, elapsed);
           compositeTransitionFrame(
             context,
             frameWidth,
@@ -921,8 +1067,8 @@ export class PlaybackEngine {
           return;
         }
       } else {
-        compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionIn?.type ?? "crossfade", progress, (alphaMultiplier) => {
-          this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, alphaMultiplier, clip.chromaKey, colorGrading, clip.id);
+        compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionIn?.type ?? "crossfade", progress, (alphaMultiplier, targetContext) => {
+          this.drawTransformed(targetContext ?? context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, alphaMultiplier, clip.chromaKey, colorGrading, clip.id, clip.lutId, clip.pixelEffect, elapsed);
         });
         return;
       }
@@ -939,14 +1085,14 @@ export class PlaybackEngine {
       const remaining = clipEnd(clip) - time;
       if (remaining < transitionOut.duration) {
         const reveal = Math.min(1, Math.max(0, remaining / transitionOut.duration));
-        compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionOut?.type ?? "crossfade", reveal, (alphaMultiplier) => {
-          this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, alphaMultiplier, clip.chromaKey, colorGrading, clip.id);
+        compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionOut?.type ?? "crossfade", reveal, (alphaMultiplier, targetContext) => {
+          this.drawTransformed(targetContext ?? context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, alphaMultiplier, clip.chromaKey, colorGrading, clip.id, clip.lutId, clip.pixelEffect, elapsed);
         });
         return;
       }
     }
 
-    this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, clip.chromaKey, colorGrading, clip.id);
+    this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, clip.chromaKey, colorGrading, clip.id, clip.lutId, clip.pixelEffect, elapsed);
   }
 
   /** Draws the outgoing clip's own tail frame during a crossfade — a stripped-down sibling of the main
@@ -965,27 +1111,37 @@ export class PlaybackEngine {
     elapsed: number
   ): boolean {
     const asset = project.assets.find((a) => a.id === partner.assetId);
-    const isImage = asset?.kind === "image";
-    const element = this.mediaFor(partner, isImage ? "image" : "video");
-    if (!element) return false;
 
+    let element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
     let sourceWidth: number;
     let sourceHeight: number;
 
-    if (element instanceof HTMLImageElement) {
-      if (!element.complete || element.naturalWidth === 0) return false;
-      sourceWidth = element.naturalWidth;
-      sourceHeight = element.naturalHeight;
-    } else if (element instanceof HTMLVideoElement) {
-      const sourceTime = partner.sourceOut - duration + elapsed;
-      if (element.readyState === 0) return false;
-      if (Math.abs(element.currentTime - sourceTime) > DRIFT_TOLERANCE) element.currentTime = sourceTime;
-      if (!element.paused) element.pause();
-      if (element.readyState < 2) return false;
-      sourceWidth = element.videoWidth;
-      sourceHeight = element.videoHeight;
+    if (asset?.kind === "color") {
+      // Same stand-in as `drawVideoClip`'s own identical branch — see its comment.
+      element = this.colorCanvasFor(asset.color ?? "#000000", frameWidth, frameHeight);
+      sourceWidth = frameWidth;
+      sourceHeight = frameHeight;
     } else {
-      return false;
+      const isImage = asset?.kind === "image";
+      const loaded = this.mediaFor(partner, isImage ? "image" : "video");
+      if (!loaded) return false;
+      element = loaded;
+
+      if (element instanceof HTMLImageElement) {
+        if (!element.complete || element.naturalWidth === 0) return false;
+        sourceWidth = element.naturalWidth;
+        sourceHeight = element.naturalHeight;
+      } else if (element instanceof HTMLVideoElement) {
+        const sourceTime = partner.sourceOut - duration + elapsed;
+        if (element.readyState === 0) return false;
+        if (Math.abs(element.currentTime - sourceTime) > DRIFT_TOLERANCE) element.currentTime = sourceTime;
+        if (!element.paused) element.pause();
+        if (element.readyState < 2) return false;
+        sourceWidth = element.videoWidth;
+        sourceHeight = element.videoHeight;
+      } else {
+        return false;
+      }
     }
 
     if (sourceWidth === 0 || sourceHeight === 0) return false;
@@ -1000,7 +1156,7 @@ export class PlaybackEngine {
     const transform = resolveClipTransform(partner, partnerElapsed);
     const effects = resolveClipEffects(partner, partnerElapsed);
     const colorGrading = resolveClipColorGrading(partner, partnerElapsed);
-    this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, partner.chromaKey, colorGrading, partner.id);
+    this.drawTransformed(context, element, sourceWidth, sourceHeight, frameWidth, frameHeight, transform, effects, 1, partner.chromaKey, colorGrading, partner.id, partner.lutId, partner.pixelEffect, partnerElapsed);
     return true;
   }
 
@@ -1019,7 +1175,7 @@ export class PlaybackEngine {
    *  one silently overriding the other. */
   private drawTransformed(
     context: CanvasRenderingContext2D,
-    element: HTMLVideoElement | HTMLImageElement,
+    element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
     sourceWidth: number,
     sourceHeight: number,
     frameWidth: number,
@@ -1029,21 +1185,29 @@ export class PlaybackEngine {
     alphaMultiplier = 1,
     chromaKey?: ChromaKeySettings,
     colorGrading?: ColorGrading,
-    clipId?: string
+    clipId?: string,
+    lutId?: string,
+    pixelEffect?: Clip["pixelEffect"],
+    elapsedSeconds = 0
   ): void {
     const box = computeTransformedBox(sourceWidth, sourceHeight, frameWidth, frameHeight, transform);
     if (!box) return;
 
-    // Chroma key and color-grading curves BOTH operate on the RAW, un-cropped, un-scaled source, and
-    // BOTH need a `getImageData`/`putImageData` round-trip — combined into a SINGLE readback here rather
-    // than each running its own (chroma key touches only alpha, curves touch only R/G/B, so the two
-    // passes never interact and can share one buffer). Result handed to the exact same crop/scale/
-    // rotate/translate `drawImage` call below a plain clip already uses, via `source` standing in for
-    // `element`. Zero geometry-path divergence between a processed and unprocessed clip — only which
-    // image gets drawn differs.
+    // Chroma key, color-grading curves, a LUT, and a pixel effect (glitch/water-ripple) ALL operate on
+    // the RAW, un-cropped, un-scaled source, and ALL need a `getImageData`/`putImageData` round-trip —
+    // combined into a SINGLE readback here rather than each running its own (chroma key touches only
+    // alpha, curves and the LUT both touch only R/G/B, and a pixel effect runs LAST, after every color
+    // operation, since it's a spatial displacement rather than a color one — none of the passes
+    // destructively interact). Result handed to the exact same crop/scale/rotate/translate `drawImage`
+    // call below a plain clip already uses, via `source` standing in for `element`. Zero geometry-path
+    // divergence between a processed and unprocessed clip — only which image gets drawn differs.
+    // `needsLut` gates the READBACK on `lutId` being SET, not on the LUT having actually finished
+    // loading — a clip with a LUT but otherwise-identity color grading must still get the readback, or
+    // a still-loading (or just-assigned) LUT would never get the chance to apply once it resolves.
     let source: CanvasImageSource = element;
     const needsColorGrading = colorGrading !== undefined && !isIdentityColorGrading(colorGrading);
-    if (chromaKey || needsColorGrading) {
+    const needsLut = lutId !== undefined;
+    if (chromaKey || needsColorGrading || needsLut || pixelEffect) {
       const scratch = this.chromaKeyCanvas(sourceWidth, sourceHeight);
       if (scratch) {
         scratch.clearRect(0, 0, sourceWidth, sourceHeight);
@@ -1051,6 +1215,22 @@ export class PlaybackEngine {
         const imageData = scratch.getImageData(0, 0, sourceWidth, sourceHeight);
         if (chromaKey) applyChromaKey(imageData, chromaKey);
         if (needsColorGrading) applyColorGrading(imageData, this.resolveColorGradingLuts(clipId ?? "", colorGrading!));
+        // Applied AFTER color grading, matching `Clip.lutId`'s own doc comment and
+        // `buildExportPlan.ts`'s identical curves-then-lut3d ordering. `resolveLut` returns `null` while
+        // the file is still loading (or unresolvable) — this frame just renders without it rather than
+        // blocking the render loop; the very next frame after it resolves applies it normally.
+        if (needsLut) {
+          const lut = this.resolveLut(lutId!);
+          if (lut) applyLut3D(imageData, lut);
+        }
+        // Last: a spatial displacement, not a color operation — see `Clip.pixelEffect`'s own doc
+        // comment for why this isn't keyframeable, and `timeline/pixelEffects.ts` for the two pure
+        // functions themselves.
+        if (pixelEffect) {
+          const speed = pixelEffect.speed ?? 1;
+          if (pixelEffect.type === "glitch") applyGlitch(imageData, elapsedSeconds, speed);
+          else applyWaterRipple(imageData, elapsedSeconds, speed);
+        }
         scratch.putImageData(imageData, 0, 0);
         source = scratch.canvas;
       }
@@ -1077,6 +1257,34 @@ export class PlaybackEngine {
       box.height
     );
     context.restore();
+  }
+
+  /** A solid-fill canvas per distinct (color, size) pair, memoized (the same color/frame-size combo
+   *  repeats far more often than it changes) rather than rebuilt every frame. Sized to MATCH
+   *  `sourceWidth`×`sourceHeight` (`drawVideoClip`'s color branch passes `frameWidth`/`frameHeight`) —
+   *  NOT just 1×1 — because `drawTransformed`'s `drawImage` call reads `box.cropX/cropY/cropWidth/
+   *  cropHeight` from `computeTransformedBox`, which computes that crop rectangle IN SOURCE-PIXEL SPACE
+   *  against the `sourceWidth`/`sourceHeight` this function was told, not the canvas's own actual pixel
+   *  dimensions. A 1×1 backing canvas with a crop rectangle computed for a 1080×1920 "source" asks
+   *  `drawImage` for a source rect far outside the image's real bounds — confirmed live: it silently
+   *  draws NOTHING (leaving the frame's prior black clear showing through) rather than erroring, so the
+   *  mismatch is invisible until you actually look at the result. Cache key includes size so a sequence
+   *  resize (rare) just adds a new cached canvas rather than reusing a stale one. */
+  private colorCanvasCache = new Map<string, HTMLCanvasElement>();
+  private colorCanvasFor(color: string, width: number, height: number): HTMLCanvasElement {
+    const key = `${color}@${width}x${height}`;
+    const cached = this.colorCanvasCache.get(key);
+    if (cached) return cached;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width));
+    canvas.height = Math.max(1, Math.round(height));
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    this.colorCanvasCache.set(key, canvas);
+    return canvas;
   }
 
   /** Gets (or creates/resizes) one of the two scratch canvases `compositeTransitionFrame` blends —
@@ -1132,6 +1340,38 @@ export class PlaybackEngine {
     };
     this.colorGradingLutCache.set(clipId, next);
     return next;
+  }
+
+  /** Resolves `lutId` to its parsed `Lut3D`, fetching + parsing the `.cube` file at most once per id
+   *  (see `lutCache`'s own doc comment). Returns `null` — meaning "skip applying a LUT this frame" —
+   *  for THREE distinct cases the caller doesn't need to tell apart: the id doesn't resolve to a real
+   *  `LutAsset` (`lutUrlFor` returned `null`), the fetch/parse is still in flight, or it already failed
+   *  (network error, or a `.cube` file `parseCubeLut` couldn't read). This is the same "don't stall the
+   *  render loop for a still-loading resource" principle `mediaFor`'s own not-yet-decoded-frame checks
+   *  already follow elsewhere in this file — a LUT that hasn't loaded yet just renders as if absent for
+   *  a frame or two, then starts applying itself the instant it resolves, with no visible stall. */
+  private resolveLut(lutId: string): Lut3D | null {
+    const cached = this.lutCache.get(lutId);
+    if (cached instanceof Promise) return null;
+    if (cached) return cached;
+
+    const url = this.host.lutUrlFor(lutId);
+    if (!url) return null;
+
+    const pending = fetch(url)
+      .then((response) => response.text())
+      .then((text) => {
+        this.lutCache.set(lutId, parseCubeLut(text));
+      })
+      .catch(() => {
+        // Drop the cache entry (rather than caching the rejected promise forever) so a transient
+        // failure — a dropped connection, a file removed mid-fetch — gets a real retry on the NEXT
+        // frame that needs this lutId, instead of silently never applying the LUT for the rest of the
+        // session.
+        this.lutCache.delete(lutId);
+      });
+    this.lutCache.set(lutId, pending);
+    return null;
   }
 
   /** Draws every visible text track's active clip, on top of whatever the video layer drew. Several
@@ -1199,8 +1439,8 @@ export class PlaybackEngine {
             const outCtx = this.transitionCanvas("a", frameWidth, frameHeight);
             const inCtx = this.transitionCanvas("b", frameWidth, frameHeight);
             if (outCtx && inCtx) {
-              this.drawText(outCtx, frameWidth, frameHeight, partnerAsset.textContent ?? "", partnerAsset.textStyle);
-              this.drawText(inCtx, frameWidth, frameHeight, asset.textContent ?? "", style);
+              this.drawText(outCtx, frameWidth, frameHeight, partnerAsset.textContent ?? "", partnerAsset.textStyle, undefined, project.customFonts);
+              this.drawText(inCtx, frameWidth, frameHeight, asset.textContent ?? "", style, undefined, project.customFonts);
               withCrop(() => {
                 compositeTransitionFrame(
                   context,
@@ -1218,7 +1458,7 @@ export class PlaybackEngine {
         } else {
           withCrop(() => {
             compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionIn?.type ?? "crossfade", progress, () => {
-              this.drawText(context, frameWidth, frameHeight, asset.textContent ?? "", style);
+              this.drawText(context, frameWidth, frameHeight, asset.textContent ?? "", style, undefined, project.customFonts);
             });
           });
           continue;
@@ -1235,7 +1475,7 @@ export class PlaybackEngine {
           const reveal = Math.min(1, Math.max(0, remaining / transitionOut.duration));
           withCrop(() => {
             compositeSoloReveal(context, frameWidth, frameHeight, clip.transitionOut?.type ?? "crossfade", reveal, () => {
-              this.drawText(context, frameWidth, frameHeight, asset.textContent ?? "", style);
+              this.drawText(context, frameWidth, frameHeight, asset.textContent ?? "", style, undefined, project.customFonts);
             });
           });
           continue;
@@ -1243,21 +1483,13 @@ export class PlaybackEngine {
       }
 
       withCrop(() => {
-        this.drawAnimatedText(context, frameWidth, frameHeight, asset.textContent ?? "", style, clip.textAnimation, elapsed, clipDuration(clip));
+        this.drawAnimatedText(context, frameWidth, frameHeight, asset.textContent ?? "", style, clip.textAnimation, elapsed, clipDuration(clip), project.customFonts);
       });
     }
   }
 
-  /** `drawText`, plus whatever `animation` asks for — a thin wrapper, not folded into `drawText`
-   *  itself, since a transitioning clip (the two branches above, both `continue`ing before ever
-   *  reaching this call) deliberately does NOT also animate: composing a continuous motion effect with
-   *  an in-flight transition blend is real added complexity (which of the two scratch canvases gets
-   *  the animated draw? does the transition's own progress interact with the animation's phase?) for a
-   *  combination a v1 pass doesn't need to get right — see `TextAnimationType`'s own doc comment on
-   *  the export-side scope cut this pairs with. `elapsedSeconds` is simply `time - clip.timelineStart`,
-   *  the same value every other per-clip timing calculation in this file already uses.
-   *  `clipDurationSeconds` is only ever consulted for `wordHighlight` (see `activeWordIndex`'s own doc
-   *  comment on why it needs the clip's own length, unlike every other animation type here). */
+  /** Thin wrapper over the extracted, standalone `drawAnimatedTextFrame` (`textLayout.ts`) — same
+   *  "reuse the exact preview code, don't reimplement it" reasoning as `drawText`'s own wrapper above. */
   private drawAnimatedText(
     context: CanvasRenderingContext2D,
     frameWidth: number,
@@ -1266,173 +1498,36 @@ export class PlaybackEngine {
     style: TextStyle,
     animation: Clip["textAnimation"],
     elapsedSeconds: number,
-    clipDurationSeconds: number
+    clipDurationSeconds: number,
+    customFonts: CustomFontAsset[]
   ): void {
-    if (!animation) {
-      this.drawText(context, frameWidth, frameHeight, content, style);
-      return;
-    }
-    // `speed` scales the effective elapsed time fed to EVERY animation type uniformly — applied once,
-    // here, rather than threading a speed parameter through `computeTextAnimationTransform`/
-    // `typewriterVisibleContent`/`activeWordIndex` individually. None of those functions need their
-    // own notion of speed this way; they just see a bigger or smaller elapsed-time number than the
-    // clip's real playhead position implies.
-    const elapsed = elapsedSeconds * (animation.speed ?? 1);
-
-    if (animation.type === "typewriter") {
-      this.drawText(context, frameWidth, frameHeight, typewriterVisibleContent(content, elapsed), style);
-      return;
-    }
-    if (animation.type === "wordHighlight") {
-      const words = splitWords(content);
-      const active = activeWordIndex(words.length, elapsed, clipDurationSeconds);
-      this.drawText(context, frameWidth, frameHeight, content, style, {
-        activeWordIndex: active,
-        highlightColor: animation.highlightColor ?? DEFAULT_WORD_HIGHLIGHT_COLOR,
-      });
-      return;
-    }
-
-    const { dx, dy, scale, rotationDeg } = computeTextAnimationTransform(animation.type, elapsed);
-    // Pivots around the text BLOCK's own real center — NOT `frameWidth/2 + style.offsetX`, which is
-    // only correct for `align: "center"`. `computeTextBlock` already resolves `blockLeft`/`blockTop`
-    // correctly for `"left"`/`"right"` too (hugging their own frame edge, inset by `TEXT_MARGIN_PX`,
-    // not the frame center) — reusing it here, instead of re-deriving a separate approximation, is
-    // what keeps a left/right-aligned clip pulsing/wiggling IN PLACE rather than around a point that's
-    // nowhere near where the text actually is. Redundant with the measurement `drawText` below does
-    // again via its own `computeTextBlock` call — real but cheap (`measureText` on a short string),
-    // and simpler than threading the already-measured block through `drawText`'s own signature.
-    const block = computeTextBlock(context, frameWidth, frameHeight, content, style);
-    const pivotX = block.blockLeft + block.blockWidth / 2;
-    const pivotY = block.blockTop + block.blockHeight / 2;
-    context.save();
-    context.translate(dx, dy);
-    context.translate(pivotX, pivotY);
-    context.rotate((rotationDeg * Math.PI) / 180);
-    context.scale(scale, scale);
-    context.translate(-pivotX, -pivotY);
-    this.drawText(context, frameWidth, frameHeight, content, style);
-    context.restore();
+    drawAnimatedTextFrame(context, frameWidth, frameHeight, content, style, animation, elapsedSeconds, clipDurationSeconds, customFonts);
   }
 
-  /** Renders one text asset's content+style. Deliberately reproduces the SAME approximation
-   *  `buildExportPlan`'s FFmpeg `drawtext` chain is forced into — see `textLayout.ts`'s own doc
-   *  comment for why: every line grows rightward from ONE shared x (computed from the align setting
-   *  and the WIDEST line's width), never per-line `textAlign` centering, even though Canvas2D could
-   *  do the fancier thing. Agreement with export matters more here than either renderer being
-   *  independently more correct.
+  /** Renders one text asset's content+style. Mirrors `buildExportPlan`'s FFmpeg `drawtext` chain in
+   *  two ways, both covered by `textLayout.ts`'s own doc comment: the block's own screen position
+   *  depends only on `offsetX`/`offsetY`, never on `align` (so re-justifying text never moves the box),
+   *  and per-line justification WITHIN that fixed box (via `lineX` below) matches FFmpeg's own
+   *  `text_align` option exactly — both true per-line alignment now, not an approximation.
    *
-   *  Rotation pivots around the SEQUENCE FRAME's own center, offset applied AFTER rotating (not the
-   *  text block's own visual center) — a second, less obvious instance of that same "match export"
-   *  principle. Canvas2D COULD rotate around the block's own true center directly (whatever the align
-   *  setting), but FFmpeg's `rotate` filter fundamentally can't: it only spins a buffer around ITS OWN
-   *  geometric center, and — critically — the text block's true center for `align: "left"`/`"right"`
-   *  depends on the rendered text's actual measured width, which only exists inside FreeType's own
-   *  per-frame evaluation of ONE `drawtext` call and isn't exposed to any sibling FFmpeg filter (no
-   *  expression variable carries it across). Frame-center is the one pivot BOTH renderers can compute
-   *  exactly, with zero text-width dependency, so both use it — see `buildRotatedDrawTextFilter`'s own
-   *  comment for the FFmpeg-side half of this. For `align: "center"` (the default) this is invisible:
-   *  frame-center-plus-offset IS the block's own true center exactly, so nothing looks different. */
+   *  Rotation pivots around the SEQUENCE FRAME's own center, offset applied AFTER rotating — which,
+   *  now that the block's own position no longer depends on `align`, IS the block's own true center
+   *  for every `align` value (not just `"center"`), so this needs no per-align special case on either
+   *  renderer — see `buildRotatedDrawTextFilter`'s own comment for the FFmpeg-side half of this. */
+  // Thin wrapper over the extracted, standalone `drawTextFrame` (`textLayout.ts`) — moved out so the
+  // Khmer-script export render harness (a headless-browser page, see `khmerTextRenderer.ts`) can call
+  // the exact same function the live preview uses, guaranteeing byte-for-byte parity rather than a
+  // reimplementation that could quietly drift from what this class actually draws.
   private drawText(
     context: CanvasRenderingContext2D,
     frameWidth: number,
     frameHeight: number,
     content: string,
     style: TextStyle,
-    wordHighlight?: { activeWordIndex: number; highlightColor: string }
+    wordHighlight?: { activeWordIndex: number; highlightColor: string },
+    customFonts: CustomFontAsset[] = []
   ): void {
-    const block = computeTextBlock(context, frameWidth, frameHeight, content, style);
-    // The block's NATURAL (align-anchored, offset-EXCLUDED) position — offsetX/Y are additive terms in
-    // `computeTextBlock`'s own anchor formula, so subtracting them back out recovers this without a
-    // second measurement pass. This is what gets rotated; the offset then applies as a translate
-    // OUTSIDE the rotation, exactly mirroring `buildRotatedDrawTextFilter`'s draw-then-rotate-then-
-    // overlay order.
-    const drawLeft = style.rotationDeg !== 0 ? block.blockLeft - style.offsetX : block.blockLeft;
-    const drawTop = style.rotationDeg !== 0 ? block.blockTop - style.offsetY : block.blockTop;
-    const frameCenterX = frameWidth / 2;
-    const frameCenterY = frameHeight / 2;
-
-    context.save();
-    if (style.rotationDeg !== 0) {
-      context.translate(style.offsetX, style.offsetY);
-      context.translate(frameCenterX, frameCenterY);
-      context.rotate((style.rotationDeg * Math.PI) / 180);
-      context.translate(-frameCenterX, -frameCenterY);
-    }
-
-    if (style.backgroundColor) {
-      context.fillStyle = style.backgroundColor;
-      context.fillRect(
-        drawLeft - TEXT_BOX_PADDING,
-        drawTop - TEXT_BOX_PADDING,
-        block.blockWidth + TEXT_BOX_PADDING * 2,
-        block.blockHeight + TEXT_BOX_PADDING * 2
-      );
-    }
-
-    // `baselineOffset` is derived from the browser's own real font metrics (see `computeTextBlock`'s
-    // own comment) — not a fontSize-based guess, so the glyphs actually center within their own
-    // padded background box regardless of how a script's ascent/descent proportions compare to Latin.
-    const firstBaseline = drawTop + block.baselineOffset;
-    const drawLines = (draw: (line: string, x: number, y: number) => void) =>
-      block.lines.forEach((line, i) => draw(line, drawLeft, firstBaseline + block.lineHeight * i));
-
-    // Set AFTER the background box (which shouldn't get a shadow of its own) and left active through
-    // both the stroke and fill draws below — canvas naturally draws a shadow under EACH, but since both
-    // land on the identical glyph shapes, the two shadow instances just overlap into one, matching
-    // FFmpeg's own fixed draw order for `drawtext`: shadow, then outline, then fill (see
-    // `buildDrawTextStyleParams`'s comment). `shadowBlur` stays 0 — FFmpeg's shadow is a hard-edged
-    // offset duplicate, not a blurred one, and there's no blur radius to match if there were.
-    if (style.shadowColor) {
-      context.shadowColor = style.shadowColor;
-      context.shadowOffsetX = style.shadowOffsetX;
-      context.shadowOffsetY = style.shadowOffsetY;
-      context.shadowBlur = 0;
-    }
-
-    if (style.strokeColor) {
-      context.strokeStyle = style.strokeColor;
-      // `strokeText` centers the stroke ON the glyph's own outline — half the width lands INSIDE the
-      // glyph (invisible, covered by the fill drawn next) and half OUTSIDE (the only part actually
-      // visible). Doubling here makes the VISIBLE thickness equal `strokeWidth`, matching FFmpeg's
-      // `borderw`, which specifies the outer border thickness directly rather than a centered stroke.
-      context.lineWidth = style.strokeWidth * 2;
-      context.lineJoin = "round"; // avoids spiky miters at sharp glyph corners, closer to FFmpeg's own border rendering
-      drawLines((line, x, y) => context.strokeText(line, x, y));
-    }
-
-    if (wordHighlight) {
-      // Per-word fill only — shadow/stroke/background above stay whole-line, matching how a caption's
-      // outline/box reads as one continuous shape rather than N separate word-sized ones. Walks EVERY
-      // `segmentLine` token (not just the word-like ones) so whitespace/punctuation between words
-      // still advances `x` by its own measured width rather than an assumed space size — matters for
-      // tab-indented or multiple-space-separated captions, where a guessed width would visibly drift
-      // the line. `segmentLine` (not a plain `.split(/\s+/)`) is what makes this correct for Khmer and
-      // the other scripts that don't space words at all — see its own comment in
-      // `timeline/textAnimation.ts`. `globalWordIndex` only advances on WORD segments, matching
-      // `splitWords`'s own counting exactly, so `wordHighlight.activeWordIndex` (computed FROM
-      // `splitWords`) always lands on the same word this loop actually colors.
-      let globalWordIndex = 0;
-      block.lines.forEach((line, i) => {
-        const y = firstBaseline + block.lineHeight * i;
-        let x = drawLeft;
-        for (const token of segmentLine(line)) {
-          if (token.text.length === 0) continue;
-          if (!token.isWord) {
-            x += context.measureText(token.text).width;
-            continue;
-          }
-          context.fillStyle = globalWordIndex === wordHighlight.activeWordIndex ? wordHighlight.highlightColor : style.color;
-          context.fillText(token.text, x, y);
-          x += context.measureText(token.text).width;
-          globalWordIndex++;
-        }
-      });
-    } else {
-      context.fillStyle = style.color;
-      drawLines((line, x, y) => context.fillText(line, x, y));
-    }
-    context.restore();
+    drawTextFrame(context, frameWidth, frameHeight, content, style, wordHighlight, customFonts);
   }
 
   private syncAudioTracks(project: Project, time: number, playing: boolean): void {

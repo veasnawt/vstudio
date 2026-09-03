@@ -41,7 +41,7 @@ export function computeGroupMoveOverrides(
     const found = findClip(project, id);
     if (!found) continue;
     const asset = findAsset(project, found.clip.assetId);
-    if (found.track.kind === "video" && (asset?.kind === "video" || asset?.kind === "image")) {
+    if (found.track.kind === "video" && (asset?.kind === "video" || asset?.kind === "image" || asset?.kind === "color")) {
       const t = found.clip.transform ?? IDENTITY_TRANSFORM;
       overrides.push({ clipId: id, transform: { ...t, offsetX: t.offsetX + deltaX, offsetY: t.offsetY + deltaY } });
     } else if (found.track.kind === "text" && asset?.kind === "text") {

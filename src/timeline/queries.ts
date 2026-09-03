@@ -1,5 +1,5 @@
 import { clipEnd } from "../project/createProject.ts";
-import type { Clip, Project, Track } from "../project/types.ts";
+import type { Clip, Project, Track, TrackKind } from "../project/types.ts";
 
 /** The clip playing at `time` on this track, if any. Ranges are half-open — `[start, end)` — so two
  *  adjacent clips never both claim the boundary frame, which would make playback flicker between
@@ -8,18 +8,35 @@ export function clipAtTime(track: Track, time: number): Clip | undefined {
   return track.clips.find((c) => time >= c.timelineStart && time < clipEnd(c));
 }
 
-/** Every time value worth snapping to while dragging: zero, clip edges, and the playhead. `excludeId`
- *  drops the clip being dragged, which would otherwise snap to where it already is. */
-export function snapPoints(project: Project, excludeClipId?: string, playhead?: number): number[] {
+/** Every time value worth snapping to while dragging: zero, clip edges, and the playhead.
+ *
+ *  `trackKind`, when given, only collects edges from tracks of that SAME kind — `moveClip` already
+ *  refuses to land a clip on a different-kind track, so a video clip being dragged can only ever end
+ *  up on another video track anyway; without this filter, its snap points were pulled from every
+ *  track regardless of kind, so it could get magnetically pulled toward some numerically-nearby text
+ *  caption or audio clip's edge that has nothing to do with where it can actually land — noise that
+ *  worked against exactly the "two clips of the same kind stick together" feel this is for. Omit it
+ *  to fall back to every track (used by non-drag callers that don't have a kind to scope to).
+ *
+ *  `excludeClipIds` drops the clip(s) being dragged, which would otherwise snap to where they
+ *  already are — a plain array (not just one id) so a multi-clip group drag can exclude every
+ *  selected clip, not only the one directly under the pointer; otherwise the dragged clip could snap
+ *  against its own group-mate's edge, which never means anything useful. */
+export function snapPoints(
+  project: Project,
+  options?: { trackKind?: TrackKind; excludeClipIds?: string[]; playhead?: number }
+): number[] {
+  const exclude = new Set(options?.excludeClipIds ?? []);
   const points = new Set<number>([0]);
   for (const track of project.sequence.tracks) {
+    if (options?.trackKind && track.kind !== options.trackKind) continue;
     for (const clip of track.clips) {
-      if (clip.id === excludeClipId) continue;
+      if (exclude.has(clip.id)) continue;
       points.add(clip.timelineStart);
       points.add(clipEnd(clip));
     }
   }
-  if (playhead !== undefined) points.add(playhead);
+  if (options?.playhead !== undefined) points.add(options.playhead);
   return [...points].sort((a, b) => a - b);
 }
 

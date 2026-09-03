@@ -1,5 +1,21 @@
 import { newId } from "./createProject.ts";
-import type { Asset, ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorCurve, ColorGrading, Project, Sequence, TextCrop, TextStyle, Track } from "./types.ts";
+import type {
+  Asset,
+  ChromaKeySettings,
+  Clip,
+  ClipEffects,
+  ClipTransform,
+  ColorCurve,
+  ColorGrading,
+  CustomFontAsset,
+  CustomSfxAsset,
+  LutAsset,
+  Project,
+  Sequence,
+  TextCrop,
+  TextStyle,
+  Track,
+} from "./types.ts";
 import { DEFAULT_TEXT_STYLE, IDENTITY_CURVE, PROJECT_SCHEMA_VERSION } from "./types.ts";
 import { FONT_REGISTRY } from "./fonts.ts";
 import { TRANSITION_TYPE_OPTIONS } from "../timeline/transitions.ts";
@@ -49,7 +65,7 @@ function parseTextStyle(raw: unknown): TextStyle {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const align = r.align === "left" || r.align === "right" ? r.align : "center";
   // Validated against the actual registry, not just "is this a string" — a font id from a NEWER
-  // VStudio build (or a hand-edited file) that this build doesn't bundle a file for falls back to the
+  // VCut build (or a hand-edited file) that this build doesn't bundle a file for falls back to the
   // default rather than pointing `computeTextBlock`/export at a font that doesn't exist.
   const fontFamily =
     typeof r.fontFamily === "string" && FONT_REGISTRY.some((f) => f.id === r.fontFamily)
@@ -77,7 +93,7 @@ function parseTextStyle(raw: unknown): TextStyle {
 
 function parseAsset(raw: Record<string, unknown>): Asset {
   const kind = str(raw.kind, "asset kind");
-  if (kind !== "video" && kind !== "audio" && kind !== "image" && kind !== "text") {
+  if (kind !== "video" && kind !== "audio" && kind !== "image" && kind !== "text" && kind !== "color") {
     throw new ProjectFormatError(`Project file has an unknown asset kind: ${kind}`);
   }
   // Optional fields are spread in only when actually present, never written as an explicit
@@ -103,7 +119,74 @@ function parseAsset(raw: Record<string, unknown>): Asset {
     ...(typeof raw.offline === "boolean" ? { offline: raw.offline } : null),
     ...(typeof raw.hiddenFromLibrary === "boolean" ? { hiddenFromLibrary: raw.hiddenFromLibrary } : null),
     ...(kind === "text" ? { textContent: str(raw.textContent, "text content", ""), textStyle: parseTextStyle(raw.textStyle) } : null),
+    // Same "additive presentation data, not something that defines what the asset fundamentally IS"
+    // spirit as `textContent`/`textStyle` above — a missing/malformed color falls back to black rather
+    // than losing the whole asset, matching `parseChromaKey`'s own hex-validation fallback.
+    ...(kind === "color"
+      ? { color: typeof raw.color === "string" && /^#[0-9a-fA-F]{6}$/.test(raw.color) ? raw.color : "#000000" }
+      : null),
   };
+}
+
+/** Same field-by-field-lenient, drop-the-malformed-entry spirit `parseTransformKeyframes` uses for a
+ *  keyframe array — a project's LUT/font/SFX libraries are additive reusable-asset lists, not something
+ *  that defines what the project fundamentally IS, so one corrupted entry loses only itself, not the
+ *  whole project. Requires a real `id`+`relPath` (the two fields every consumer actually keys off of —
+ *  `Clip.lutId`, `customSfxUrl`); anything else falls back to a sensible default rather than dropping
+ *  the entry. */
+function parseLutAsset(raw: unknown): LutAsset | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.relPath !== "string") return undefined;
+  return {
+    id: r.id,
+    name: str(r.name, "LUT name", r.id),
+    relPath: r.relPath,
+    size: num(r.size, "LUT size", 0),
+    importedAt: num(r.importedAt, "LUT import time", 0),
+  };
+}
+
+function parseLuts(raw: unknown): LutAsset[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(parseLutAsset).filter((l): l is LutAsset => l !== undefined);
+}
+
+/** Mirrors `parseLutAsset`, for a `CustomFontAsset`. */
+function parseCustomFontAsset(raw: unknown): CustomFontAsset | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.relPath !== "string") return undefined;
+  return {
+    id: r.id,
+    name: str(r.name, "custom font name", r.id),
+    relPath: r.relPath,
+    cssFamily: str(r.cssFamily, "custom font family", `VCutCustom${r.id}`),
+    importedAt: num(r.importedAt, "custom font import time", 0),
+  };
+}
+
+function parseCustomFonts(raw: unknown): CustomFontAsset[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(parseCustomFontAsset).filter((f): f is CustomFontAsset => f !== undefined);
+}
+
+/** Mirrors `parseLutAsset`, for a `CustomSfxAsset`. */
+function parseCustomSfxAsset(raw: unknown): CustomSfxAsset | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.relPath !== "string") return undefined;
+  return {
+    id: r.id,
+    label: str(r.label, "custom sfx label", r.id),
+    relPath: r.relPath,
+    importedAt: num(r.importedAt, "custom sfx import time", 0),
+  };
+}
+
+function parseCustomSfx(raw: unknown): CustomSfxAsset[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(parseCustomSfxAsset).filter((s): s is CustomSfxAsset => s !== undefined);
 }
 
 /** Lenient by design, unlike the rest of this file: `transform` is purely additive enhancement data
@@ -443,11 +526,11 @@ export function deserializeProject(json: string): Project {
   if (!raw || typeof raw !== "object") throw new ProjectFormatError("Project file is empty");
 
   const version = num(raw.schemaVersion, "schema version", 0);
-  // A file written by a NEWER VStudio may use fields this build would drop on the next save,
+  // A file written by a NEWER VCut may use fields this build would drop on the next save,
   // quietly destroying work. Refuse rather than round-trip it lossily.
   if (version > PROJECT_SCHEMA_VERSION) {
     throw new ProjectFormatError(
-      `This project was created by a newer version of VStudio (format ${version}, this build reads ${PROJECT_SCHEMA_VERSION}). Update VStudio to open it.`
+      `This project was created by a newer version of VCut (format ${version}, this build reads ${PROJECT_SCHEMA_VERSION}). Update VCut to open it.`
     );
   }
 
@@ -471,6 +554,13 @@ export function deserializeProject(json: string): Project {
         192
       ),
     },
+    // `[]` for a project file saved before these libraries existed — same backward-compatible default
+    // every other field added after `PROJECT_SCHEMA_VERSION`'s last bump uses (e.g. `Track.gain`/`.pan`
+    // above), rather than bumping the schema version for what's purely an additive, empty-by-default
+    // list.
+    luts: parseLuts(raw.luts),
+    customFonts: parseCustomFonts(raw.customFonts),
+    customSfx: parseCustomSfx(raw.customSfx),
   };
 
   // A clip pointing at an asset that isn't in the file would crash the compositor on first render.

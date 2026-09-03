@@ -1,10 +1,10 @@
 import { Capacitor } from "@capacitor/core";
 import { deserializeProject } from "../project/serialize.ts";
-import type { Asset, Project } from "../project/types.ts";
+import type { Asset, CustomSfxAsset, Project } from "../project/types.ts";
 import { nativeCancelExport, nativeExportAvailable, nativeStartExport, nativeWatchExport } from "./nativeExport.ts";
 import { nativeDeleteMedia, nativeImportMedia, nativeLoadProject, nativeMediaUrl, nativeSaveProject } from "./nativeStorage.ts";
 
-/** Browser-side client for VStudio's server routes.
+/** Browser-side client for VCut's server routes.
  *
  *  All paths are relative, so this works unchanged whether the app is served from `next dev` on
  *  :3001 or from the packaged desktop app's own loopback port. On the native (Capacitor) shell —
@@ -12,7 +12,7 @@ import { nativeDeleteMedia, nativeImportMedia, nativeLoadProject, nativeMediaUrl
  *  and delegates to `nativeStorage.ts` instead, which is the ONE thing this session's mobile-app plan
  *  documents as needing per-function runtime branches rather than two parallel files (Capacitor
  *  bundles a single JS build that must also run in a plain dev browser). */
-const BASE = "/api/vstudio";
+const BASE = "/api/vcut";
 const isNative = Capacitor.isNativePlatform();
 
 export class ApiRequestError extends Error {
@@ -124,6 +124,48 @@ export function waveformUrl(projectId: string, asset: Asset): string | null {
 
 export function exportUrl(projectId: string, fileName: string): string {
   return `${mediaUrl(projectId, fileName)}&kind=export`;
+}
+
+/** URL for one bundled `SFX_REGISTRY` catalog entry's audio file (`project/sfx.ts`'s own `file`) —
+ *  served as a plain static asset, not project-scoped the way `mediaUrl` is: a bundled sound effect
+ *  isn't stored per-project, it ships with the app the same way a bundled font's `.ttf` does (see
+ *  `fonts.ts`'s own `resolveFontVariant` doc comment for the matching "packages/vcut/assets/" bundled-
+ *  file convention this mirrors, one directory over — `packages/vcut/assets/sfx/`). */
+export function sfxAssetUrl(file: string): string {
+  return `/sfx/${file}`;
+}
+
+/** URL for one entry in the project's own "My Sounds" library (`project.customSfx`) — reuses
+ *  `mediaUrl`'s exact same project-relative-path convention a placed `Asset` uses, since a
+ *  `CustomSfxAsset` lives in the SAME project media tree, just not itself placed on the timeline (see
+ *  `CustomSfxAsset`'s own doc comment for why it's a separate library, not a plain `Asset`). */
+export function customSfxUrl(projectId: string, sfx: CustomSfxAsset): string {
+  return mediaUrl(projectId, sfx.relPath);
+}
+
+/** Imports a file into the project's own "My Sounds" library — same `FormData` upload shape as
+ *  `importMedia`, against a dedicated route so the result lands in `project.customSfx` (a reusable
+ *  library entry) rather than `project.assets` (a placeable clip source); see `CustomSfxAsset`'s own
+ *  doc comment for why the two are kept separate. No native branch yet — same v1 scope cut
+ *  `startInpaint`/`startCaptions` already document for a feature that needs the desktop/browser server,
+ *  not (yet) the on-device native shell. */
+export async function importCustomSfx(projectId: string, file: File): Promise<CustomSfxAsset> {
+  if (isNative) throw new ApiRequestError("Importing sound effects isn't available on this device yet.", 501, "sfx-unavailable");
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${BASE}/sfx?projectId=${encodeURIComponent(projectId)}`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await unwrap<{ sfx: CustomSfxAsset }>(response);
+  return body.sfx;
+}
+
+/** Removes one "My Sounds" library entry — same `relPath`-keyed delete shape as `deleteMedia`. */
+export async function deleteCustomSfx(projectId: string, sfx: CustomSfxAsset): Promise<void> {
+  if (isNative) return;
+  const params = new URLSearchParams({ projectId, relPath: sfx.relPath });
+  await unwrap<{ ok: boolean }>(await fetch(`${BASE}/sfx?${params}`, { method: "DELETE" }));
 }
 
 export interface ExportStarted {
@@ -405,7 +447,7 @@ export function watchLocalSetup(
 // ---------------------------------------------------------------------------
 // Auto Captions — same fire-and-track-via-SSE job shape as Remove Object
 // (startInpaint/watchInpaint/cancelInpaint/inpaintAvailable above), against
-// /api/vstudio/captions instead. One provider (OpenAI Whisper), so the
+// /api/vcut/captions instead. One provider (OpenAI Whisper), so the
 // key-status/save functions are simpler than Remove Object's own
 // multi-provider equivalents — no provider argument, no "active provider"
 // concept.

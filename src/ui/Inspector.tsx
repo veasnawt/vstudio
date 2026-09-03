@@ -168,7 +168,7 @@ function AlignButton({ active, onClick, children }: { active: boolean; onClick: 
 type CaptionsPhase = "idle" | "running" | "failed" | "cancelled";
 
 /** Auto Captions' Inspector content — transcribes THIS clip's own on-screen time range (via
- *  `/api/vstudio/captions`, `clipId` present) and lands the result as real, editable text clips on a
+ *  `/api/vcut/captions`, `clipId` present) and lands the result as real, editable text clips on a
  *  new "Captions" track, all in one undo-able step (`landCaptions` → `AddCaptionsCommand`).
  *
  *  Structurally a smaller `RemoveObjectSection`: same availability/credentials/progress-phase shape,
@@ -351,7 +351,7 @@ type LocalSetupPhase = "idle" | "running" | "done" | "failed" | "cancelled";
  *  The provider dropdown/status-sentence/key-input interaction below is a direct port of Universe's
  *  `RixieApiKeySection` (packages/universe/src/components/SettingsPanel.tsx) — same "switching to an
  *  already-configured provider activates it immediately, a new one just reveals its key field" rule —
- *  adapted to VStudio's own flat-function API client and Tailwind styling instead of Universe's
+ *  adapted to VCut's own flat-function API client and Tailwind styling instead of Universe's
  *  bridge-object pattern and `--os-*` CSS variables.
  *
  *  Job phase state is LOCAL to this component (not the store), exactly like `ExportDialog` keeps its

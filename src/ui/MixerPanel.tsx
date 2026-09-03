@@ -139,7 +139,7 @@ function MixerChannelStrip({ track }: { track: Track }) {
 }
 
 /** The Audio Mixer — a non-modal panel that swaps into the Timeline's own row when toggled (see
- *  `VStudioApp.tsx`'s `bottomPanel` state), styled as a row of professional-NLE-style vertical channel
+ *  `VCutApp.tsx`'s `bottomPanel` state), styled as a row of professional-NLE-style vertical channel
  *  strips: Pan knob, dB-scaled fader + live peak-hold meter, Mute/Solo, plus one Master strip (fader +
  *  meter only — panning the whole mix isn't a per-channel routing question the way it is for one
  *  track, see `Sequence.masterGain`'s own doc comment). Deliberately scoped to audio tracks only,

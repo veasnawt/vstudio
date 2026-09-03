@@ -4,7 +4,7 @@ import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION, SHORT_PRESET } from "./type
 /** `crypto.randomUUID` is gated to secure contexts (HTTPS, or literally `localhost`) — a plain LAN
  *  IP over HTTP does NOT count, even one this app's own local-only guard explicitly allows for
  *  phone/tablet testing (see `_lib/localOnly.ts`'s `isPrivateLanIPv4`). Confirmed live: opening
- *  VStudio on an iPad/iPhone at `http://192.168.x.x` made `crypto.randomUUID` simply undefined,
+ *  VCut on an iPad/iPhone at `http://192.168.x.x` made `crypto.randomUUID` simply undefined,
  *  throwing "crypto.randomUUID is not a function" the instant anything tried to create an id — which
  *  is nearly every action (add a clip, add a track, split, import...). `crypto.getRandomValues`,
  *  unlike `randomUUID`, is NOT restricted to secure contexts, so it's the real fallback here rather
@@ -106,6 +106,9 @@ export function createProject(
       crf: 20,
       audioBitrateKbps: 192,
     },
+    luts: [],
+    customFonts: [],
+    customSfx: [],
   };
 }
 

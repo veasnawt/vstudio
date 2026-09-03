@@ -2,7 +2,7 @@
 
 import React, { useMemo, useRef, useState } from "react";
 import { Capacitor } from "@capacitor/core";
-import { Close, Image as ImageIcon, Music, Text as TextIcon, Video } from "@veasnawt/vicons";
+import { Art, Close, Image as ImageIcon, Music, Text as TextIcon, Video } from "@veasnawt/vicons";
 import { thumbnailUrl } from "../api/client.ts";
 import { AddClipCommand } from "../commands/index.ts";
 import { translateText } from "../i18n/translations.ts";
@@ -43,11 +43,12 @@ const KIND_BADGE: Record<Asset["kind"], { Icon: typeof Video; className: string 
   audio: { Icon: Music, className: "text-emerald-300" },
   image: { Icon: ImageIcon, className: "text-violet-300" },
   text: { Icon: TextIcon, className: "text-amber-300" },
+  color: { Icon: Art, className: "text-rose-300" },
 };
 
 type SortKey = "name" | "duration" | "imported";
 
-/** Matches `studios/vstudio/app/api/vstudio/_lib/mediaFormats.ts`'s own list exactly — that file is
+/** Matches `studios/vcut/app/api/vcut/_lib/mediaFormats.ts`'s own list exactly — that file is
  *  the real authority (it's what actually decides whether an uploaded file gets accepted), this is
  *  just what the OS file picker is told to show. Extensions, not MIME-wildcard patterns
  *  (`accept="audio/*"` etc.) — a wildcard's OS-level filter is built from the browser's own
@@ -353,7 +354,7 @@ export function MediaLibrary({ onAssetAdded }: { onAssetAdded?: () => void } = {
                   onTouchStart={(e) => beginAssetDrag(e, asset)}
                   onDoubleClick={() => addAssetAtPlayhead(asset.id)}
                   // Only wired when `onAssetAdded` is passed — i.e. only in the mobile bottom-sheet
-                  // usage (see VStudioApp.tsx), where a plain tap is the ONLY practical way to place a
+                  // usage (see VCutApp.tsx), where a plain tap is the ONLY practical way to place a
                   // clip (the sheet replaces the Timeline entirely while open, so there's nothing to
                   // drag onto, and touch has no double-tap equivalent to `onDoubleClick` above). Left
                   // unwired for the desktop persistent column, where a bare click choosing to do

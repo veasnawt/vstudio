@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildAudioOnlyExportPlan } from "../src/export/buildAudioOnlyExportPlan.ts";
-import { addClip, setClipGain, setMasterGain, setTrackGain } from "../src/timeline/operations.ts";
+import { addClip, setClipGain, setClipTransitionIn, setMasterGain, setTrackFlag, setTrackGain } from "../src/timeline/operations.ts";
+import { clipEnd } from "../src/project/createProject.ts";
 import { audioAsset, audioTrackId, clipsOf, emptyProject, videoAsset, videoTrackId } from "./fixture.ts";
 
 /** Mirrors `export.test.ts`'s own `options`/`plan`/`filterGraph` helpers, scoped to this file's
@@ -68,5 +69,36 @@ describe("buildAudioOnlyExportPlan with track/master gain", () => {
     const graph = filterGraph(plan(project).args);
 
     assert.ok(!graph.includes("[mastered]"));
+  });
+});
+
+describe("buildAudioOnlyExportPlan with audio-track transitions", () => {
+  it("blends a transition between two audio-track clips with acrossfade, instead of a hard cut", () => {
+    const base = emptyProject([videoAsset("asset1", 10), audioAsset("a", 5), audioAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /acrossfade=d=1\.000000/);
+  });
+
+  it("skips a muted audio track entirely, transitions and all", () => {
+    const base = emptyProject([videoAsset("asset1", 10), audioAsset("a", 5), audioAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, audioTrackId(project), "a", 0);
+    const [clipA] = clipsOf(project, audioTrackId(project));
+    project = addClip(project, audioTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, audioTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "crossfade" });
+    project = setTrackFlag(project, audioTrackId(project), "muted", true);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("acrossfade="));
   });
 });

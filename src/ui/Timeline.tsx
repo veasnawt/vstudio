@@ -120,7 +120,7 @@ export function Timeline() {
   }, []);
 
   // Same `lg` breakpoint every other mobile/desktop layout branch in this app already uses
-  // (VStudioApp.tsx's own `timelineHeight` seed) — reactive here (not a one-time check) since
+  // (VCutApp.tsx's own `timelineHeight` seed) — reactive here (not a one-time check) since
   // rotating a tablet or resizing a desktop window across it mid-session needs to actually flip
   // between "fixed-center playhead, scroll scrubs" (mobile) and "moving playhead, independent scroll"
   // (desktop) behavior live, not just at first mount.
@@ -318,7 +318,7 @@ export function Timeline() {
     };
   }, [zoomAround]);
 
-  // Keyboard shortcuts (Ctrl/⌘ +/-/0) live in VStudioApp's global keydown handler, which has no
+  // Keyboard shortcuts (Ctrl/⌘ +/-/0) live in VCutApp's global keydown handler, which has no
   // access to this component's scroll container — it dispatches this event instead of calling the
   // store directly, so a keyboard-triggered zoom gets the same cursor-anchoring treatment (anchored
   // on the viewport center, since a keypress has no cursor position) as the mouse-driven paths below.
@@ -328,8 +328,8 @@ export function Timeline() {
       if (detail.reset) resetZoom();
       else if (detail.factor) zoomAround(detail.factor);
     }
-    window.addEventListener("vstudio:zoom", onZoomEvent);
-    return () => window.removeEventListener("vstudio:zoom", onZoomEvent);
+    window.addEventListener("vcut:zoom", onZoomEvent);
+    return () => window.removeEventListener("vcut:zoom", onZoomEvent);
   }, [zoomAround, resetZoom]);
 
   /** Whether `track` should render at `EMPTY_TRACK_HEIGHT` instead of `TRACK_HEIGHT` — mobile only,
@@ -489,7 +489,7 @@ export function Timeline() {
   );
 
   /** Drag either export-range flag to nudge it — the fine-adjustment half of the "I/O sets it at the
-   *  playhead, drag refines it" pair (see `VStudioApp.tsx`'s own `I`/`O` shortcut handlers for the
+   *  playhead, drag refines it" pair (see `VCutApp.tsx`'s own `I`/`O` shortcut handlers for the
    *  other half). `stopPropagation` keeps this from ALSO registering as a `scrub` press on the ruler
    *  underneath it, which would yank the playhead to the same spot the instant you grab the flag. */
   const scrubExportStart = useCallback(
@@ -685,7 +685,7 @@ export function Timeline() {
         {hasExportRange && (
           // Same amber as the in/out markers themselves — the visual link makes it obvious this
           // button is what removes THOSE, not some unrelated action. Also reachable via Shift+X (see
-          // VStudioApp.tsx) — this is the discoverable version for anyone who wouldn't otherwise know
+          // VCutApp.tsx) — this is the discoverable version for anyone who wouldn't otherwise know
           // the shortcut, or the "Reset to full timeline" link buried inside the Export dialog.
           <button
             onClick={() => clearExportRange()}
@@ -778,7 +778,7 @@ export function Timeline() {
 
         <div
           ref={scrollRef}
-          id="vstudio-timeline-lanes"
+          id="vcut-timeline-lanes"
           // Both axes scroll together in this one container now — with more than a handful of tracks,
           // `overflow-y-hidden` here used to CLIP the extra rows entirely rather than making them
           // reachable, silently hiding tracks with no way to scroll down to them. `scrollbar-none`
@@ -994,7 +994,7 @@ export function Timeline() {
 
             {/* Export range markers — same shape/positioning convention as the playhead marker below,
                 amber instead of rose so the two are never confused. Unlike the playhead, each has a
-                real drag handle (the small flag): `I`/`O` (see VStudioApp.tsx) set them at the current
+                real drag handle (the small flag): `I`/`O` (see VCutApp.tsx) set them at the current
                 playhead from nothing, and the flag refines an already-set point from there. Each is
                 independent — setting only an out-point (leaving in at the implicit start) is valid. */}
             {exportRangeStart !== null && (
@@ -1058,7 +1058,7 @@ export function Timeline() {
         <div style={{ width: isMobile ? 0 : HEADER_WIDTH }} className="shrink-0" />
         <div
           role="scrollbar"
-          aria-controls="vstudio-timeline-lanes"
+          aria-controls="vcut-timeline-lanes"
           aria-orientation="horizontal"
           aria-valuemin={0}
           aria-valuemax={Math.round(maxScrollLeft)}

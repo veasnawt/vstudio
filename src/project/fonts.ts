@@ -1,4 +1,4 @@
-/** The registry of fonts VStudio text clips can use — the ONE place both renderers (`PlaybackEngine`'s
+/** The registry of fonts VCut text clips can use — the ONE place both renderers (`PlaybackEngine`'s
  *  canvas compositor, via `computeTextBlock`, and `buildExportPlan`'s FFmpeg `drawtext` chain) and the
  *  Inspector's font picker read from, so a font can never exist in one without the other.
  *
@@ -9,8 +9,10 @@
  *  Khmer and Hanuman, for instance, are Google-Fonts-variable-only) — every font here was confirmed to
  *  ship genuinely separate static files for the styles it lists before being added. */
 
+import type { CustomFontAsset } from "./types.ts";
+
 export interface FontVariantFiles {
-  /** Filename within `packages/vstudio/assets/fonts/` — never a path, so there's no ambiguity between
+  /** Filename within `packages/vcut/assets/fonts/` — never a path, so there's no ambiguity between
    *  the dev filesystem location and the packaged app's (see `ffmpeg.ts`'s `resolveFontsDir`). */
   regular: string;
   bold?: string;
@@ -29,11 +31,44 @@ export interface FontDefinition {
   files: FontVariantFiles;
 }
 
+/** Resolves a `TextStyle.fontFamily` id to the `FontDefinition`-shaped record both text renderers
+ *  (`playback/textLayout.ts`'s `computeTextBlock`, and export's own drawtext font selection) actually
+ *  need — the ONE place that decides whether a given id names a BUNDLED font (this registry) or one of
+ *  the project's own uploaded `CustomFontAsset` entries, so neither renderer has to know that
+ *  distinction exists.
+ *
+ *  `customFonts` is checked FIRST, not `fontById` — an id could otherwise collide only in theory (a
+ *  custom font's id is a fresh `newId(...)`, never a bundled font's short slug), but checking the
+ *  project's own library first is also simply the more useful precedence: a user who uploads a font
+ *  almost always means to use THEIR font over a same-named bundled one, if that ever happened. A custom
+ *  font is single-weight only (see `CustomFontAsset`'s own doc comment) — its `files` always reports
+ *  just `regular`, so `resolveFontVariant`/`fontFileFor` naturally clamp any requested bold/italic back
+ *  to the one real face it has, the exact same "clamped to whichever real file exists" leniency they
+ *  already give a bundled single-weight font like `moul`.
+ *
+ *  Falls back to `fontById` (bundled-only, itself falling back to the default font for an unknown id)
+ *  when no custom font matches — so an id belonging to neither library (an older project, a hand-edited
+ *  file, or a custom font that's since been removed from `customFonts`) still resolves to SOMETHING
+ *  renderable rather than throwing, matching `fontById`'s own "never let a bad value break rendering"
+ *  contract. */
+export function resolveFont(fontFamily: string, customFonts: CustomFontAsset[]): FontDefinition {
+  const custom = customFonts.find((f) => f.id === fontFamily);
+  if (custom) {
+    return {
+      id: custom.id,
+      label: custom.name,
+      cssFamily: custom.cssFamily,
+      files: { regular: custom.relPath },
+    };
+  }
+  return fontById(fontFamily);
+}
+
 export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "lato",
     label: "Lato",
-    cssFamily: "VStudioLato",
+    cssFamily: "VCutLato",
     files: {
       regular: "Lato-Regular.ttf",
       bold: "Lato-Bold.ttf",
@@ -44,7 +79,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "battambang",
     label: "Battambang (Khmer)",
-    cssFamily: "VStudioBattambang",
+    cssFamily: "VCutBattambang",
     files: {
       // No italic — Khmer script has no italic convention, and Battambang (like every Khmer font
       // checked for this) ships none. `resolveFontVariant` below is what keeps this from becoming a
@@ -57,7 +92,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "moul",
     label: "Moul (Khmer display)",
-    cssFamily: "VStudioMoul",
+    cssFamily: "VCutMoul",
     files: {
       // Single-weight display face (already heavy/bold by design, the way a headline typeface often
       // is) — bold/italic toggles simply have nothing to fall forward to, same reasoning as above.
@@ -73,7 +108,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "roboto",
     label: "Roboto",
-    cssFamily: "VStudioRoboto",
+    cssFamily: "VCutRoboto",
     files: {
       regular: "Roboto-Regular.ttf",
       bold: "Roboto-Bold.ttf",
@@ -84,7 +119,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "opensans",
     label: "Open Sans",
-    cssFamily: "VStudioOpenSans",
+    cssFamily: "VCutOpenSans",
     files: {
       regular: "OpenSans-Regular.ttf",
       bold: "OpenSans-Bold.ttf",
@@ -95,7 +130,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "inter",
     label: "Inter",
-    cssFamily: "VStudioInter",
+    cssFamily: "VCutInter",
     files: {
       regular: "Inter-Regular.ttf",
       bold: "Inter-Bold.ttf",
@@ -106,7 +141,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "montserrat",
     label: "Montserrat",
-    cssFamily: "VStudioMontserrat",
+    cssFamily: "VCutMontserrat",
     files: {
       regular: "Montserrat-Regular.ttf",
       bold: "Montserrat-Bold.ttf",
@@ -117,7 +152,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "poppins",
     label: "Poppins",
-    cssFamily: "VStudioPoppins",
+    cssFamily: "VCutPoppins",
     files: {
       regular: "Poppins-Regular.ttf",
       bold: "Poppins-Bold.ttf",
@@ -128,7 +163,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "nunito",
     label: "Nunito",
-    cssFamily: "VStudioNunito",
+    cssFamily: "VCutNunito",
     files: {
       regular: "Nunito-Regular.ttf",
       bold: "Nunito-Bold.ttf",
@@ -139,7 +174,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "raleway",
     label: "Raleway",
-    cssFamily: "VStudioRaleway",
+    cssFamily: "VCutRaleway",
     files: {
       regular: "Raleway-Regular.ttf",
       bold: "Raleway-Bold.ttf",
@@ -150,7 +185,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "worksans",
     label: "Work Sans",
-    cssFamily: "VStudioWorkSans",
+    cssFamily: "VCutWorkSans",
     files: {
       regular: "WorkSans-Regular.ttf",
       bold: "WorkSans-Bold.ttf",
@@ -161,7 +196,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "merriweather",
     label: "Merriweather",
-    cssFamily: "VStudioMerriweather",
+    cssFamily: "VCutMerriweather",
     files: {
       regular: "Merriweather-Regular.ttf",
       bold: "Merriweather-Bold.ttf",
@@ -172,7 +207,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "playfairdisplay",
     label: "Playfair Display",
-    cssFamily: "VStudioPlayfairDisplay",
+    cssFamily: "VCutPlayfairDisplay",
     files: {
       regular: "PlayfairDisplay-Regular.ttf",
       bold: "PlayfairDisplay-Bold.ttf",
@@ -183,7 +218,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "lora",
     label: "Lora",
-    cssFamily: "VStudioLora",
+    cssFamily: "VCutLora",
     files: {
       regular: "Lora-Regular.ttf",
       bold: "Lora-Bold.ttf",
@@ -194,7 +229,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "oswald",
     label: "Oswald",
-    cssFamily: "VStudioOswald",
+    cssFamily: "VCutOswald",
     files: {
       regular: "Oswald-Regular.ttf",
       bold: "Oswald-Bold.ttf",
@@ -203,7 +238,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "bebasneue",
     label: "Bebas Neue",
-    cssFamily: "VStudioBebasNeue",
+    cssFamily: "VCutBebasNeue",
     files: {
       regular: "BebasNeue-Regular.ttf",
     },
@@ -211,7 +246,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "anton",
     label: "Anton",
-    cssFamily: "VStudioAnton",
+    cssFamily: "VCutAnton",
     files: {
       regular: "Anton-Regular.ttf",
     },
@@ -219,7 +254,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "pacifico",
     label: "Pacifico (script)",
-    cssFamily: "VStudioPacifico",
+    cssFamily: "VCutPacifico",
     files: {
       regular: "Pacifico-Regular.ttf",
     },
@@ -227,7 +262,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "caveat",
     label: "Caveat (handwriting)",
-    cssFamily: "VStudioCaveat",
+    cssFamily: "VCutCaveat",
     files: {
       regular: "Caveat-Regular.ttf",
       bold: "Caveat-Bold.ttf",
@@ -236,7 +271,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "hanuman",
     label: "Hanuman (Khmer)",
-    cssFamily: "VStudioHanuman",
+    cssFamily: "VCutHanuman",
     files: {
       regular: "Hanuman-Regular.ttf",
       bold: "Hanuman-Bold.ttf",
@@ -245,7 +280,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "kantumruypro",
     label: "Kantumruy Pro (Khmer)",
-    cssFamily: "VStudioKantumruyPro",
+    cssFamily: "VCutKantumruyPro",
     files: {
       regular: "KantumruyPro-Regular.ttf",
       bold: "KantumruyPro-Bold.ttf",
@@ -256,7 +291,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "koulen",
     label: "Koulen (Khmer display)",
-    cssFamily: "VStudioKoulen",
+    cssFamily: "VCutKoulen",
     files: {
       regular: "Koulen-Regular.ttf",
     },
@@ -264,7 +299,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "bokor",
     label: "Bokor (Khmer display)",
-    cssFamily: "VStudioBokor",
+    cssFamily: "VCutBokor",
     files: {
       regular: "Bokor-Regular.ttf",
     },
@@ -272,7 +307,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "angkor",
     label: "Angkor (Khmer display)",
-    cssFamily: "VStudioAngkor",
+    cssFamily: "VCutAngkor",
     files: {
       regular: "Angkor-Regular.ttf",
     },
@@ -280,7 +315,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "dangrek",
     label: "Dangrek (Khmer display)",
-    cssFamily: "VStudioDangrek",
+    cssFamily: "VCutDangrek",
     files: {
       regular: "Dangrek-Regular.ttf",
     },
@@ -288,7 +323,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "siemreap",
     label: "Siemreap (Khmer)",
-    cssFamily: "VStudioSiemreap",
+    cssFamily: "VCutSiemreap",
     files: {
       regular: "Siemreap-Regular.ttf",
     },
@@ -296,7 +331,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "suwannaphum",
     label: "Suwannaphum (Khmer)",
-    cssFamily: "VStudioSuwannaphum",
+    cssFamily: "VCutSuwannaphum",
     files: {
       regular: "Suwannaphum-Regular.ttf",
       bold: "Suwannaphum-Bold.ttf",
@@ -305,7 +340,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "moulpali",
     label: "Moulpali (Khmer display)",
-    cssFamily: "VStudioMoulpali",
+    cssFamily: "VCutMoulpali",
     files: {
       regular: "Moulpali-Regular.ttf",
     },
@@ -313,7 +348,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "nokora",
     label: "Nokora (Khmer)",
-    cssFamily: "VStudioNokora",
+    cssFamily: "VCutNokora",
     files: {
       regular: "Nokora-Regular.ttf",
       bold: "Nokora-Bold.ttf",
@@ -322,7 +357,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "content",
     label: "Content (Khmer)",
-    cssFamily: "VStudioContent",
+    cssFamily: "VCutContent",
     files: {
       regular: "Content-Regular.ttf",
       bold: "Content-Bold.ttf",
@@ -331,7 +366,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "fasthand",
     label: "Fasthand (Khmer script)",
-    cssFamily: "VStudioFasthand",
+    cssFamily: "VCutFasthand",
     files: {
       regular: "Fasthand-Regular.ttf",
     },
@@ -339,7 +374,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "chenla",
     label: "Chenla (Khmer display)",
-    cssFamily: "VStudioChenla",
+    cssFamily: "VCutChenla",
     files: {
       regular: "Chenla-Regular.ttf",
     },
@@ -347,7 +382,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "metal",
     label: "Metal (Khmer display)",
-    cssFamily: "VStudioMetal",
+    cssFamily: "VCutMetal",
     files: {
       regular: "Metal-Regular.ttf",
     },
@@ -355,7 +390,7 @@ export const FONT_REGISTRY: FontDefinition[] = [
   {
     id: "preahvihear",
     label: "Preahvihear (Khmer display)",
-    cssFamily: "VStudioPreahvihear",
+    cssFamily: "VCutPreahvihear",
     files: {
       regular: "Preahvihear-Regular.ttf",
     },

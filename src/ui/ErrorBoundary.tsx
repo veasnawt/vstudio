@@ -7,7 +7,7 @@ interface State {
   error: Error | null;
 }
 
-/** Catches render-time throws anywhere in `VStudioApp`'s own subtree (`VStudioApp.tsx` wraps its
+/** Catches render-time throws anywhere in `VCutApp`'s own subtree (`VCutApp.tsx` wraps its
  *  export in exactly this) and shows a recovery screen instead of the blank, unmounted-React screen
  *  an uncaught render error produces today. Must be a class component — `getDerivedStateFromError`/
  *  `componentDidCatch` have no hooks equivalent; this is the one place in this whole app that's
@@ -36,7 +36,7 @@ export class ErrorBoundary extends React.Component<{ children: React.ReactNode }
       <div className="flex h-full min-h-0 w-full flex-col items-center justify-center gap-4 bg-[#0a0c10] p-6 text-center text-white">
         <h1 className="text-base font-semibold">{t("Something went wrong")}</h1>
         <p className="max-w-md text-xs text-white/60">
-          {t("VStudio hit an unexpected error and couldn't continue. Your project's last save is safe — reloading will get you back to it.")}
+          {t("VCut hit an unexpected error and couldn't continue. Your project's last save is safe — reloading will get you back to it.")}
         </p>
         {/* The raw message, not the full stack — enough for the user to describe what happened when
             reporting a bug, without dumping an intimidating wall of text onto a recovery screen. The

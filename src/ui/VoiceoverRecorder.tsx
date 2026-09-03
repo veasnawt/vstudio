@@ -174,7 +174,7 @@ export function VoiceoverRecorder() {
     useEditorStore.getState().finalizeRecordingIndicator();
   }
 
-  // Sized to match ToolbarButton (VStudioApp.tsx's h-10 icon+label buttons) while recording, but
+  // Sized to match ToolbarButton (VCutApp.tsx's h-10 icon+label buttons) while recording, but
   // wider — the elapsed-time readout needs the room, and a growing/shrinking control is a fine trade
   // for showing the one piece of info (how long you've been talking) that actually matters
   // mid-recording; the timer text already IS this button's label while it's showing.

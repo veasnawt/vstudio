@@ -32,7 +32,16 @@ const DRAG_THRESHOLD = 3;
 // 16px read as too small to reliably hit on a touch device (confirmed dragging these one-handed on a
 // phone-sized viewport during a mobile UX pass) — 24px keeps the dots visually unobtrusive against a
 // full preview frame while roughly doubling the actual hit area (scales with the square of the size).
+// Still the invisible HIT-AREA size (and `clampPointToRect`'s own clamp margin) — kept unchanged from
+// that mobile UX pass. `HANDLE_DOT_SIZE` below is what actually renders now; the two used to be the
+// same value, which made the visible dot itself feel oversized on a mouse-driven desktop preview
+// (reported directly, not a touch-usability complaint) even though the LARGER touch target was and
+// still is the right call.
 const HANDLE_SIZE = 24;
+// The actual visible circle, centered inside `HANDLE_SIZE`'s invisible hit area — a fingertip or mouse
+// cursor still has the full 24px to land on, but the dot itself reads as a precise resize/rotate
+// affordance rather than a chunky one.
+const HANDLE_DOT_SIZE = 10;
 const ROTATE_HANDLE_OFFSET = 28;
 
 type DragMode = "move" | "scale" | "rotate";
@@ -43,6 +52,35 @@ const CORNERS: { x: number; y: number; cursor: string; label: string }[] = [
   { x: 0, y: 1, cursor: "cursor-nesw-resize", label: "bottom-left" },
   { x: 1, y: 1, cursor: "cursor-nwse-resize", label: "bottom-right" },
 ];
+
+type Store = ReturnType<typeof useEditorStore.getState>;
+
+/** Shared by `beginDrag`'s single-clip `onUp` path and the pinch-to-scale effect below — commits a
+ *  plain (non-group) clip transform, respecting the same auto-keyframe rule the Inspector's
+ *  NumberFields use (`upsertKeyframe`) so a canvas gesture and a typed value make the identical
+ *  insert-vs-update decision regardless of which surface produced the new value. Takes `project`/
+ *  `playhead`/`run` as plain arguments rather than reading them off the store internally so each
+ *  caller controls freshness: `onUp` passes its own render-closed-over values (a drag never outlives
+ *  one render's worth of relevant state), while the pinch effect below pulls fresh ones off
+ *  `useEditorStore.getState()` at the moment the gesture ends, since its listeners are NOT recreated
+ *  every render. */
+function commitSingleTransform(
+  target: { clipId: string; hasKeyframes: boolean; timelineStart: number; sequence: { fps: number } },
+  final: ClipTransform,
+  project: Store["project"],
+  playhead: Store["playhead"],
+  run: Store["run"]
+) {
+  if (target.hasKeyframes) {
+    const elapsed = playhead - target.timelineStart;
+    const found = project ? findClip(project, target.clipId) : undefined;
+    const existing = found?.clip.transformKeyframes ?? [];
+    const next = upsertKeyframe(existing, elapsed, final, target.sequence.fps);
+    run(new SetClipTransformKeyframesCommand(target.clipId, next));
+  } else {
+    run(new SetClipTransformCommand(target.clipId, final));
+  }
+}
 
 /** Draggable Position/Scale/Rotation handles overlaid on the Preview canvas — the on-canvas half of
  *  transform editing (Crop stays numeric-only in the Inspector). Shown only when exactly one clip is
@@ -135,7 +173,14 @@ export function TransformHandles({
       // Not just "is this clip selected" — is it the one actually under the playhead right now.
       if (clipAtTime(found.track, playhead)?.id !== found.clip.id) continue;
       const asset = findAsset(project, found.clip.assetId);
-      if (!asset?.width || !asset.height) continue;
+      // A color-matte clip (see `Asset.color`'s own doc comment) has no intrinsic `width`/`height` of
+      // its own — it fills the frame edge-to-edge, same "use the sequence's own size as the stand-in
+      // source size" treatment `PlaybackEngine.drawVideoClip`'s color branch and
+      // `computeVisibleClipBoxes`'s identical gap-fix already use. Without this, a selected color clip
+      // would fail this `width`/`height` guard and simply show no handles at all.
+      const assetWidth = asset?.kind === "color" ? project.sequence.width : asset?.width;
+      const assetHeight = asset?.kind === "color" ? project.sequence.height : asset?.height;
+      if (!assetWidth || !assetHeight) continue;
       // Resolved at the CURRENT PLAYHEAD, not the clip's raw static `transform` — for a keyframed
       // clip this is the interpolated value for whatever frame is actually showing, so the handles
       // draw/drag from where the box visually IS, not a fixed authored value. Zero behavior change
@@ -147,15 +192,117 @@ export function TransformHandles({
         savedTransform,
         hasKeyframes: hasTransformKeyframes(found.clip),
         timelineStart: found.clip.timelineStart,
-        assetWidth: asset.width,
-        assetHeight: asset.height,
+        assetWidth,
+        assetHeight,
         sequence: project.sequence,
       };
     }
     return null;
   })();
 
+  // Kept in sync every render so the pinch effect below (which attaches once per `canvas` identity,
+  // not once per render) can always read the CURRENT selection/playhead instead of whatever was
+  // selected back when the effect happened to be set up — the same staleness `beginDrag` itself never
+  // has to worry about, since it's invoked fresh from an inline JSX handler on every render.
+  const resolvedRef = useRef(resolved);
+  resolvedRef.current = resolved;
+
   const isGroupSelection = selectedClipIds.length > 1;
+
+  // Two-finger pinch scales the currently selected clip directly on the canvas — the gesture every
+  // mobile video editor uses for "make this bigger/smaller", alongside (not replacing) the
+  // corner-handle drag, which stays the way to resize anchored on a specific corner. Scales around the
+  // clip's own center (offset unchanged) — the same "no anchor" fallback `beginDrag`'s own scale mode
+  // already falls back to, so this is an existing, established transform shape, not a new one.
+  //
+  // Listens on `window`, not the canvas: the move/corner/rotate handles below are `position: fixed`
+  // siblings of the canvas (not DOM descendants of it — see their own JSX comments on why), each with
+  // its own `pointer-events-auto` hit area stacked at `zIndex: 40`, ABOVE the canvas. A two-finger
+  // touch landing on the move-handle (which covers the clip's full box — the common case, since a
+  // pinch naturally starts centered on the clip you're resizing) would hit that div, not the canvas
+  // underneath — confirmed live: a canvas-only listener never saw the touch at all, and the move
+  // handle's own touchstart quietly turned the gesture into a single-finger move drag instead
+  // (confirmed via a real two-touch simulation: the clip visibly slid left, exactly like a single
+  // stray finger dragging it, instead of scaling). `touchstart` is registered in the CAPTURE phase
+  // specifically so it runs BEFORE any handle's own bubble-phase React `onTouchStart` (React 17+
+  // delegates its synthetic handlers to the root in the bubble phase — a capture listener anywhere
+  // above always wins the race) — on a genuine 2-touch start with a clip selected, `stopPropagation()`
+  // keeps that event from ever reaching the handle at all, so `beginDrag` never starts a move/scale/
+  // rotate drag out from under the pinch. `touchmove`/`touchend` don't need capture: by then `dragRef`
+  // is guaranteed still null (nothing got the chance to claim it), so there's nothing left to race.
+  useEffect(() => {
+    if (!canvas) return;
+    let lastDistance = 0;
+    let pinchTransform: ClipTransform | null = null;
+
+    function distance(touches: TouchList) {
+      const [a, b] = [touches[0], touches[1]];
+      return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    }
+
+    // Window-scoped listeners have to opt themselves OUT of anything outside the preview — without
+    // this, a pinch on the TIMELINE (its own, separate pinch-zoom handler) while a clip happens to be
+    // selected would get `stopPropagation()`-ed by this capture listener before Timeline's own bubble-
+    // phase one ever saw it, silently breaking timeline pinch-zoom any time a clip is selected. The
+    // canvas's own rect (not the handles' possibly-larger/clamped screen extents) is the deliberately
+    // simple, good-enough "is this pinch over the preview" test.
+    function withinCanvas(touches: TouchList) {
+      const rect = canvas!.getBoundingClientRect();
+      const midX = (touches[0].clientX + touches[1].clientX) / 2;
+      const midY = (touches[0].clientY + touches[1].clientY) / 2;
+      return midX >= rect.left && midX <= rect.right && midY >= rect.top && midY <= rect.bottom;
+    }
+
+    // A self-contained copy of `updatePreview` that reads `resolvedRef.current` instead of the
+    // (potentially stale, closed-over-at-mount) `resolved` — see `resolvedRef`'s own comment above.
+    function updatePinchPreview(next: ClipTransform | null) {
+      previewRef.current = next;
+      setPreview(next);
+      const r = resolvedRef.current;
+      useEditorStore.getState().setLivePreviewOverrides(next && r ? [{ clipId: r.clipId, transform: next }] : []);
+    }
+
+    function onTouchStart(e: TouchEvent) {
+      // Bows out if a single-pointer drag (move/corner-scale/rotate) somehow already claimed
+      // `dragRef`, and if there's no single video/image clip selected to scale in the first place —
+      // in either case, let the event proceed untouched to whatever would normally handle it.
+      if (e.touches.length !== 2 || dragRef.current || !resolvedRef.current || !withinCanvas(e.touches)) return;
+      e.stopPropagation();
+      lastDistance = distance(e.touches);
+      pinchTransform = resolvedRef.current.savedTransform;
+    }
+    function onTouchMove(e: TouchEvent) {
+      if (e.touches.length !== 2 || lastDistance === 0 || !pinchTransform) return;
+      e.preventDefault();
+      const d = distance(e.touches);
+      pinchTransform = { ...pinchTransform, scale: pinchTransform.scale * (d / lastDistance) };
+      lastDistance = d;
+      updatePinchPreview(pinchTransform);
+    }
+    function onTouchEnd(e: TouchEvent) {
+      if (e.touches.length >= 2) return;
+      lastDistance = 0;
+      const final = pinchTransform;
+      pinchTransform = null;
+      if (!final) return;
+      updatePinchPreview(null);
+      const r = resolvedRef.current;
+      if (!r) return;
+      const store = useEditorStore.getState();
+      commitSingleTransform(r, final, store.project, store.playhead, store.run);
+    }
+
+    window.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onTouchEnd, { passive: true });
+    window.addEventListener("touchcancel", onTouchEnd, { passive: true });
+    return () => {
+      window.removeEventListener("touchstart", onTouchStart, { capture: true });
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onTouchEnd);
+      window.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, [canvas]);
 
   if (!resolved || !canvas) return null;
 
@@ -371,17 +518,8 @@ export function TransformHandles({
           }
         }
         run(commands.length > 1 ? new BatchCommand("Move Clips", commands) : commands[0]);
-      } else if (resolved!.hasKeyframes) {
-        // Same auto-key rule the Inspector's NumberFields use (`upsertKeyframe`, `timeline/
-        // keyframes.ts`) — a canvas drag and a typed value make the identical insert-vs-update
-        // decision, so it doesn't matter which surface you used to edit a given frame.
-        const elapsed = playhead - resolved!.timelineStart;
-        const found = project ? findClip(project, resolved!.clipId) : undefined;
-        const existing = found?.clip.transformKeyframes ?? [];
-        const next = upsertKeyframe(existing, elapsed, final, resolved!.sequence.fps);
-        run(new SetClipTransformKeyframesCommand(resolved!.clipId, next));
       } else {
-        run(new SetClipTransformCommand(resolved!.clipId, final));
+        commitSingleTransform(resolved!, final, project, playhead, run);
       }
     }
 
@@ -483,8 +621,10 @@ export function TransformHandles({
               onMouseDown={(e) => beginDrag(e, "scale", { x, y })}
               onTouchStart={(e) => beginDrag(e, "scale", { x, y })}
               style={{ position: "fixed", left: point.x, top: point.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
-              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
-            />
+              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 flex touch-none items-center justify-center ${cursor}`}
+            >
+              <div style={{ width: HANDLE_DOT_SIZE, height: HANDLE_DOT_SIZE }} className="rounded-full border border-white bg-sky-400 shadow" />
+            </div>
           ))}
           <div
             role="button"
@@ -493,8 +633,10 @@ export function TransformHandles({
             onMouseDown={(e) => beginDrag(e, "rotate")}
             onTouchStart={(e) => beginDrag(e, "rotate")}
             style={{ position: "fixed", left: rotatePoint.x, top: rotatePoint.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
-            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
-          />
+            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 flex touch-none cursor-grab items-center justify-center"
+          >
+            <div style={{ width: HANDLE_DOT_SIZE, height: HANDLE_DOT_SIZE }} className="rounded-full border border-white bg-emerald-400 shadow" />
+          </div>
         </>
       )}
     </>

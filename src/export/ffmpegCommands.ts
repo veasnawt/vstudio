@@ -1,5 +1,5 @@
 /** Pure FFmpeg argument builders for media-library asset generation (thumbnail, filmstrip, waveform)
- *  — extracted from `studios/vstudio/app/api/vstudio/_lib/ffmpeg.ts` so the exact same command shape
+ *  — extracted from `studios/vcut/app/api/vcut/_lib/ffmpeg.ts` so the exact same command shape
  *  is available to more than one EXECUTOR. `_lib/ffmpeg.ts` still owns actually running these (via
  *  Node's `child_process.execFile`, server-side); the native mobile host's own FFmpeg plugin (backed
  *  by ffmpeg-kit's native SDKs, not Node) is the other consumer, and needs the identical argv this
@@ -81,7 +81,7 @@ const WAVEFORM_COLOR = "0x34d399";
  *  parameters are exactly the kind of thing ARCHITECTURE.md's own discipline says to verify against
  *  the real binary, not assume): `showwavespic` alone renders a raw sample's LINEAR amplitude, so a
  *  file recorded at a conservative level — extremely common for voiceovers and dialog, which is
- *  exactly the audio most likely to end up on a VStudio timeline — comes out as a near-invisible flat
+ *  exactly the audio most likely to end up on a VCut timeline — comes out as a near-invisible flat
  *  line even though the content has real dynamic shape. `dynaudnorm`'s OWN defaults (500ms frames)
  *  were tested first and left the line just as flat; a much shorter, more locally-reactive window
  *  (`f=150:g=15`) is what actually pulled out a legible, non-flat envelope on real test audio, and
@@ -163,7 +163,7 @@ export function buildMaskVideoArgs(
 
 /** Builds args for a black/white mask IMAGE (single still frame, not a video) — the local ProPainter
  *  CLI's `--mask` flag only accepts a static image or a folder of per-frame images, never a video file
- *  (unlike the cloud providers' input schemas, which take a mask video). Since VStudio's "Remove
+ *  (unlike the cloud providers' input schemas, which take a mask video). Since VCut's "Remove
  *  Object" already applies ONE rectangle across a clip's whole duration, a single static image is both
  *  sufficient and simpler than `buildMaskVideoArgs` above — no duration/fps/video-codec concerns. */
 export function buildMaskImageArgs(

@@ -160,7 +160,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
         {available === false ? (
           <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-200">
-            {t("FFmpeg isn't available on this machine, so VStudio can't render a file. Reinstall dependencies")} (
+            {t("FFmpeg isn't available on this machine, so VCut can't render a file. Reinstall dependencies")} (
             <code className="font-mono">pnpm install</code>
             {t(") to restore it.")}
           </p>

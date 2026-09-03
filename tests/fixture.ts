@@ -1,5 +1,5 @@
 import { createProject } from "../src/project/createProject.ts";
-import type { Asset, Project } from "../src/project/types.ts";
+import type { Asset, LutAsset, Project } from "../src/project/types.ts";
 import { DEFAULT_TEXT_STYLE } from "../src/project/types.ts";
 
 /** A 10-second 1080×1920 30fps video asset — the shape almost every test starts from. */
@@ -99,6 +99,34 @@ export function textAsset(id = "text1", content = "Hello"): Asset {
     importedAt: 0,
     textContent: content,
     textStyle: { ...DEFAULT_TEXT_STYLE },
+  };
+}
+
+/** A color-matte background asset — no backing file, no intrinsic duration, no audio, same shape as
+ *  `textAsset` above (see `Asset.color`'s own doc comment). */
+export function colorAsset(id = "color1", color = "#224466"): Asset {
+  return {
+    id,
+    kind: "color",
+    name: color,
+    relPath: "",
+    duration: 0,
+    hasAudio: false,
+    sizeBytes: 0,
+    importedAt: 0,
+    color,
+  };
+}
+
+/** A minimal `.cube` LUT registered in the project's LUT library — the shape `setClipLut`/
+ *  `SetClipLutCommand` tests reference by id. */
+export function lutAsset(id = "lut1"): LutAsset {
+  return {
+    id,
+    name: `${id}.cube`,
+    relPath: `${id}.cube`,
+    size: 2,
+    importedAt: 0,
   };
 }
 

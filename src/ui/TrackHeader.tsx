@@ -35,7 +35,7 @@ const ACCEPTED_EXTENSIONS_BY_KIND: Record<"video" | "audio", string> = {
  *  readable mid-drag, to confirm the dragged track is the same kind as the row being hovered. That's
  *  what keeps a video track from being reordered into the audio group (or vice versa) — the same
  *  video-above-audio invariant `addTrack`/`reorderTrack` both maintain. */
-const TRACK_DRAG_MIME = "application/x-vstudio-track";
+const TRACK_DRAG_MIME = "application/x-vcut-track";
 
 function FlagButton({
   active,

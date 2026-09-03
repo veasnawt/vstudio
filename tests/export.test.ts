@@ -11,6 +11,8 @@ import {
   setClipEffects,
   setClipEffectsKeyframes,
   setClipGain,
+  setClipLut,
+  setClipPixelEffect,
   setClipMuted,
   setClipTextAnimation,
   setClipTextCrop,
@@ -27,9 +29,10 @@ import {
   splitClip,
   trimClip,
 } from "../src/timeline/operations.ts";
-import { audioAsset, audioTrackId, clipsOf, closeTo, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
+import { audioAsset, audioTrackId, clipsOf, closeTo, colorAsset, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
 import { DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TRANSFORM } from "../src/project/types.ts";
 import { DEFAULT_WORD_HIGHLIGHT_COLOR } from "../src/timeline/textAnimation.ts";
+import { TRANSITION_TYPE_OPTIONS } from "../src/timeline/transitions.ts";
 
 /** "#rrggbb" → the same `&H00bbggrr` form `buildExportPlan.ts`'s own (unexported) `assColor` produces —
  *  duplicated here deliberately rather than exported from production code purely for a test to import,
@@ -189,6 +192,32 @@ describe("buildExportPlan", () => {
     assert.ok(!filterGraph(plan(project).args).includes("amix"));
   });
 
+  it("mutes a video clip's own embedded audio when its track is muted, without hiding the picture", () => {
+    const base = emptyProject([videoAsset("asset1", 10)]); // videoAsset() defaults to hasAudio: true
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = setTrackFlag(project, videoTrackId(project), "muted", true);
+
+    const { args } = plan(project);
+    const graph = filterGraph(args);
+    // A real (unmuted) clip's own audio goes through this resample stage — its absence is what
+    // confirms the mute actually took effect, matching how a muted CLIP (`Clip.mutedAudio`) already
+    // renders (see the next test for that unmuted-track baseline).
+    assert.ok(!graph.includes("aresample=48000"), "a muted video track's clip audio should not be resampled as real audio");
+    // The silent placeholder is a separate `-i anullsrc=...` INPUT (referenced from the graph by index
+    // like any other input, so its own presence doesn't show up as literal text inside the graph
+    // string itself) — checked against the full arg list instead.
+    assert.ok(args.includes("anullsrc=channel_layout=stereo:sample_rate=48000"), "still gets a silent placeholder in the same audio slot an unmuted clip would fill");
+    // Muting is audio-only — the video half renders exactly as it would unmuted.
+    assert.equal(args[args.indexOf("-map") + 1], "[cv0]");
+  });
+
+  it("an unmuted video track's clip audio is NOT silenced (baseline for the muted-track test above)", () => {
+    const base = emptyProject([videoAsset("asset1", 10)]);
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    assert.ok(filterGraph(plan(project).args).includes("aresample=48000"));
+  });
+
   it("encodes H.264/AAC MP4 with a faststart index and an explicit duration cap", () => {
     const base = emptyProject();
     const project = addClip(base, videoTrackId(base), "asset1", 0);
@@ -297,6 +326,69 @@ describe("buildExportPlan with images", () => {
   });
 });
 
+describe("buildExportPlan with a color-matte clip", () => {
+  it("treats a color asset exactly like a still image — looped, no seek, explicit duration", () => {
+    const base = emptyProject([colorAsset("color1", "#224466")]);
+    const project = addClip(base, videoTrackId(base), "color1", 0);
+
+    const { args, duration } = plan(project);
+    const inputIndex = args.indexOf("-i");
+
+    assert.equal(args[0], "-loop");
+    assert.equal(args[1], "1");
+    assert.ok(!args.slice(0, inputIndex).includes("-ss"), "a color-matte input must not be given -ss");
+    assert.ok(args.slice(0, inputIndex).includes("-t"), "a color-matte input needs an explicit duration");
+    // IMAGE_DEFAULT_DURATION — same "no intrinsic length" default an image gets when placed.
+    assert.ok(closeTo(duration, 5), `expected the default 5s color-matte duration, got ${duration}`);
+  });
+
+  it("resolves the input path via inputPathFor, same seam every other asset kind goes through", () => {
+    const base = emptyProject([colorAsset("color1", "#224466")]);
+    const project = addClip(base, videoTrackId(base), "color1", 0);
+
+    const { args } = buildExportPlan(project, {
+      ...options,
+      inputPathFor: (assetId) => (assetId === "color1" ? "/media/color-224466-1080x1920.png" : `/media/${assetId}.mp4`),
+    });
+
+    assert.ok(args.includes("/media/color-224466-1080x1920.png"));
+  });
+
+  it("gives a silent color-matte a generated audio pad so concat still pairs up, same as an image", () => {
+    const base = emptyProject([colorAsset()]);
+    const project = addClip(base, videoTrackId(base), "color1", 0);
+
+    const { args } = plan(project);
+
+    assert.ok(args.some((a) => a.startsWith("anullsrc")), "a color-matte clip has no audio stream of its own");
+    assert.match(filterGraph(args), /concat=n=1:v=1:a=1/);
+  });
+
+  it("mixes a color-matte clip with real video in one timeline", () => {
+    const base = emptyProject([videoAsset("asset1", 10), colorAsset()]);
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, videoTrackId(project), "color1", 10);
+
+    const { args } = plan(project);
+
+    assert.match(filterGraph(args), /concat=n=2:v=1:a=1/);
+    assert.ok(args.includes("-loop"), "the color-matte still needs looping alongside the video clip");
+  });
+
+  it("applies Transform/Effects to a color-matte clip through the exact same filter chain a video clip gets", () => {
+    let base = emptyProject([colorAsset()]);
+    let project = addClip(base, videoTrackId(base), "color1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipTransform(project, clip.id, { ...IDENTITY_TRANSFORM, scale: 1.5, rotationDeg: 10 });
+    project = setClipEffects(project, clip.id, { ...IDENTITY_EFFECTS, brightness: 0.2, blur: 4 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /rotate=/, "rotation should apply to a color-matte clip like any other");
+    assert.match(graph, /gblur=/, "blur should apply to a color-matte clip like any other");
+  });
+});
+
 describe("buildExportPlan with a real transform", () => {
   it("keeps the untransformed scale+pad chain byte-for-byte identical (regression)", () => {
     const base = emptyProject();
@@ -401,7 +493,10 @@ describe("buildExportPlan with keyframed transform/effects", () => {
     const graph = filterGraph(plan(project).args);
 
     // A single 0.5s gap subdivided at the 0.15s base interval: ceil(0.5 / 0.15) = 4 slices.
-    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    // The trailing `fps=` re-normalizes the concat output's negotiated timebase back to the
+    // sequence rate (see the doc comment on `pushKeyframedClipVideoFilters`'s own concat line) —
+    // without it, a downstream `xfade` transition can reject this stream's timebase entirely.
+    assert.match(graph, /concat=n=4:v=1:a=0,fps=30\[/);
     // Each slice goes through the exact same buildTransformFilters chain a static transformed clip
     // uses (crop/eq/scale/rotate/overlay) — 4 full occurrences, one per slice.
     assert.equal((graph.match(/overlay=x=/g) ?? []).length, 4);
@@ -418,7 +513,7 @@ describe("buildExportPlan with keyframed transform/effects", () => {
 
     const graph = filterGraph(plan(project).args);
 
-    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    assert.match(graph, /concat=n=4:v=1:a=0,fps=30\[/);
     assert.equal((graph.match(/lutyuv=/g) ?? []).length, 4);
   });
 
@@ -439,7 +534,7 @@ describe("buildExportPlan with keyframed transform/effects", () => {
 
     // Confirms the `hasColorGradingKeyframes` gate: a color-grading-only keyframed clip must still
     // route through the keyframed slicing path, not the plain one.
-    assert.match(graph, /concat=n=4:v=1:a=0\[/);
+    assert.match(graph, /concat=n=4:v=1:a=0,fps=30\[/);
     assert.equal((graph.match(/overlay=x=/g) ?? []).length, 4);
     // Only the 2 post-boundary slices carry a `curves=` fragment — the 2 pre-boundary slices hold the
     // identity curve, which emits no fragment at all (see `buildCurvesFilterFragment`'s own `null`
@@ -541,7 +636,7 @@ describe("buildExportPlan with keyframed transform/effects", () => {
     const { args } = plan(project);
     const graph = filterGraph(args);
 
-    assert.match(graph, /concat=n=240:v=1:a=0\[/);
+    assert.match(graph, /concat=n=240:v=1:a=0,fps=30\[/);
     // The bug this fix targets: the old per-slice-input version pushed 2 fresh `-i` per slice (source +
     // bg), i.e. 480 for this fixture alone, plus 1 more for audio — 481 total. The fix keeps this fixed
     // at 3 (source + bg + audio) regardless of slice count.
@@ -695,6 +790,132 @@ describe("buildExportPlan with clip color grading", () => {
 
     assert.ok(graph.includes("master="));
     assert.ok(!graph.includes("all="));
+  });
+});
+
+describe("buildExportPlan with a clip LUT", () => {
+  const lutOptions = { ...options, lutPathFor: (lutId: string) => `/luts/${lutId}.cube` };
+  function planWithLuts(project: Parameters<typeof buildExportPlan>[0]) {
+    return buildExportPlan(project, lutOptions);
+  }
+
+  it("keeps the untransformed scale+pad chain when no clip has a lutId (regression)", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(planWithLuts(project).args);
+
+    assert.ok(!graph.includes("lut3d="), "a LUT-less clip must not go through the lut3d chain");
+    assert.ok(!graph.includes("rotate="), "a LUT-less clip must not go through the full transform chain");
+  });
+
+  it("a LUT-only clip (no real transform/effects/grading) still routes through the full chain", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipLut(project, clip.id, "lut1");
+
+    const graph = filterGraph(planWithLuts(project).args);
+
+    assert.ok(graph.includes("lut3d=file='/luts/lut1.cube':interp=tetrahedral"));
+  });
+
+  it("positions the lut3d= fragment right after curves and before scale (post-crop/pre-scale, matching preview order)", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipColorGrading(project, clip.id, {
+      ...IDENTITY_COLOR_GRADING,
+      master: [{ x: 0, y: 0 }, { x: 0.5, y: 0.6 }, { x: 1, y: 1 }],
+    });
+    project = setClipLut(project, clip.id, "lut1");
+
+    const graph = filterGraph(planWithLuts(project).args);
+
+    const curvesIndex = graph.indexOf("curves=");
+    const lut3dIndex = graph.indexOf("lut3d=");
+    const scaleIndex = graph.indexOf("scale=w=");
+    assert.ok(curvesIndex >= 0 && lut3dIndex > curvesIndex && scaleIndex > lut3dIndex);
+  });
+
+  it("skips the lut3d= stage entirely when lutPathFor isn't supplied, without throwing", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipLut(project, clip.id, "lut1");
+
+    // Plain `options` here has no lutPathFor at all.
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("lut3d="));
+  });
+});
+
+describe("buildExportPlan with a clip pixel effect", () => {
+  it("keeps the untransformed scale+pad chain when no clip has a pixelEffect (regression)", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(!graph.includes("geq="), "a plain clip must not go through the geq (water-ripple) chain");
+    assert.ok(!graph.includes("rgbashift="), "a plain clip must not go through the rgbashift (glitch) chain");
+    assert.ok(!graph.includes("rotate="), "a plain clip must not go through the full transform chain");
+  });
+
+  it("a pixelEffect-only clip (no real transform/effects/grading) still routes through the full chain", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipPixelEffect(project, clip.id, { type: "waterRipple" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.ok(graph.includes("geq=lum="), "a clip with only pixelEffect set must still reach the full transform chain");
+  });
+
+  it("water ripple emits a geq= fragment with T-varying lum/cb/cr expressions", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipPixelEffect(project, clip.id, { type: "waterRipple", speed: 2 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /geq=lum='p\(X\+[\d.]+\*sin\(Y\/[\d.]+\+T\*[\d.]+\*2\.000000\),Y\)':cb='p\(X\+[\d.]+\*sin\(Y\/[\d.]+\+T\*[\d.]+\*2\.000000\),Y\)':cr=/);
+  });
+
+  it("glitch emits rgbashift= plus noise=allf=t, with an asymmetric R/B split", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipPixelEffect(project, clip.id, { type: "glitch", speed: 1 });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /rgbashift=rh=-?\d+:bv=-?\d+,noise=alls=[\d.]+:allf=t/);
+    const rh = Number(graph.match(/rgbashift=rh=(-?\d+)/)?.[1]);
+    const bv = Number(graph.match(/bv=(-?\d+)/)?.[1]);
+    assert.notEqual(rh, 0, "a zero shift would be an invisible glitch");
+    assert.notEqual(Math.sign(rh), Math.sign(bv), "R and B should shift in OPPOSITE directions for a real channel-split look");
+  });
+
+  it("positions the pixel-effect fragment right after the LUT stage and before scale (post-crop/pre-scale, matching preview order)", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setClipColorGrading(project, clip.id, {
+      ...IDENTITY_COLOR_GRADING,
+      master: [{ x: 0, y: 0 }, { x: 0.5, y: 0.6 }, { x: 1, y: 1 }],
+    });
+    project = setClipPixelEffect(project, clip.id, { type: "waterRipple" });
+
+    const graph = filterGraph(plan(project).args);
+
+    const curvesIndex = graph.indexOf("curves=");
+    const geqIndex = graph.indexOf("geq=");
+    const scaleIndex = graph.indexOf("scale=w=");
+    assert.ok(curvesIndex >= 0 && geqIndex > curvesIndex && scaleIndex > geqIndex);
   });
 });
 
@@ -1045,6 +1266,23 @@ describe("buildExportPlan with text clips", () => {
 
     assert.match(graph, /\[cv0\]drawtext=/);
     assert.ok(!graph.includes("rotate="), "an unrotated clip should never reach the rotate pipeline");
+  });
+
+  it("a text clip's drawtext x= position is identical across align:left/center/right — only text_align differs", () => {
+    // The block's own screen position must depend only on offsetX, never on align — re-justifying a
+    // text box's lines shouldn't teleport the box itself (see `textLayout.ts`'s own doc comment).
+    for (const align of ["left", "center", "right"] as const) {
+      let base = emptyProject([videoAsset(), textAsset("text1", "Hello")]);
+      base = addTrack(base, "text");
+      base = setTextAsset(base, "text1", "Hello", { ...DEFAULT_TEXT_STYLE, align, offsetX: 25 });
+      let project = addClip(base, videoTrackId(base), "asset1", 0);
+      project = addClip(project, textTrackId(project), "text1", 0);
+
+      const graph = filterGraph(plan(project).args);
+
+      assert.match(graph, /x=\(\(w\/2\)\+25\.000000\)-text_w\/2:/, `align:${align} should still anchor at frame-center+offsetX`);
+      assert.match(graph, new RegExp(`text_align=${align}(:|$)`), `align:${align} should still drive per-line text_align`);
+    }
   });
 
   it("a rotated text clip builds a background+drawtext+rotate+overlay chain instead of a plain drawtext", () => {
@@ -1828,9 +2066,10 @@ describe("buildExportPlan wordHighlight with ASS/libass capability", () => {
     // this line was apparently copied from.
     assert.ok(!ass.includes("\\pos(") || !/\\pos\([\d.]+\\,/.test(ass), "\\pos()'s comma must not be backslash-escaped");
     // 1080-wide frame, align:"left" -> anchorX = TEXT_MARGIN_PX(40) + offsetX(60) = 100; anchorY =
-    // frameHeight/2(960) + offsetY(-300) = 660 — the exact same anchor `buildDrawTextFilter`'s own
-    // `x`/`y` formulas resolve to for the same style, so a wordHighlight clip lands where a plain text
-    // clip with identical style would.
+    // frameHeight/2(960) + offsetY(-300) = 660. This is the wordHighlight/ASS path's OWN anchor, which
+    // for align:"left"/"right" no longer matches `buildDrawTextFilter`'s own `x`/`y` (now always
+    // frame-center-plus-offset, unaffected by align — see `textLayout.ts`'s doc comment) — a known,
+    // documented divergence; see `buildWordHighlightAss`'s own comment for why it wasn't changed here.
     assert.match(ass, /\{\\pos\(100\.00,660\.00\)\}/);
   });
 
@@ -2029,6 +2268,225 @@ describe("buildExportPlan wordHighlight with ASS/libass capability", () => {
   });
 });
 
+describe("buildExportPlan Khmer static text (browser-rendered images — every FFmpeg text path fails to correctly stack certain Khmer subscript-consonant clusters)", () => {
+  /** A fake `khmerTextWindowsFor` — real production populates this from an async Puppeteer pre-pass
+   *  (`khmerTextRenderer.ts`) `buildExportPlan` itself never runs; a test only needs SOME window list
+   *  with real-looking image paths to verify the graph this function builds from it. `count` spreads
+   *  `count` equal windows across the clip's own duration, mimicking an animated clip's own multiple
+   *  slices; defaults to 1 (a plain, static clip's single window). */
+  function fakeKhmerWindows(clip: { timelineStart: number; sourceOut: number; sourceIn: number }, count = 1) {
+    const duration = clip.sourceOut - clip.sourceIn;
+    return Array.from({ length: count }, (_, i) => ({
+      startOffset: (duration / count) * i,
+      endOffset: (duration / count) * (i + 1),
+      imagePath: `/tmp/khmer-win${i}.png`,
+    }));
+  }
+
+  function planWithKhmerWindows(project: Parameters<typeof buildExportPlan>[0], windowCount = 1) {
+    return buildExportPlan(project, {
+      ...options,
+      khmerTextWindowsFor: (clip) => fakeKhmerWindows(clip, windowCount),
+    });
+  }
+
+  it("a plain (no textAnimation) Khmer-content clip routes through overlay=, not drawtext= or subtitles=", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន")]); // "thank you very much"
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("drawtext="), "Khmer content must never reach drawtext, which fails to shape certain subscript clusters");
+    assert.ok(!graph.includes("subtitles="), "Khmer content must never reach libass either — same shaping failure, confirmed empirically");
+    assert.match(graph, /overlay=format=auto\[txt0\]/);
+    assert.ok(args.includes("/tmp/khmer-win0.png"), "the pre-rendered window image is fed in as a real -i input");
+  });
+
+  it("a plain Latin-content clip still routes through drawtext= — this fix must not touch non-Khmer text", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "Hello World")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("subtitles="));
+    assert.match(graph, /drawtext=/);
+  });
+
+  it("without khmerTextWindowsFor supplied, a Khmer clip falls back to plain drawtext (same graceful-degradation shape as every other optional resolver)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = plan(project); // the shared `options` fixture omits khmerTextWindowsFor
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("subtitles="));
+    assert.ok(!graph.includes("overlay=format=auto[txt0]"));
+    assert.match(graph, /drawtext=/);
+  });
+
+  it("when khmerTextWindowsFor returns an empty array (nothing rendered), falls back to plain drawtext rather than an empty overlay", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = buildExportPlan(project, { ...options, khmerTextWindowsFor: () => [] });
+    const graph = filterGraph(args);
+
+    assert.match(graph, /drawtext=/);
+  });
+
+  it("a single-window clip composites exactly one input image, held for the clip's own whole duration", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន សម្រាប់ជំនួយ")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 3); // starts at t=3s
+    project = addClip(project, textTrackId(project), "text1", 3);
+    const [textClip] = clipsOf(project, textTrackId(project));
+
+    const { args } = planWithKhmerWindows(project, 1);
+    const graph = filterGraph(args);
+
+    assert.equal(args.filter((a) => a === "-loop").length, 1, "exactly one image held via -loop for the whole window");
+    // Lead-in (transparent, [0,3)) + the one real window + trail-out (the sequence's own total duration,
+    // set by the video clip underneath, runs past this text clip's own end) — 3 legs concatenated.
+    assert.match(graph, /concat=n=3:v=1:a=0,fps=\d+\[txt0_stream\]/);
+    void textClip;
+  });
+
+  it("an animated Khmer clip (bounce/pulse/wiggle/typewriter) composites multiple window images back to back", () => {
+    for (const type of ["bounce", "pulse", "wiggle", "typewriter"] as const) {
+      let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+      base = addTrack(base, "text");
+      let project = addClip(base, videoTrackId(base), "asset1", 0);
+      project = addClip(project, textTrackId(project), "text1", 0);
+      const [textClip] = clipsOf(project, textTrackId(project));
+      project = setClipTextAnimation(project, textClip.id, { type });
+
+      const { args } = planWithKhmerWindows(project, 4);
+      const graph = filterGraph(args);
+
+      assert.ok(!graph.includes("drawtext="), `${type}: must not fall back to drawtext when windows are supplied`);
+      assert.equal(args.filter((a) => a === "-loop").length, 4, `${type}: all 4 fake windows should be composited`);
+    }
+  });
+
+  it("a Khmer clip with wordHighlight ALSO routes through overlay=, not the ASS wordHighlight path", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const { args } = planWithKhmerWindows(project, 2);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("subtitles="), "a Khmer wordHighlight clip must not use the ASS path when pre-rendered windows exist");
+    assert.match(graph, /overlay=format=auto\[txt0\]/);
+  });
+
+  it("a Khmer wordHighlight clip WITHOUT pre-rendered windows still falls back to the existing ASS path — unchanged, non-Khmer behavior", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextAnimation(project, textClip.id, { type: "wordHighlight" });
+
+    const { args } = buildExportPlan(project, {
+      ...options,
+      assFilePathFor: (clip) => `/tmp/${clip.id}.ass`,
+      fontMetricsFor: () => ({ family: "TestFamily", fontsizeScale: 1.5 }),
+      fontsDirFor: () => "/fonts",
+    });
+    const graph = filterGraph(args);
+
+    assert.match(graph, /subtitles=/);
+  });
+
+  it("a rotated Khmer clip routes through overlay= too — unlike the old libass path, rotation is fully supported (the harness draws it the same way the preview does)", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+    base = addTrack(base, "text");
+    base = setTextAsset(base, "text1", "អរគុណ", { ...DEFAULT_TEXT_STYLE, rotationDeg: 15 });
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("drawtext="));
+    assert.match(graph, /overlay=format=auto\[txt0\]/);
+  });
+
+  it("a Khmer clip with keyframed text style still falls back to drawtext — not yet covered by the render harness", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextStyleKeyframes(project, textClip.id, [
+      { id: "a", time: 0, value: DEFAULT_TEXT_STYLE },
+      { id: "b", time: 1, value: { ...DEFAULT_TEXT_STYLE, fontSize: 40 } },
+    ]);
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("overlay=format=auto[txt0]"));
+  });
+
+  it("a Khmer clip with a real crop still falls back to drawtext — not yet covered by the render harness", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណ")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTextCrop(project, textClip.id, { left: 0.1, right: 0.1, top: 0, bottom: 0 });
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("overlay=format=auto[txt0]"));
+  });
+
+  it("threads transitionIn/transitionOut into a fade=...alpha=1 stage on the composited overlay stream", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+    const [textClip] = clipsOf(project, textTrackId(project));
+    project = setClipTransitionIn(project, textClip.id, { duration: 0.5, type: "crossfade" });
+    project = setClipTransitionOut(project, textClip.id, { duration: 0.25, type: "crossfade" });
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.match(graph, /fade=t=in:st=0\.000000:d=0\.500000:alpha=1/);
+    assert.match(graph, /fade=t=out:st=[\d.]+:d=0\.250000:alpha=1/);
+  });
+
+  it("no transitionIn/transitionOut means no fade= stage at all", () => {
+    let base = emptyProject([videoAsset(), textAsset("text1", "អរគុណច្រើន")]);
+    base = addTrack(base, "text");
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    project = addClip(project, textTrackId(project), "text1", 0);
+
+    const { args } = planWithKhmerWindows(project);
+    const graph = filterGraph(args);
+
+    assert.ok(!graph.includes("fade=t=in"));
+    assert.ok(!graph.includes("fade=t=out"));
+  });
+});
+
 /** Pulls out the `-ss <n> -t <n>` pair immediately preceding each `-i <path>` occurrence for a given
  *  path — several inputs can reference the same media file (a plain segment, plus a transition's own
  *  slice of it), each needing its OWN seek/trim verified independently. Scanning back only as far as
@@ -2063,6 +2521,30 @@ describe("buildExportPlan with transitions", () => {
     assert.ok(closeTo(duration, 10));
   });
 
+  it("a keyframed clip on either side of a transition normalizes its concat timebase so xfade can accept it (regression)", () => {
+    // Real crash reported against an actual user project: `pushKeyframedClipVideoFilters`'s own
+    // `concat=` over irregular keyframe slices can let FFmpeg negotiate a high-precision output
+    // timebase (e.g. 1/1000000) instead of the graph's normal 1/fps — invisible for a standalone
+    // keyframed clip, but fatal once that stream feeds `xfade` alongside a plain 1/fps stream
+    // ("First input link main timebase (X) do not match the corresponding second input link xfade
+    // timebase (Y)"). The fix appends `,fps=<sequence fps>` right after `concat=` to renormalize.
+    const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "a", 0);
+    const [clipA] = clipsOf(project, videoTrackId(project));
+    project = addClip(project, videoTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, videoTrackId(project));
+    project = setClipTransformKeyframes(project, clipB.id, [
+      { id: "k1", time: 0, value: IDENTITY_TRANSFORM },
+      { id: "k2", time: 5, value: { ...IDENTITY_TRANSFORM, scale: 1.3 } },
+    ]);
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "wipeLeft" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /concat=n=\d+:v=1:a=0,fps=30\[/, "the keyframed slice concat must renormalize its timebase before feeding xfade");
+    assert.match(graph, /xfade=transition=wipeleft:duration=1\.000000:offset=/);
+  });
+
   it("a valid transition splices a third segment in and blends with xfade/acrossfade at the right duration", () => {
     const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
     let project = addClip(base, videoTrackId(base), "a", 0);
@@ -2080,6 +2562,49 @@ describe("buildExportPlan with transitions", () => {
     // A crossfade blends, it doesn't shorten the timeline — clips never overlap in storage, so the
     // total exported length must still equal the sum of both clips' own nominal lengths.
     assert.ok(closeTo(duration, 10));
+  });
+
+  it("every TransitionType renders as the correct FFmpeg xfade transition name, not just crossfade", () => {
+    // Mirrors buildExportPlan.ts's own (unexported) TRANSITION_XFADE_NAME table as literal expected
+    // values — same "duplicate the expected string rather than import production internals" style as
+    // assColorForTest above — so a real typo in that table (e.g. "wipeleft" -> "wipe-left") fails
+    // this test instead of only ever being caught by someone eyeballing a real export.
+    const expectedXfadeName: Record<string, string> = {
+      crossfade: "fade",
+      dissolve: "dissolve",
+      wipeLeft: "wipeleft",
+      wipeRight: "wiperight",
+      wipeUp: "wipeup",
+      wipeDown: "wipedown",
+      slideLeft: "slideleft",
+      slideRight: "slideright",
+      slideUp: "slideup",
+      slideDown: "slidedown",
+      circleOpen: "circleopen",
+      circleClose: "circleclose",
+      // Not real xfade names — a corruption pre-pass runs first, then always blends with a plain
+      // "fade" underneath (see the dedicated "glitch/water-ripple transition" describe block below for
+      // the pre-pass's own assertions); this loop only checks the FINAL xfade call's own name.
+      glitchCut: "fade",
+      waterRippleCut: "fade",
+    };
+
+    for (const type of TRANSITION_TYPE_OPTIONS) {
+      const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
+      let project = addClip(base, videoTrackId(base), "a", 0);
+      const [clipA] = clipsOf(project, videoTrackId(project));
+      project = addClip(project, videoTrackId(project), "b", clipEnd(clipA));
+      const [, clipB] = clipsOf(project, videoTrackId(project));
+      project = setClipTransitionIn(project, clipB.id, { duration: 1, type });
+
+      const graph = filterGraph(plan(project).args);
+      const expected = expectedXfadeName[type];
+      assert.match(
+        graph,
+        new RegExp(`xfade=transition=${expected}:duration=1\\.000000:offset=0`),
+        `TransitionType "${type}" should render as xfade transition "${expected}"`
+      );
+    }
   });
 
   it("the outgoing clip's own segment is emitted in full; only the incoming clip is shortened, at its head", () => {
@@ -2282,6 +2807,66 @@ describe("buildExportPlan's two different text fade-out timings: solo vs. a real
     const { duration } = plan(project);
 
     assert.ok(closeTo(duration, 2));
+  });
+});
+
+describe("buildExportPlan with a glitch/water-ripple transition", () => {
+  it("waterRippleCut runs a ramped geq= corruption pass on both sides before a plain xfade=fade", () => {
+    const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "a", 0);
+    const [clipA] = clipsOf(project, videoTrackId(project));
+    project = addClip(project, videoTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, videoTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "waterRippleCut" });
+
+    const graph = filterGraph(plan(project).args);
+
+    // Both the outgoing (`_from`) and incoming (`_to`) labels get their own corruption stage, each
+    // feeding a distinct `_fx` label, BEFORE the two `_fx` labels (not the raw `_from`/`_to` ones) are
+    // what actually gets blended.
+    assert.match(graph, /\[v0_1_from\]geq=lum='[^']+':cb='[^']+':cr='[^']+'\[v0_1_from_fx\]/);
+    assert.match(graph, /\[v0_1_to\]geq=lum='[^']+':cb='[^']+':cr='[^']+'\[v0_1_to_fx\]/);
+    assert.match(graph, /\[v0_1_from_fx\]\[v0_1_to_fx\]xfade=transition=fade:duration=1\.000000:offset=0/);
+    // A real T-varying ramp (0 at both ends of the 1s window, peaking at the midpoint) — not a flat
+    // per-clip amplitude constant.
+    assert.match(graph, /\(T\/1\.000000\)\*\(1-T\/1\.000000\)/);
+  });
+
+  it("glitchCut runs a fixed rgbashift=+noise= corruption pass on both sides before a plain xfade=fade", () => {
+    const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
+    let project = addClip(base, videoTrackId(base), "a", 0);
+    const [clipA] = clipsOf(project, videoTrackId(project));
+    project = addClip(project, videoTrackId(project), "b", clipEnd(clipA));
+    const [, clipB] = clipsOf(project, videoTrackId(project));
+    project = setClipTransitionIn(project, clipB.id, { duration: 1, type: "glitchCut" });
+
+    const graph = filterGraph(plan(project).args);
+
+    assert.match(graph, /\[v0_1_from\]rgbashift=rh=-?\d+:bv=-?\d+,noise=alls=[\d.]+:allf=t\[v0_1_from_fx\]/);
+    assert.match(graph, /\[v0_1_to\]rgbashift=rh=-?\d+:bv=-?\d+,noise=alls=[\d.]+:allf=t\[v0_1_to_fx\]/);
+    assert.match(graph, /\[v0_1_from_fx\]\[v0_1_to_fx\]xfade=transition=fade:duration=1\.000000:offset=0/);
+  });
+
+  it("every OTHER transition type is unaffected — no corruption fragment, raw labels feed xfade directly (regression)", () => {
+    for (const type of TRANSITION_TYPE_OPTIONS) {
+      if (type === "glitchCut" || type === "waterRippleCut") continue;
+
+      const base = emptyProject([videoAsset("a", 5), videoAsset("b", 5)]);
+      let project = addClip(base, videoTrackId(base), "a", 0);
+      const [clipA] = clipsOf(project, videoTrackId(project));
+      project = addClip(project, videoTrackId(project), "b", clipEnd(clipA));
+      const [, clipB] = clipsOf(project, videoTrackId(project));
+      project = setClipTransitionIn(project, clipB.id, { duration: 1, type });
+
+      const graph = filterGraph(plan(project).args);
+
+      assert.ok(!graph.includes("_fx]"), `"${type}" must not produce a corruption pre-pass label`);
+      assert.ok(!graph.includes("rgbashift="), `"${type}" must not use the glitch corruption filter`);
+      assert.ok(
+        !/\[v0_1_from\]geq=/.test(graph),
+        `"${type}" must not run a geq= corruption pass on its transition segment`
+      );
+    }
   });
 });
 

@@ -7,7 +7,7 @@ import type { Clip, Project } from "../project/types.ts";
 import { ApiRequestError } from "./client.ts";
 import type { ExportProgress, ExportStarted } from "./client.ts";
 
-/** On-device counterpart of `studios/vstudio/app/api/vstudio/export/route.ts`, talking to the native
+/** On-device counterpart of `studios/vcut/app/api/vcut/export/route.ts`, talking to the native
  *  `Ffmpeg` plugin (`apps/mobile/android/.../FfmpegPlugin.kt`) instead of spawning a server child
  *  process. `buildExportPlan` itself is reused completely unchanged — the only work here is resolving
  *  every path its `ExportPlanOptions` needs to a REAL native filesystem path before calling it, since
@@ -45,9 +45,9 @@ interface FfmpegPluginApi {
 const Ffmpeg = registerPlugin<FfmpegPluginApi>("Ffmpeg");
 
 const DIRECTORY = Directory.Data;
-const ROOT = "vstudio-projects";
+const ROOT = "vcut-projects";
 const FONTS_DIR = `${ROOT}/_fonts`;
-const TEXT_SCRATCH_DIR = "vstudio-text";
+const TEXT_SCRATCH_DIR = "vcut-text";
 
 function projectDir(projectId: string): string {
   return `${ROOT}/${projectId}`;

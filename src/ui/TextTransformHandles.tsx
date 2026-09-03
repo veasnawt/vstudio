@@ -32,9 +32,12 @@ const ALIGN_SNAP_PIXELS = 8;
 // (Inspector-only, like `ClipTransform.crop` itself) is a separate frame-space mask over the frame,
 // not a repositioning of this block — it doesn't change any of the geometry these handles manipulate.
 const DRAG_THRESHOLD = 3;
-// Kept in sync with TransformHandles.tsx's own identical constant and its comment: 16px was too
-// small to reliably hit on a touch device, 24px roughly doubles the actual hit area.
+// Kept in sync with TransformHandles.tsx's own identical constants and its comments: `HANDLE_SIZE` (the
+// invisible hit area) was too small at 16px on a touch device, 24px roughly doubles the actual hit area;
+// `HANDLE_DOT_SIZE` is the smaller VISIBLE dot centered inside it, added afterward so the on-screen
+// circle doesn't itself look oversized to a mouse-driven desktop user despite the hit area staying big.
 const HANDLE_SIZE = 24;
+const HANDLE_DOT_SIZE = 10;
 const ROTATE_HANDLE_OFFSET = 28;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 600;
@@ -172,7 +175,7 @@ export function TextTransformHandles({
   // on-screen size for performance (see `PlaybackEngine.setDisplaySize`'s own comment) and no longer
   // reliably equals the sequence's real resolution. `style.offsetX`/`fontSize` are authored (and
   // exported) in true sequence pixels, so that's the space this whole component has to compute in.
-  const block = computeTextBlock(context, resolved.sequence.width, resolved.sequence.height, resolved.content, style);
+  const block = computeTextBlock(context, resolved.sequence.width, resolved.sequence.height, resolved.content, style, project?.customFonts ?? []);
 
   // Every screen measurement (handle position, drag deltas) has to go through this ratio to land in
   // the right place and track the pointer 1:1 — CSS pixels per SEQUENCE pixel, matching `block` above.
@@ -545,7 +548,7 @@ export function TextTransformHandles({
           identical comment for why a rotated parent's `%` positioning can't express that directly. */}
       {!isEditing && !isGroupSelection && (
         <>
-          {cornerHandles.map(({ x, y, cursor, label, point }) => (
+          {cornerHandles.map(({ cursor, label, point }) => (
             <div
               key={label}
               role="button"
@@ -554,8 +557,10 @@ export function TextTransformHandles({
               onMouseDown={(e) => beginDrag(e, "resize")}
               onTouchStart={(e) => beginDrag(e, "resize")}
               style={{ position: "fixed", left: point.x, top: point.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
-              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none rounded-full border border-white bg-sky-400 shadow ${cursor}`}
-            />
+              className={`pointer-events-auto -translate-x-1/2 -translate-y-1/2 flex touch-none items-center justify-center ${cursor}`}
+            >
+              <div style={{ width: HANDLE_DOT_SIZE, height: HANDLE_DOT_SIZE }} className="rounded-full border border-white bg-sky-400 shadow" />
+            </div>
           ))}
           <div
             role="button"
@@ -564,8 +569,10 @@ export function TextTransformHandles({
             onMouseDown={(e) => beginDrag(e, "rotate")}
             onTouchStart={(e) => beginDrag(e, "rotate")}
             style={{ position: "fixed", left: rotatePoint.x, top: rotatePoint.y, width: HANDLE_SIZE, height: HANDLE_SIZE, zIndex: 40 }}
-            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 touch-none cursor-grab rounded-full border border-white bg-emerald-400 shadow"
-          />
+            className="pointer-events-auto -translate-x-1/2 -translate-y-1/2 flex touch-none cursor-grab items-center justify-center"
+          >
+            <div style={{ width: HANDLE_DOT_SIZE, height: HANDLE_DOT_SIZE }} className="rounded-full border border-white bg-emerald-400 shadow" />
+          </div>
         </>
       )}
     </>

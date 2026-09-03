@@ -2,10 +2,9 @@ import { TEXT_BOX_PADDING, TEXT_MARGIN_PX } from "../playback/textLayout.ts";
 import { clipDuration, clipEnd, findAsset, sequenceDuration } from "../project/createProject.ts";
 import { fontById, fontFileFor, resolveFontVariant } from "../project/fonts.ts";
 import type { AssFontMetrics, FontDefinition } from "../project/fonts.ts";
-import type { ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorGrading, Project, TextCrop, TextStyle, TransitionType, Track } from "../project/types.ts";
+import type { ChromaKeySettings, Clip, ClipEffects, ClipTransform, ColorGrading, PixelEffectType, Project, TextCrop, TextStyle, TransitionType, Track } from "../project/types.ts";
 import { IDENTITY_EFFECTS, IDENTITY_TRANSFORM, isIdentityColorGrading, isIdentityEffects, isIdentityTextCrop, isIdentityTransform } from "../project/types.ts";
 import {
-  activeWordIndex,
   BOUNCE_AMPLITUDE_PX,
   BOUNCE_PERIOD_SECONDS,
   DEFAULT_WORD_HIGHLIGHT_COLOR,
@@ -18,9 +17,11 @@ import {
   WIGGLE_PERIOD_SECONDS,
 } from "../timeline/textAnimation.ts";
 import { hasColorGradingKeyframes, hasEffectsKeyframes, hasTextCropKeyframes, hasTextStyleKeyframes, hasTransformKeyframes, resolveClipColorGrading, resolveClipEffects, resolveClipTransform, resolveTextCrop, resolveTextStyle } from "../timeline/keyframes.ts";
+import { GLITCH_NOISE_AMOUNT, GLITCH_SHIFT_PX, WATER_RIPPLE_AMPLITUDE_PX, WATER_RIPPLE_PERIOD_SECONDS, WATER_RIPPLE_WAVELENGTH_PX } from "../timeline/pixelEffects.ts";
 import { snapToFrame } from "../timeline/time.ts";
 import { findTransitionOut, findTransitionPartner } from "../timeline/transitions.ts";
 import { buildCurvesFilterFragment } from "./curvesFilter.ts";
+import type { KhmerTextWindow } from "./khmerTextRenderer.ts";
 import { buildPanFilterStage } from "./panFilter.ts";
 
 /** `TransitionType` → FFmpeg's own `xfade` filter transition name — a 1:1 mapping (every value here
@@ -44,6 +45,14 @@ const TRANSITION_XFADE_NAME: Record<TransitionType, string> = {
   slideDown: "slidedown",
   circleOpen: "circleopen",
   circleClose: "circleclose",
+  // Not real xfade names — the ONE deliberate exception to the "every value here is a real xfade
+  // name" rule above. A corruption pre-pass filter stage (`geq=`/`rgbashift=`+`noise=`, applied to
+  // both sides before the transition) runs first, then this plain "fade" is what actually blends
+  // the two now-corrupted streams underneath it — the corruption itself, not the blend math, is
+  // what makes it read as "glitch"/"ripple" rather than a plain dissolve. See the transition-segment
+  // pre-pass below (searches for `glitchCut`/`waterRippleCut`) for where that stage is built.
+  glitchCut: "fade",
+  waterRippleCut: "fade",
 };
 
 /** Builds the FFmpeg invocation that renders a project to a finished file.
@@ -122,6 +131,22 @@ export interface ExportPlanOptions {
    *  `fontfile=`, which points at one exact file), so this needs the whole folder, not a per-file path
    *  the way `fontPathFor` is. */
   fontsDirFor?: () => string;
+  /** Synchronous lookup for a Khmer-script text clip's own pre-rendered window images — populated by
+   *  an ASYNC pre-pass the caller runs BEFORE calling `buildExportPlan` (this function itself stays
+   *  synchronous, same as every other resolver here), driving a headless-browser render harness (see
+   *  `khmerTextRenderer.ts`'s own doc comment for the full reasoning: every FFmpeg-side Khmer text path
+   *  fails to correctly stack certain subscript-consonant clusters, confirmed empirically, so Khmer text
+   *  is rendered through a real browser ahead of time instead of asking FFmpeg to shape it). Returns
+   *  `undefined` for a clip that wasn't pre-rendered (any non-Khmer clip, or a caller — `nativeExport.ts`
+   *  — that doesn't support this path at all), which falls back to the plain `drawtext` path exactly
+   *  like every other optional resolver here degrades when omitted. */
+  khmerTextWindowsFor?: (clip: Clip) => KhmerTextWindow[] | undefined;
+  /** Absolute path to a `.cube` 3D LUT file, given a `LutAsset.id` (`Clip.lutId`) — same "resolve to a
+   *  real file only at render time" seam `fontPathFor` uses for a font id. Omitted entirely (rather
+   *  than throwing) skips the `lut3d=` stage for every clip, same graceful-degradation shape every
+   *  other optional resolver here already has — `nativeExport.ts` currently doesn't support LUTs, so
+   *  it simply doesn't supply this. */
+  lutPathFor?: (lutId: string) => string | undefined;
 }
 
 export interface ExportPlan {
@@ -219,7 +244,10 @@ export function buildSegments(
     if (!asset) throw new ExportError(`A clip references media that is no longer in the project`);
     if (asset.offline) throw new ExportError(`"${asset.name}" is offline. Relink it before exporting.`);
 
-    const isImage = asset.kind === "image";
+    // A color-matte asset (`AssetKind === "color"`) has no intrinsic duration or seekable timeline of
+    // its own, same as a still image — both resolve to a single generated frame that needs `-loop 1`
+    // to occupy real time on the timeline, never `-ss`.
+    const isImage = asset.kind === "image" || asset.kind === "color";
     const path = options.inputPathFor(clip.assetId);
     const fullDuration = clipDuration(clip);
     const transition = findTransitionPartner(track, clip);
@@ -238,7 +266,7 @@ export function buildSegments(
         from: {
           clip: partner,
           hasAudio: partnerAsset.hasAudio,
-          isImage: partnerAsset.kind === "image",
+          isImage: partnerAsset.kind === "image" || partnerAsset.kind === "color",
           path: options.inputPathFor(partner.assetId),
         },
         to: { clip, hasAudio: asset.hasAudio, isImage, path },
@@ -330,8 +358,12 @@ function buildTransformFilters(params: {
   fps: number;
   chromaKey?: ChromaKeySettings;
   colorGrading?: ColorGrading;
+  /** Resolved `.cube` file path (`ExportPlanOptions.lutPathFor(clip.lutId)`), or `undefined` when the
+   *  clip has no `lutId` or the resolver itself wasn't supplied — either way, no `lut3d=` stage. */
+  lutPath?: string;
+  pixelEffect?: { type: PixelEffectType; speed?: number };
 }): string[] {
-  const { source, bg, outputLabel, transform, effects, width, height, fps, chromaKey, colorGrading } = params;
+  const { source, bg, outputLabel, transform, effects, width, height, fps, chromaKey, colorGrading, lutPath, pixelEffect } = params;
   const { crop } = transform;
   const clipLabel = `${outputLabel}_src`;
   const bgLabel = `${outputLabel}_bg`;
@@ -380,6 +412,42 @@ function buildTransformFilters(params: {
   // post-crop/pre-scale pixel-domain position `PlaybackEngine.ts`'s own `drawTransformed` applies its
   // curves LUT pass in (both right after the chroma-key stage, before geometry).
   const curvesFilter = colorGrading ? buildCurvesFilterFragment(colorGrading, n) : null;
+  // Applied right after curves, before geometry — matches `PlaybackEngine.drawTransformed`'s own
+  // post-color-grading/pre-geometry placement for its LUT pass. `interp=tetrahedral` matches the
+  // interpolation quality `Lut3DEngine`'s own preview LUT sampling already uses.
+  const lutFilter = lutPath ? `,lut3d=file='${lutPath}':interp=tetrahedral` : "";
+  // Applied right after the LUT stage, still before geometry — a spatial displacement needs to see the
+  // clip's own native pixels, same reasoning `PlaybackEngine.drawTransformed` runs `applyGlitch`/
+  // `applyWaterRipple` LAST among its color/grade passes, before the geometric transform. Only one of
+  // the two can ever be set (`PixelEffectType` is a single-choice union on the clip, not a set), so
+  // there's no ordering question between them.
+  //
+  // `applyWaterRipple`'s own per-pixel loop (`timeline/pixelEffects.ts`) is a direct, empirically-
+  // verified port of this `geq=` recipe — `p(X+amplitude*sin(Y/wavelength+T*rate*speed),Y)` samples
+  // each output pixel from a horizontally-displaced input coordinate that varies by row and by time,
+  // applied identically to all three planes (luma reads full-resolution X/Y; FFmpeg's own `geq`
+  // evaluates cb/cr in THEIR plane's own coordinate space, so the same expression already samples
+  // correctly at chroma resolution with no extra scaling needed).
+  //
+  // `applyGlitch`'s own preview version varies per discrete time "burst" (`GLITCH_BURST_PERIOD_SECONDS`)
+  // via a seeded pseudo-random hash — `rgbashift`'s `rh=`/`bv=` take plain constants, not a `T`-driven
+  // expression the way `geq=` does, so there's no way to reproduce that per-burst jitter at the FFmpeg
+  // level. A deliberate, documented scope cut: export renders ONE fixed R/B channel split (deterministic
+  // from `speed` alone, not real time) for the clip's whole duration instead, with `noise=allf=t` at
+  // least keeping the per-pixel noise grain itself animating frame-to-frame so the result doesn't read
+  // as a completely static filter.
+  const pixelEffectFilter = (() => {
+    if (!pixelEffect) return "";
+    const speed = pixelEffect.speed ?? 1;
+    if (pixelEffect.type === "waterRipple") {
+      const rate = (2 * Math.PI) / WATER_RIPPLE_PERIOD_SECONDS;
+      const expr = `p(X+${n(WATER_RIPPLE_AMPLITUDE_PX)}*sin(Y/${n(WATER_RIPPLE_WAVELENGTH_PX)}+T*${n(rate)}*${n(speed)}),Y)`;
+      return `,geq=lum='${expr}':cb='${expr}':cr='${expr}'`;
+    }
+    // "glitch"
+    const shift = Math.round(GLITCH_SHIFT_PX * speed) || GLITCH_SHIFT_PX;
+    return `,rgbashift=rh=${shift}:bv=${-shift},noise=alls=${n(GLITCH_NOISE_AMOUNT)}:allf=t`;
+  })();
   // Applied AFTER scale, not before — so `blur`'s sigma corresponds to the clip's FINAL on-screen
   // pixel size, matching both the "pixels" unit the Inspector's slider promises and how Canvas2D's
   // own `context.filter` blurs the already-scaled draw, not the source's native resolution. Only
@@ -392,7 +460,7 @@ function buildTransformFilters(params: {
   const opacityFilter = effects.opacity < 1 ? `,colorchannelmixer=aa=${n(effects.opacity)}` : "";
 
   return [
-    `[${source}]${chromaKeyFilter}${cropFilter},format=rgba,${eqFilter}${curvesFilter ? `,${curvesFilter}` : ""},${scaleFilter}${blurFilter},${rotateFilter}${opacityFilter},` +
+    `[${source}]${chromaKeyFilter}${cropFilter},format=rgba,${eqFilter}${curvesFilter ? `,${curvesFilter}` : ""}${lutFilter}${pixelEffectFilter},${scaleFilter}${blurFilter},${rotateFilter}${opacityFilter},` +
       `setsar=1,fps=${fps},setpts=PTS-STARTPTS[${clipLabel}]`,
     // The background is its own lavfi input (pushed alongside this), not an inline `color=` source
     // filter — matching the pattern gap segments already use elsewhere in this function, so there's
@@ -450,8 +518,12 @@ const MAX_KEYFRAME_SLICES_PER_CLIP = 240;
  *  than this one growing a generic resolver list). `keyframeTimes` is the flat, already-merged list of
  *  every keyframe time relevant to whichever caller is asking (video: transform+effects+colorGrading;
  *  text: textStyleKeyframes alone) — see `computeKeyframeSlices`'s own comment on why a HOLD-resolved
- *  field's keyframe times still need to be included here, not just interpolated ones. */
-function computeSliceBoundaries(keyframeTimes: number[], elapsedAtSegmentStart: number, sliceDuration: number, fps: number): number[] {
+ *  field's keyframe times still need to be included here, not just interpolated ones.
+ *
+ *  Exported so `khmerTextRenderer.ts` can reuse the exact same "flipbook" slice boundaries for a
+ *  Khmer bounce/pulse/typewriter text clip's own per-window image renders — same reasoning as
+ *  `buildSegments`'s own export, reuse over reimplementation. */
+export function computeSliceBoundaries(keyframeTimes: number[], elapsedAtSegmentStart: number, sliceDuration: number, fps: number): number[] {
   const segmentEnd = elapsedAtSegmentStart + sliceDuration;
 
   function boundariesAt(interval: number): number[] {
@@ -591,8 +663,8 @@ function buildTextCropFilter(inputLabel: string, crop: TextCrop, outputLabel: st
  *  Backslashes (the path separator `path.join`/`path.resolve`/`os.tmpdir()` actually produce on
  *  Windows) get normalized to forward slashes FIRST, before the colon escape — a raw backslash is
  *  FFmpeg's OWN filtergraph escape character, so an un-normalized Windows path silently eats its own
- *  separators (confirmed live: `C:\Users\...\vstudio-text-xyz\clip.txt` arrived at FFmpeg as
- *  `C:Users...vstudio-text-xyzclip.txt`, "no such file"). Forward slashes work as path separators on
+ *  separators (confirmed live: `C:\Users\...\vcut-text-xyz\clip.txt` arrived at FFmpeg as
+ *  `C:Users...vcut-text-xyzclip.txt`, "no such file"). Forward slashes work as path separators on
  *  Windows regardless of what produced the string, so this is a safe normalization either way. */
 function ffmpegPath(absolutePath: string): string {
   return `'${absolutePath.replace(/\\/g, "/").replace(/:/g, "\\:")}'`;
@@ -618,7 +690,13 @@ function buildDrawTextStyleParams(style: TextStyle): string {
   const shadow = style.shadowColor
     ? `:shadowcolor=${ffmpegColor(style.shadowColor)}:shadowx=${n(style.shadowOffsetX)}:shadowy=${n(style.shadowOffsetY)}`
     : "";
-  return `${box}${border}${shadow}`;
+  // `text_align` is what per-line-justifies multi-line text WITHIN the frame-centered block that
+  // `buildDrawTextGeometry`'s own `x=` now always anchors regardless of `align` — see that function's
+  // own comment, and `textLayout.ts`'s top-of-file comment for the preview-side mirror of this split.
+  // `TextStyle.align`'s three values map 1:1 onto `drawtext`'s own `text_align` option, confirmed live
+  // against this repo's bundled ffmpeg.
+  const textAlign = `:text_align=${style.align}`;
+  return `${box}${border}${shadow}${textAlign}`;
 }
 
 /** A text clip's own fade-out is one of two genuinely different things, both surfaced by the main
@@ -719,6 +797,29 @@ function assTimestamp(seconds: number): string {
  *  defensible failure mode of the two. */
 function assEscapeRun(text: string): string {
   return text.replace(/[{}]/g, "");
+}
+
+/** Whether `text` contains any Khmer-script codepoint (U+1780–U+17FF) — decides whether a text clip
+ *  routes through the browser-rendered image-overlay path (`pushKhmerTextOverlay`, driven by an async
+ *  pre-pass the export route runs before calling `buildExportPlan` at all — see
+ *  `ExportPlanOptions.khmerTextWindowsFor`'s own doc comment) instead of `drawtext=`. Exported so that
+ *  same pre-pass (`studios/vcut`'s export route) can decide which clips are even worth rendering
+ *  through the headless-browser harness in the first place, without duplicating this check.
+ *
+ *  `drawtext` selects glyphs via a raw FreeType cmap lookup with no OpenType GSUB substitution — most
+ *  of this app's bundled Khmer fonts need GSUB even to select a BASE consonant glyph, not just for
+ *  subscript/vowel-sign reordering. The libass `subtitles=` filter this app's Khmer text used to route
+ *  through instead gets much closer (no tofu) but was separately confirmed to fail at correctly
+ *  stacking certain subscript-consonant clusters regardless of font or FFmpeg build (see
+ *  `khmerTextRenderer.ts`'s own doc comment for the full empirical trail) — the browser is the one
+ *  thing confirmed to shape Khmer correctly, hence the image-overlay path. Latin text is unaffected
+ *  either way, so this only redirects the specific case that's actually broken. */
+export function containsKhmerScript(text: string): boolean {
+  for (const ch of text) {
+    const codePoint = ch.codePointAt(0);
+    if (codePoint !== undefined && codePoint >= 0x1780 && codePoint <= 0x17ff) return true;
+  }
+  return false;
 }
 
 /** Builds one complete `.ass` subtitle document implementing `wordHighlight` — see
@@ -1083,13 +1184,14 @@ function buildDrawTextGeometry(
   const font = fontById(style.fontFamily);
   const fontFile = ffmpegPath(fontPathFor(fontFileFor(font, style.bold, style.italic)));
 
-  const anchorX =
-    style.align === "left"
-      ? `${TEXT_MARGIN_PX}+${n(style.offsetX)}`
-      : style.align === "right"
-        ? `(w-${TEXT_MARGIN_PX})+${n(style.offsetX)}`
-        : `(w/2)+${n(style.offsetX)}`;
-  const x = style.align === "left" ? anchorX : style.align === "right" ? `(${anchorX})-text_w` : `(${anchorX})-text_w/2`;
+  // The block's own on-screen position depends ONLY on `offsetX` — the frame's center, nudged by the
+  // user's own drag/offset — never on `align`, matching `textLayout.ts`'s own `anchorX` fix (see its
+  // top-of-file comment): re-justifying a text box's lines must not teleport the box itself. `align`
+  // now only drives `text_align=` (`buildDrawTextStyleParams`), which handles per-LINE justification
+  // within this frame-centered block natively — the same job `textLayout.ts`'s own `lineX` does for
+  // preview.
+  const anchorX = `(w/2)+${n(style.offsetX)}`;
+  const x = `(${anchorX})-text_w/2`;
   const y = `(h/2)+${n(style.offsetY)}-text_h/2`;
 
   const styleParams = buildDrawTextStyleParams(style);
@@ -1299,9 +1401,10 @@ function buildRotatedDrawTextGeometry(
   const fontFile = ffmpegPath(fontPathFor(fontFileFor(font, style.bold, style.italic)));
 
   // Centered within the background buffer's OWN w/h (== the full sequence frame), not the final
-  // on-screen position — offset is applied later, at the overlay step, after rotation.
-  const anchorX = style.align === "left" ? `${TEXT_MARGIN_PX}` : style.align === "right" ? `(w-${TEXT_MARGIN_PX})` : `(w/2)`;
-  const x = style.align === "left" ? anchorX : style.align === "right" ? `(${anchorX})-text_w` : `(${anchorX})-text_w/2`;
+  // on-screen position — offset is applied later, at the overlay step, after rotation. Never
+  // align-dependent, same fix and reasoning as `buildDrawTextGeometry` above — `align` only drives
+  // `text_align=` now, not which edge the block itself anchors to.
+  const x = `(w/2)-text_w/2`;
   const y = `(h/2)-text_h/2`;
 
   const styleParams = buildDrawTextStyleParams(style);
@@ -1547,7 +1650,9 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
       (!transform || isIdentityTransform(transform)) &&
       (!effects || isIdentityEffects(effects)) &&
       !clip.chromaKey &&
-      (!clip.colorGrading || isIdentityColorGrading(clip.colorGrading));
+      (!clip.colorGrading || isIdentityColorGrading(clip.colorGrading)) &&
+      !clip.lutId &&
+      !clip.pixelEffect;
 
     if (isPlain) {
       filters.push(
@@ -1585,6 +1690,8 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
           fps,
           chromaKey: clip.chromaKey,
           colorGrading: clip.colorGrading,
+          lutPath: clip.lutId ? options.lutPathFor?.(clip.lutId) : undefined,
+          pixelEffect: clip.pixelEffect,
         })
       );
     }
@@ -1706,12 +1813,17 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
           fps,
           chromaKey: clip.chromaKey,
           colorGrading: slice.colorGrading,
+          lutPath: clip.lutId ? options.lutPathFor?.(clip.lutId) : undefined,
+          pixelEffect: clip.pixelEffect,
         })
       );
       sliceLabels.push(`[${sliceLabel}]`);
     });
 
-    filters.push(`${sliceLabels.join("")}concat=n=${slices.length}:v=1:a=0[${label}]`);
+    // `,fps=` renormalizes the concat output's own negotiated timebase back to the sequence rate —
+    // without it, a downstream `xfade` transition can reject this stream's timebase entirely (the same
+    // fix `buildSegments`' own outer segment concat needed for the identical reason).
+    filters.push(`${sliceLabels.join("")}concat=n=${slices.length}:v=1:a=0,fps=${fps}[${label}]`);
 
     if (fadeIn || fadeOut) {
       const alphaParam = transparent ? ":alpha=1" : "";
@@ -1790,6 +1902,106 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
     }
   }
 
+  // Composites a Khmer-script text clip's pre-rendered window images (see `khmerTextRenderer.ts`'s own
+  // doc comment for why Khmer routes through browser-rendered PNGs instead of `drawtext=`/`subtitles=`
+  // at all) onto `videoOut`, entirely replacing that clip's own drawtext/rotated/wordHighlight branches.
+  //
+  // The composited stream (`txt0_stream` etc.) is built to span the FULL sequence duration, not just
+  // this clip's own — a transparent `color=...@0` leg fills [0, clip start) when the clip doesn't start
+  // at t=0, each real window is held for its own [startOffset, endOffset) via `-loop 1 -framerate`, and
+  // a second transparent leg fills [clip end, sequence duration) when the clip ends before the sequence
+  // does. All three leg kinds are just `concat`-ed together (`,fps=` renormalizes each leg's own
+  // timebase first — the same fix `buildSegments`' own segment concat needed for `xfade` compatibility
+  // applies here too, since a `-loop`'d image input and a `lavfi color=` input don't share one natively).
+  // Doing it this way means the FINAL overlay step needs no `enable='between(t,...)'` gate at all — the
+  // stream is already correctly "on" only where content should show, unlike every drawtext path above
+  // which draws onto a clip-duration-only buffer and relies on `enable=` to place it in time.
+  //
+  // Fades use the plain raster-layer `fade=...:alpha=1` filter (same shape `pushClipVideoFilters` uses
+  // for a video/image clip's own solo fade), not `buildTextFadeParams`'s `drawtext`-specific `:alpha=`
+  // expression term — there's no `drawtext` call here for that term to attach to. Only `enableEnd` is
+  // reused from it, since the crossfade-vs-solo timing distinction `TextFadeOut` documents applies
+  // identically to a raster fade's own ramp window.
+  function pushKhmerTextOverlay(
+    videoOut: string,
+    outputLabel: string,
+    clip: Clip,
+    windows: KhmerTextWindow[],
+    fadeIn: number | undefined,
+    fadeOut: TextFadeOut | undefined
+  ): void {
+    const start = clip.timelineStart;
+    const end = clipEnd(clip);
+    const streamLabel = `${outputLabel}_stream`;
+    const legLabels: string[] = [];
+
+    function pushColorLeg(legDuration: number): void {
+      const idx = inputIndex++;
+      inputs.push("-f", "lavfi", "-t", t(legDuration), "-i", `color=c=black@0:s=${width}x${height}:r=${fps},format=rgba`);
+      const legLabel = `${streamLabel}_leg${legLabels.length}`;
+      filters.push(`[${idx}:v]setpts=PTS-STARTPTS[${legLabel}]`);
+      legLabels.push(`[${legLabel}]`);
+    }
+
+    function pushImageLeg(imagePath: string, legDuration: number): void {
+      const idx = inputIndex++;
+      inputs.push("-loop", "1", "-framerate", String(fps), "-t", t(legDuration), "-i", imagePath);
+      const legLabel = `${streamLabel}_leg${legLabels.length}`;
+      filters.push(`[${idx}:v]format=rgba,setpts=PTS-STARTPTS[${legLabel}]`);
+      legLabels.push(`[${legLabel}]`);
+    }
+
+    if (start > 1e-9) pushColorLeg(start);
+    for (const w of windows) pushImageLeg(w.imagePath, w.endOffset - w.startOffset);
+    if (duration - end > 1e-9) pushColorLeg(duration - end);
+
+    filters.push(`${legLabels.join("")}concat=n=${legLabels.length}:v=1:a=0,fps=${fps}[${streamLabel}]`);
+
+    const { enableEnd } = buildTextFadeParams(clip, fadeIn, fadeOut);
+    const fadeStages: string[] = [];
+    if (fadeIn) fadeStages.push(`fade=t=in:st=${t(start)}:d=${t(fadeIn)}:alpha=1`);
+    if (fadeOut) fadeStages.push(`fade=t=out:st=${t(enableEnd - fadeOut.duration)}:d=${t(fadeOut.duration)}:alpha=1`);
+
+    let overlayInputLabel = `[${streamLabel}]`;
+    if (fadeStages.length > 0) {
+      const fadedLabel = `${streamLabel}_faded`;
+      filters.push(`[${streamLabel}]${fadeStages.join(",")}[${fadedLabel}]`);
+      overlayInputLabel = `[${fadedLabel}]`;
+    }
+
+    filters.push(`${videoOut}${overlayInputLabel}overlay=format=auto[${outputLabel}]`);
+  }
+
+  // The two "Cut" transition types (`glitchCut`/`waterRippleCut`) render as a plain `fade` blend (see
+  // `TRANSITION_XFADE_NAME`) preceded by a corruption pass on EACH side's own stream — mirrors
+  // `PlaybackEngine.compositeTransitionFrame`'s own glitch/water-ripple transition families, which run
+  // `applyGlitch`/`applyWaterRipple` on both outgoing/incoming frames before blending them, rather than
+  // just picking a different `xfade` geometry the way every other transition type does. Returns `label`
+  // UNCHANGED for every other type — the raw `_from`/`_to` streams feed `xfade` directly, exactly as
+  // before this feature existed.
+  //
+  // `waterRippleCut` ramps the displacement's own amplitude across the blend window (zero at both
+  // edges, peaking at the midpoint) via a plain quadratic in `T` — `4*(T/D)*(1-T/D)` is 0 at T=0 and
+  // T=D, 1 at T=D/2 — instead of `applyWaterRipple`'s continuous per-clip effect's flat full-strength
+  // wobble, matching `compositeTransitionFrame`'s own "ramp up then back down across the blend window"
+  // shape for this transition family specifically. `glitchCut` has no equivalent ramp — same
+  // "`rgbashift=`/`noise=` can't be driven by a `T` expression the way `geq=` can" limitation
+  // `pixelEffectFilter` above already documents — so it's a fixed corruption pass for the transition's
+  // whole duration.
+  function applyTransitionCorruptionPass(label: string, transitionType: TransitionType, transitionDuration: number): string {
+    if (transitionType !== "glitchCut" && transitionType !== "waterRippleCut") return label;
+    const fxLabel = `${label}_fx`;
+    if (transitionType === "waterRippleCut") {
+      const rate = (2 * Math.PI) / WATER_RIPPLE_PERIOD_SECONDS;
+      const ramp = `4*(T/${t(transitionDuration)})*(1-T/${t(transitionDuration)})`;
+      const expr = `p(X+${n(WATER_RIPPLE_AMPLITUDE_PX)}*${ramp}*sin(Y/${n(WATER_RIPPLE_WAVELENGTH_PX)}+T*${n(rate)}),Y)`;
+      filters.push(`[${label}]geq=lum='${expr}':cb='${expr}':cr='${expr}'[${fxLabel}]`);
+    } else {
+      filters.push(`[${label}]rgbashift=rh=${GLITCH_SHIFT_PX}:bv=${-GLITCH_SHIFT_PX},noise=alls=${n(GLITCH_NOISE_AMOUNT)}:allf=t[${fxLabel}]`);
+    }
+    return fxLabel;
+  }
+
   // Builds ONE video track's own segment-based concat chain — everything the single-track version of
   // this function used to do in its own top-level loop, now run once per visible video track and
   // producing that track's own `[cvT]`/`[caT]` pair instead of the fixed `[cv]`/`[ca]`. `trackIndex`
@@ -1821,7 +2033,7 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
             segment.fadeIn,
             segment.fadeOut
           );
-          pushKeyframedAudio(segment.clip, segment.path, segment.isImage, segment.hasAudio, elapsedAtSegmentStart, audioLabel, segment.duration, segment.fadeIn, segment.fadeOut);
+          pushKeyframedAudio(segment.clip, segment.path, segment.isImage, segment.hasAudio && !track.muted, elapsedAtSegmentStart, audioLabel, segment.duration, segment.fadeIn, segment.fadeOut);
         } else {
           if (segment.isImage) {
             // A still has no timeline to seek into — `-ss` would be meaningless and `-t` alone would
@@ -1837,7 +2049,7 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
           const videoIndex = inputIndex++;
           pushClipVideoFilters(segment.clip, videoIndex, videoLabel, segment.duration, transparent, segment.fadeIn, segment.fadeOut);
           pushClipAudioFilters(
-            segment.hasAudio && !segment.clip.mutedAudio,
+            segment.hasAudio && !segment.clip.mutedAudio && !track.muted,
             videoIndex,
             audioLabel,
             segment.duration,
@@ -1867,7 +2079,7 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
         if (hasTransformKeyframes(segment.from.clip) || hasEffectsKeyframes(segment.from.clip) || hasColorGradingKeyframes(segment.from.clip)) {
           const fromElapsedAtSegmentStart = clipDuration(segment.from.clip) - D;
           pushKeyframedClipVideoFilters(segment.from.clip, segment.from.path, segment.from.isImage, fromElapsedAtSegmentStart, fromVideoLabel, D, transparent);
-          pushKeyframedAudio(segment.from.clip, segment.from.path, segment.from.isImage, segment.from.hasAudio, fromElapsedAtSegmentStart, fromAudioLabel, D);
+          pushKeyframedAudio(segment.from.clip, segment.from.path, segment.from.isImage, segment.from.hasAudio && !track.muted, fromElapsedAtSegmentStart, fromAudioLabel, D);
         } else {
           if (segment.from.isImage) {
             inputs.push("-loop", "1", "-framerate", String(fps), "-t", t(D), "-i", segment.from.path);
@@ -1876,12 +2088,12 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
           }
           const fromIndex = inputIndex++;
           pushClipVideoFilters(segment.from.clip, fromIndex, fromVideoLabel, D, transparent);
-          pushClipAudioFilters(segment.from.hasAudio && !segment.from.clip.mutedAudio, fromIndex, fromAudioLabel, D, segment.from.clip.gain ?? 1);
+          pushClipAudioFilters(segment.from.hasAudio && !segment.from.clip.mutedAudio && !track.muted, fromIndex, fromAudioLabel, D, segment.from.clip.gain ?? 1);
         }
 
         if (hasTransformKeyframes(segment.to.clip) || hasEffectsKeyframes(segment.to.clip) || hasColorGradingKeyframes(segment.to.clip)) {
           pushKeyframedClipVideoFilters(segment.to.clip, segment.to.path, segment.to.isImage, 0, toVideoLabel, D, transparent);
-          pushKeyframedAudio(segment.to.clip, segment.to.path, segment.to.isImage, segment.to.hasAudio, 0, toAudioLabel, D);
+          pushKeyframedAudio(segment.to.clip, segment.to.path, segment.to.isImage, segment.to.hasAudio && !track.muted, 0, toAudioLabel, D);
         } else {
           if (segment.to.isImage) {
             inputs.push("-loop", "1", "-framerate", String(fps), "-t", t(D), "-i", segment.to.path);
@@ -1890,15 +2102,18 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
           }
           const toIndex = inputIndex++;
           pushClipVideoFilters(segment.to.clip, toIndex, toVideoLabel, D, transparent);
-          pushClipAudioFilters(segment.to.hasAudio && !segment.to.clip.mutedAudio, toIndex, toAudioLabel, D, segment.to.clip.gain ?? 1);
+          pushClipAudioFilters(segment.to.hasAudio && !segment.to.clip.mutedAudio && !track.muted, toIndex, toAudioLabel, D, segment.to.clip.gain ?? 1);
         }
 
         // `segment.to.clip` is the INCOMING side — `transitionIn` describes the blend FROM its partner
         // INTO it (see that field's own doc comment), matching exactly which clip `findTransitionPartner`
         // was resolved against to produce this segment in the first place.
-        const xfadeName = TRANSITION_XFADE_NAME[segment.to.clip.transitionIn?.type ?? "crossfade"];
+        const transitionType = segment.to.clip.transitionIn?.type ?? "crossfade";
+        const xfadeName = TRANSITION_XFADE_NAME[transitionType];
+        const fromBlendLabel = applyTransitionCorruptionPass(fromVideoLabel, transitionType, D);
+        const toBlendLabel = applyTransitionCorruptionPass(toVideoLabel, transitionType, D);
         filters.push(
-          `[${fromVideoLabel}][${toVideoLabel}]xfade=transition=${xfadeName}:duration=${t(D)}:offset=0,setpts=PTS-STARTPTS[${videoLabel}]`
+          `[${fromBlendLabel}][${toBlendLabel}]xfade=transition=${xfadeName}:duration=${t(D)}:offset=0,setpts=PTS-STARTPTS[${videoLabel}]`
         );
         filters.push(`[${fromAudioLabel}][${toAudioLabel}]acrossfade=d=${t(D)}[${audioLabel}]`);
       } else {
@@ -2079,7 +2294,33 @@ export function buildExportPlan(project: Project, options: ExportPlanOptions): E
             ? { duration: soloFadeOutDuration, extendsPastEnd: false }
             : undefined;
 
-      // `wordHighlight` is checked FIRST, ahead of the rotated/plain split below — it renders through a
+      // A Khmer-script text clip (any `textAnimation`, including `wordHighlight`) renders through
+      // pre-rendered browser images instead of any FFmpeg-side text path — see `khmerTextRenderer.ts`'s
+      // own doc comment for why: every FFmpeg text path (`drawtext`, and the libass `subtitles=` filter
+      // this used to route Khmer through) fails to correctly stack certain subscript-consonant clusters,
+      // confirmed empirically. Checked FIRST, ahead of `wordHighlight`/rotated/plain, so a Khmer
+      // `wordHighlight` clip takes this path too rather than the ASS one below (kept only for non-Khmer
+      // `wordHighlight` now). Excludes keyframed style and crop — the render harness doesn't cover
+      // either yet, the same real, documented scope cut the old libass Khmer path also had — but NOT
+      // rotation: unlike the old path's unverified libass `\frz` sign convention, the harness draws
+      // through the exact same `drawAnimatedTextFrame` the preview uses, rotation included, so a
+      // rotated Khmer clip is fully supported here. `khmerTextWindowsFor` returns `undefined` for
+      // anything not pre-rendered (a non-Khmer clip, or a caller — `nativeExport.ts` — that doesn't
+      // support this path), falling through to the untouched paths below exactly like every other
+      // optional resolver here degrades when omitted.
+      const khmerWindows =
+        !hasTextStyleKeyframes(clip) &&
+        !((clip.textCrop && !isIdentityTextCrop(clip.textCrop)) || hasTextCropKeyframes(clip)) &&
+        containsKhmerScript(asset.textContent ?? "")
+          ? options.khmerTextWindowsFor?.(clip)
+          : undefined;
+      if (khmerWindows && khmerWindows.length > 0) {
+        pushKhmerTextOverlay(videoOut, outputLabel, clip, khmerWindows, fadeIn, fadeOut);
+        videoOut = `[${outputLabel}]`;
+        continue;
+      }
+
+      // `wordHighlight` is checked next, ahead of the rotated/plain split below — it renders through a
       // completely different filter (`subtitles=`, not `drawtext`) regardless of `style.rotationDeg`,
       // and `buildWordHighlightSubtitlesFilter` itself returns `null` (falling through to the ordinary
       // plain/rotated path below, same as before this capability existed) whenever the three

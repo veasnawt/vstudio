@@ -16,26 +16,52 @@ import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerE
  *  click to select a clip would register as a one-pixel move and push a pointless undo entry. */
 const DRAG_THRESHOLD = 3;
 /** Same idea as `DRAG_THRESHOLD`, but for touch specifically — a finger is never as still as a mouse
- *  cursor, so 3px of natural tremor during an intended tap would otherwise misfire as movement. Sized
- *  to match `SNAP_PIXELS`'s own already-tuned "feels right" scale rather than inventing a new one. */
+ *  cursor, so 3px of natural tremor during an intended tap would otherwise misfire as movement. */
 const TOUCH_DRAG_THRESHOLD = 8;
-/** How close (in pixels, so it feels the same at any zoom) an edge must come to a snap point. */
-const SNAP_PIXELS = 8;
+/** How close (in pixels, so it feels the same at any zoom) an edge must come to a snap point.
+ *  Widened from an earlier, tighter 8px — two same-kind clips (see `snapPoints`'s own `trackKind`
+ *  filter) butting up against each other with zero gap is a very common, deliberate thing to want,
+ *  and 8px asked for more precision than that gesture should realistically need. */
+const SNAP_PIXELS = 12;
 /** Wider snap window for touch specifically — a fingertip is nowhere near as precise as a mouse
- *  cursor, so the same 8px window that feels reliable with a mouse is easy to miss entirely with a
- *  finger. Requested directly: dragging felt "imprecise" on touch. */
+ *  cursor, so the same window that feels reliable with a mouse is easy to miss entirely with a
+ *  finger. Originally widened all the way to 22px after dragging felt "imprecise" on touch — but
+ *  brought back down from that: 22px turned out to overcorrect, confirmed live (dragging near another
+ *  clip on a real phone) — the window was wide enough that the clip would "stick" to a nearby snap
+ *  point across a real range of continued finger movement, releasing only once the finger moved
+ *  noticeably past it, so a clip regularly landed measurably away from wherever it visually looked
+ *  like it was dropped ("wrong position" reported directly). 16px keeps meaningfully more tolerance
+ *  than the mouse window (`SNAP_PIXELS`, 12px) for the same "fingertip, not a cursor" reason, without
+ *  the sticky deadzone 22px produced. */
 const TOUCH_SNAP_PIXELS = 16;
 /** How long a touch has to hold still on a clip before it counts as "add/remove this from the
- *  selection" — touch has no Ctrl/Cmd key to hold for an additive click, so a deliberate long-press
- *  is what stands in for it, matching the same convention (and duration) `MediaLibrary`'s own
- *  touch-drag pickup uses. */
-const LONG_PRESS_MS = 450;
+ *  selection" AND arms a move-drag (see `gateBehindLongPress` below) — touch has no Ctrl/Cmd key to
+ *  hold for an additive click, so a deliberate long-press is what stands in for it. Deliberately
+ *  SHORTER than `MediaLibrary`'s own same-purpose constant (450ms): that gesture picks a library
+ *  asset up to drop it somewhere, a rarer, more deliberate action; THIS one gates the single most
+ *  common touch interaction on the whole timeline (repositioning a clip), so every extra 100ms here
+ *  is felt on nearly every edit. Lowered from an original 450ms — confirmed too slow to feel
+ *  responsive on a real device — paired with `longPressArmed` below (an immediate visual "picked up"
+ *  cue the INSTANT this fires, not just once the finger also moves) so the wait reads as a deliberate,
+ *  felt handoff rather than dead air. A native scroll can no longer be hijacked into a clip move —
+ *  the root element is `touch-none` unconditionally now (see its own className comment), so the
+ *  browser never treats a gesture starting on a clip as a scroll in the first place — this constant
+ *  purely gates the tap-vs-hold selection behavior described above. */
+const LONG_PRESS_MS = 180;
 /** How long after a real touch event the browser's own synthetic compatibility mouse event (fired
  *  shortly after most touch interactions, for mouse-only sites) still counts as "the ghost of that
  *  same touch" rather than a genuine separate mouse press — see `lastTouchAtRef`'s own comment. Wide
  *  enough to comfortably cover the browser's own dispatch delay (typically under 300ms) without
  *  being so wide it could ever swallow a real, deliberate mouse click on a hybrid touch+mouse device. */
 const SYNTHETIC_MOUSE_GRACE_MS = 600;
+/** How close together two genuine quick taps (see `lastQuickTapAtRef`'s own comment) have to land to
+ *  count as a double-tap — the touch equivalent of a mouse `onDoubleClick`, which fires natively and
+ *  reliably for a real double-CLICK but, confirmed elsewhere in this app already (`MediaLibrary.tsx`'s
+ *  own identical note), has no dependable double-TAP equivalent on touch: two quick taps don't
+ *  reliably synthesize a `dblclick` event on a real phone. 350ms matches the platform-standard
+ *  double-tap window (iOS/Android both land in the 300-500ms range) rather than a value picked to feel
+ *  right on just this one gesture. */
+const DOUBLE_TAP_MS = 350;
 
 type DragMode = "move" | "trim-in" | "trim-out";
 
@@ -122,6 +148,14 @@ function TimelineClipComponent({
     snapped: boolean;
   } | null>(null);
 
+  // True the instant a touch long-press ARMS a move-drag (see `gateBehindLongPress` in `beginDrag`),
+  // well before the finger has necessarily moved at all — drives the same "picked up" visual treatment
+  // `preview`/an active drag already gets (see the root element's own className), so the moment a hold
+  // completes is something the user SEES right away instead of only finding out once they also move
+  // past `TOUCH_DRAG_THRESHOLD`. Purely a rendering concern (unlike `preview`, nothing reads this
+  // imperatively from outside React), so a plain `useState` with no ref mirror is enough.
+  const [longPressArmed, setLongPressArmed] = useState(false);
+
   // A waveform backdrop for audio clips — one PNG spanning the asset's FULL duration (see
   // `waveformUrl`'s own comment), rendered at a fixed PIXEL size/position (not a percentage of the
   // clip's own box) so the visible slice always matches this CLIP's own trim, not just the whole
@@ -167,11 +201,6 @@ function TimelineClipComponent({
   // `transitionOut.duration`, a completely different field.
   const [transitionDrag, setTransitionDrag] = useState<{ side: "in" | "out"; duration: number } | null>(null);
   const transitionDragRef = useRef<{ side: "in" | "out"; duration: number } | null>(null);
-  /** The clip's own root element — see `beginDrag`'s long-press gate for why this needs direct,
-   *  synchronous DOM access rather than going through React state/className (a React re-render is one
-   *  tick too late to matter here, the same reasoning `VStudioApp`'s drag-block overlay uses elsewhere
-   *  in this codebase for an identical timing-sensitive toggle). */
-  const rootRef = useRef<HTMLDivElement>(null);
   /** Destination track for an in-flight move. Starts as the clip's own track, so a purely horizontal
    *  drag behaves exactly as before. */
   const targetTrackRef = useRef<string>(track.id);
@@ -183,6 +212,12 @@ function TimelineClipComponent({
    *  decided the outcome, silently undoing (or doubling) it — a plain toggle looked like it "didn't
    *  work" every other press. */
   const lastTouchAtRef = useRef(0);
+  /** Timestamp of the last genuine quick tap on THIS clip (a touch that released without arming a
+   *  long-press or turning into a drag — see `onUp`'s own `!longPressFired` branch, the touch
+   *  equivalent of a plain mouse click) — what a SECOND such tap, landing within `DOUBLE_TAP_MS`, is
+   *  compared against to recognize a double-tap. See `DOUBLE_TAP_MS`'s own comment for why this exists
+   *  at all instead of just listening for `dblclick`. */
+  const lastQuickTapAtRef = useRef(0);
 
   function updatePreview(next: { start: number; duration: number; sourceIn: number; sourceOut: number; snapped: boolean } | null) {
     previewRef.current = next;
@@ -230,6 +265,16 @@ function TimelineClipComponent({
     event.stopPropagation();
     preventDefaultIfMouse(event);
 
+    // A move/trim drag only updates this clip's on-screen box (`updatePreview` below) — the committed
+    // `clip.timelineStart`/`sourceIn`/`sourceOut` `PlaybackEngine` actually schedules audio/video
+    // against don't change until `run(new TrimClipCommand(...))`/`MoveClipCommand` fires on release. Left
+    // alone, dragging a trim handle while playback is running let a clip's audio keep playing right past
+    // its own new, already-shorter-looking boundary for the whole drag — a real, confirmed bug, not a
+    // cosmetic one frame of lag. Pausing here (like scrubbing the playhead already does elsewhere) is
+    // simpler and more robust than teaching every playback code path about an in-progress, uncommitted
+    // drag preview, and matches how dragging a clip while playing already behaves in most NLEs.
+    if (useEditorStore.getState().playing) useEditorStore.getState().setPlaying(false);
+
     const additive = "ctrlKey" in event && (event.ctrlKey || event.metaKey);
     function applyTapSelection() {
       if (additive) {
@@ -245,29 +290,29 @@ function TimelineClipComponent({
 
     // Touch has no Ctrl/Cmd key, so a plain tap can never be "additive" — a quick tap on the clip
     // BODY (not the trim handles) is deferred behind a long-press instead: hold still past
-    // `LONG_PRESS_MS` and it toggles into/out of the selection (the touch equivalent of Ctrl+click),
-    // move or release before then and it falls back to a normal tap-to-select. Trim handles skip this
-    // entirely — a delayed grab there would make trimming feel laggy for no benefit, since there's no
-    // meaningful "multi-select a trim handle" gesture to defer for.
+    // `LONG_PRESS_MS` and it toggles into/out of the selection (the touch equivalent of Ctrl+click).
+    // This is now PURELY a tap-vs-hold distinction for SELECTION — it no longer has anything to do
+    // with whether a drag is allowed to start (the root element's `touch-none` already handles that
+    // unconditionally, from the very first touch — see its own doc comment for why gating it behind
+    // this timer used to let the timeline itself get dragged out from under the clip). Real movement,
+    // whenever it arrives, always starts a real drag immediately (see `onMove` below) — same as mouse
+    // already does, with no artificial wait either way now.
     const isTouch = "touches" in event;
-    // The SAME long-press gate also decides whether a touch-drag is even allowed to begin at all —
-    // see the root element's own comment on why `touch-action` starts permissive and only becomes
-    // `none` once this fires. Without gating, ANY touch movement on a clip (which covers most of the
-    // visible track area) immediately became a move-drag, so there was no way to pan the timeline by
-    // swiping across a clip — worse, a swipe that only meant to scroll could silently nudge the clip a
-    // few pixels first. Confirmed as the actual cause of "touch/scroll doesn't work" on a real
-    // Capacitor Android build, not just a theoretical concern.
     const gateBehindLongPress = isTouch && mode === "move" && !additive;
     let longPressFired = false;
     let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+    function armLongPress() {
+      if (longPressFired) return;
+      longPressFired = true;
+      toggleSelect(clip.id);
+      // The immediate "picked up" visual cue — see `longPressArmed`'s own doc comment for why this
+      // fires here, not only once the finger also crosses `TOUCH_DRAG_THRESHOLD`.
+      setLongPressArmed(true);
+    }
     if (gateBehindLongPress) {
       longPressTimer = setTimeout(() => {
         longPressTimer = null;
-        longPressFired = true;
-        toggleSelect(clip.id);
-        // Only NOW does this touch sequence start capturing movement as a drag — see the root
-        // element's own comment on why this is a direct DOM mutation, not React state.
-        if (rootRef.current) rootRef.current.style.touchAction = "none";
+        armLongPress();
       }, LONG_PRESS_MS);
     } else {
       applyTapSelection();
@@ -286,7 +331,28 @@ function TimelineClipComponent({
     // playhead at the instant a drag starts, not a value that re-renders every clip on the timeline
     // 30-60 times a second during playback (which is exactly what a `useEditorStore((s) => s.playhead)`
     // subscription here used to do, for every clip, the whole time the preview was playing).
-    const points = snapPoints(project, clip.id, useEditorStore.getState().playhead);
+    // `trackKind: track.kind` scopes candidates to tracks of this clip's OWN kind — `moveClip` only
+    // ever lands a clip on a same-kind track anyway, so this is exactly "clips of the same kind stick
+    // together," and stops an unrelated, numerically-nearby clip on a different-kind track (e.g. a
+    // caption) from pulling this one off course. `excludeClipIds: groupIds` excludes every clip in
+    // this drag's own selection, not just the one under the pointer — a group drag shouldn't snap the
+    // primary clip against its own group-mate's edge.
+    //
+    // The playhead is deliberately EXCLUDED from a touch drag's own candidates (still included for
+    // mouse) — on the mobile "fixed-center-playhead" layout (see Timeline.tsx's own `leadingPad`/
+    // `centerOffset`), the playhead marker sits at a FIXED SCREEN position (always horizontal center)
+    // rather than a fixed CONTENT position the way it does on desktop. That makes it an omnipresent
+    // snap target a thumb passes near on almost any drag across a narrow phone screen, regardless of
+    // where the playhead's own TIME actually is or whether the user meant to align anything with it —
+    // confirmed as a real, reported source of a clip landing somewhere other than where it visually
+    // looked dropped ("wrong position ... on phone"). On desktop the playhead's screen position tracks
+    // the timeline's own independent scroll, so proximity to it stays a deliberate, occasional thing,
+    // not a near-constant one — no reason to change that side.
+    const points = snapPoints(project, {
+      trackKind: track.kind,
+      excludeClipIds: groupIds,
+      playhead: isTouch ? undefined : useEditorStore.getState().playhead,
+    });
 
     function onMove(moveEvent: MouseEvent | TouchEvent) {
       const drag = dragRef.current;
@@ -295,27 +361,17 @@ function TimelineClipComponent({
       const dx = point.x - drag.startX;
       const threshold = isTouch ? TOUCH_DRAG_THRESHOLD : DRAG_THRESHOLD;
       if (!drag.moved && Math.abs(dx) < threshold) return;
-      if (!drag.moved && gateBehindLongPress && longPressTimer !== null) {
-        // Real movement arrived before the long-press armed the drag — this is a pan/scroll attempt,
-        // not a deliberate pick-up-and-move. Abandon the clip interaction entirely: clear the pending
-        // timer, drop out of drag tracking, and remove our own listeners WITHOUT ever calling
-        // `preventDefault` or flipping `touch-action` to `none` — `touch-action` stayed permissive
-        // this whole time (see the root element's className), so the browser is free to pick this
-        // touch up as a native pan the instant it decides to, exactly as if it had started over empty
-        // timeline space. No selection change either: an aborted-to-scroll gesture isn't a tap.
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-        dragRef.current = null;
-        removeListeners();
-        return;
-      }
-      if (!drag.moved && longPressTimer !== null) {
-        // Real movement arrived before the long-press fired — this is a drag, not a hold, so behave
-        // exactly like a mouse press-and-drag would: establish the selection right now instead of
-        // waiting for a hold that's no longer going to happen. Only reachable for a non-gated drag
-        // (mouse, or the vanishingly rare additive-touch case) — the gated touch path above already
-        // returned before reaching here.
-        clearTimeout(longPressTimer);
+      // Real movement, whether this drag is touch- or mouse-driven: establish the selection right now
+      // and start tracking, exactly like a mouse press-and-drag always has. `touch-none` on the root
+      // element (see its own doc comment) already means this element owns 100% of its own touch
+      // sequence from the very first contact — there's no remaining "might still turn out to be a
+      // scroll" ambiguity left to defer for, so movement no longer waits on `LONG_PRESS_MS` at all;
+      // that timer's only remaining job (`armLongPress`) is the separate "held still with no movement
+      // at all = toggle selection" gesture, which this movement means didn't happen and hence pending
+      // is now moot — clearing it here is what makes `armLongPress`'s own `longPressFired` guard a
+      // harmless no-op if the timer still happens to fire microseconds later.
+      if (!drag.moved && !longPressFired) {
+        if (longPressTimer !== null) clearTimeout(longPressTimer);
         longPressTimer = null;
         applyTapSelection();
       }
@@ -390,10 +446,10 @@ function TimelineClipComponent({
 
     function onUp(upEvent: MouseEvent | TouchEvent) {
       removeListeners();
-      // Reset back to permissive for the NEXT gesture — only ever needed if the long press actually
-      // armed it (see the timer callback above); harmless to call unconditionally otherwise, since
-      // clearing an inline style that was never set is a no-op.
-      if (gateBehindLongPress && rootRef.current) rootRef.current.style.touchAction = "";
+      // Clears the "picked up" visual for the NEXT gesture — harmless to call unconditionally even
+      // when it never armed (a `setState` to the same `false` value it already was is a cheap no-op,
+      // and React bails out of the re-render itself).
+      setLongPressArmed(false);
       // Refreshed here too, not just at touchSTART — a long hold (this whole gesture, easily past
       // `LONG_PRESS_MS`) means the ghost mouse event fires well after `beginDrag` originally ran, so
       // anchoring the grace window to release time (closer to when that ghost actually arrives) is
@@ -404,7 +460,23 @@ function TimelineClipComponent({
         longPressTimer = null;
         // Never fired and never turned into a drag (that path already applied its own selection via
         // `onMove` above) — a genuine quick tap, so it selects exactly like a mouse click would.
-        if (!longPressFired) applyTapSelection();
+        if (!longPressFired) {
+          applyTapSelection();
+          // Only reachable for `mode === "move"` (see `gateBehindLongPress`'s own definition above —
+          // a trim-handle tap never sets `longPressTimer` at all, so this whole branch never runs for
+          // one), so a double-tap on a trim handle can never open Properties by accident. Resets back
+          // to 0 (not left at `now`) once it fires, so a THIRD tap in quick succession starts a fresh
+          // window instead of immediately re-triggering — matching how a real double-click gesture is
+          // "consumed" once recognized, the same way `armLongPress`'s own `longPressFired` guard stops
+          // ITS gesture from re-firing on every subsequent event within one press.
+          const now = Date.now();
+          if (now - lastQuickTapAtRef.current < DOUBLE_TAP_MS) {
+            lastQuickTapAtRef.current = 0;
+            useEditorStore.getState().setMobileSheet("inspector");
+          } else {
+            lastQuickTapAtRef.current = now;
+          }
+        }
       }
       const drag = dragRef.current;
       dragRef.current = null;
@@ -540,7 +612,6 @@ function TimelineClipComponent({
 
   return (
     <div
-      ref={rootRef}
       role="button"
       tabIndex={0}
       // Read by Timeline's own marquee (drag-to-select-several-clips) hit test, which finds every
@@ -559,24 +630,52 @@ function TimelineClipComponent({
         // standard way to tell a keyboard-triggered click apart from a real mouse one.
         if (e.detail === 0) select([clip.id]);
       }}
+      // Mouse-only — fires natively and reliably for a real double-click, unlike touch (see
+      // `DOUBLE_TAP_MS`'s own comment for that gesture's separate, manually-tracked equivalent in
+      // `onUp` above). Harmless to call unconditionally on every breakpoint: `mobileSheet` only has a
+      // visible effect below `lg`, where opening Properties on a double-click is genuinely useful (no
+      // permanent Inspector column there to already be showing it) — at `lg`+ this just sets a piece of
+      // state nothing renders differently for.
+      onDoubleClick={() => useEditorStore.getState().setMobileSheet("inspector")}
       style={{
         left: start * pixelsPerSecond,
         width: Math.max(2, duration * pixelsPerSecond),
       }}
-      // Deliberately NOT `touch-none` here (unlike the trim handles below, and unlike the ruler's own
-      // touch-none in Timeline.tsx) — `touch-action` starts at its default `auto`, so a touch starting
-      // on a clip is free to become a native pan/scroll of the timeline underneath it, exactly like
-      // touching empty track space would. `beginDrag`'s long-press gate is what flips this to `none`
-      // (via a direct style mutation on `rootRef`, not this className) the moment a touch-drag is
-      // actually armed — see its own comment for why a whole-scroll-vs-move-this-clip ambiguity needs
-      // a deliberate hold to resolve, the same way this app already resolves touch's lack of a Ctrl
-      // key for multi-select. select-none + [-webkit-touch-callout:none] are a SEPARATE fix for a
-      // separate browser behavior: they stop the label text (and, for a text clip, its own content
-      // name) from being eligible for the browser's own long-press-to-select-text gesture, which used
-      // to fire at the same time as the long-press-to-multi-select gesture above, popping up the
-      // native selection handles/copy menu on top of (and fighting) the app's own selection. Confirmed
-      // live on a touch device, not just from the CSS spec.
-      className={`group absolute top-1 bottom-1 select-none [-webkit-touch-callout:none] overflow-hidden rounded-md border text-left transition-colors ${
+      // `touch-none`, UNCONDITIONALLY, same as the trim handles below and the ruler's own touch-none
+      // in Timeline.tsx — deliberately NOT deferred (an earlier version of this left `touch-action` at
+      // its permissive default until a long-press armed, via a direct style mutation on the clip's own
+      // root element, so a swipe starting on a clip could still become a native pan of the timeline
+      // underneath it). That
+      // turned out to be a real, reported bug, not just an edge case: `touch-action` is a scroll-vs-not
+      // decision browsers commit to per-gesture right at `touchstart`/the first `touchmove`, evaluated
+      // BEFORE any JS runs — flipping it to `none` later, once our own long-press logic decides this
+      // IS a drag, does not retroactively cancel a native scroll the browser already started under the
+      // earlier permissive value. In practice: the timeline itself would pan out from under a clip the
+      // user was trying to pick up, and since every clip's own screen position is relative to that same
+      // scrolled container, ALL of them (this one included) would visibly shift — reported directly as
+      // "the clip changes position when I hold it" and "the timeline moves when I just want to move the
+      // clip." Locking `touch-action` down from the very first touch is what makes that impossible:
+      // this element now handles 100% of its own touch sequence, so a real drag tracks the finger
+      // exactly (see `onMove` below, which no longer needs to guess whether a gesture might still turn
+      // into a scroll) and can never leak into moving the timeline out from under itself. The one
+      // gesture this gives up — swiping to PAN the timeline by starting the swipe ON TOP OF a clip — is
+      // still reachable from any empty track space or the ruler; a packed track can lose some of that
+      // convenience, but never at the cost of a clip drag being reliable, which is the more common and
+      // more important of the two on a timeline with any real content. select-none +
+      // [-webkit-touch-callout:none] are a SEPARATE fix for a separate browser behavior: they stop the
+      // label text (and, for a text clip, its own content name) from being eligible for the browser's
+      // own long-press-to-select-text gesture, which used to fire at the same time as the long-press-
+      // to-multi-select gesture above, popping up the native selection handles/copy menu on top of (and
+      // fighting) the app's own selection. Confirmed live on a touch device, not just from the CSS spec.
+      // One explicit property list (not `transition-colors` PLUS a separate arbitrary `transition-[…]`
+      // — two Tailwind utilities both setting `transition-property` don't merge, the later one in the
+      // stylesheet just wins outright), deliberately NOT `transition-all` — `left`/`width` above are
+      // plain inline styles updated on every pointermove during a real drag (see `onMove`), and
+      // animating THOSE would make the clip visibly lag behind the finger by `duration-150` instead of
+      // tracking it 1:1. Scoped to the pre-existing color transitions plus the new "picked up" cues
+      // (`longPressArmed`'s own comment) so the LIFT itself animates smoothly while actual movement
+      // stays instant.
+      className={`group absolute top-1 bottom-1 touch-none select-none [-webkit-touch-callout:none] overflow-hidden rounded-md border text-left transition-[color,background-color,border-color,transform,box-shadow,opacity] duration-150 ${
         track.locked ? "cursor-default" : "cursor-grab active:cursor-grabbing"
       } ${
         preview?.snapped
@@ -591,11 +690,21 @@ function TimelineClipComponent({
               ? "border-emerald-400/40 bg-emerald-500/20 hover:bg-emerald-500/30"
               : "border-sky-400/40 bg-sky-500/20 hover:bg-sky-500/30"
       } ${
-        // A stronger "picked up" look while an active drag is a MOVE — a shadow + slight scale +
-        // raised z-index instead of the old plain `opacity-80`, so the clip being moved reads as
-        // elevated/grabbed rather than just faded. `z-20`: above sibling clips and the drop-target
-        // highlight (z-10), below the playhead/export markers (z-30) — never fights either.
-        preview ? (dragRef.current?.mode === "move" ? "z-20 scale-[1.02] opacity-90 shadow-lg shadow-black/60" : "z-20 shadow-lg shadow-black/60") : ""
+        // A stronger "picked up" look while an active drag is a MOVE — a shadow + raised z-index
+        // instead of the old plain `opacity-80`, so the clip being moved reads as elevated/grabbed
+        // rather than just faded. `z-20`: above sibling clips and the drop-target highlight (z-10),
+        // below the playhead/export markers (z-30) — never fights either. `longPressArmed` triggers
+        // the SAME look the instant a touch long-press completes — see its own doc comment — so a
+        // held clip visibly "lifts" even before the finger has moved past `TOUCH_DRAG_THRESHOLD` and
+        // `preview` exists. Deliberately NO `scale(...)` here (there used to be one): scaling from the
+        // element's center visually shifts its left edge, which reads as "the clip moved" the instant
+        // you press and hold it — before any real drag input — which is exactly the bug this was
+        // confused for. Shadow + opacity only: neither affects layout or apparent position.
+        preview || longPressArmed
+          ? dragRef.current?.mode === "move" || longPressArmed
+            ? "z-20 opacity-90 shadow-lg shadow-black/60"
+            : "z-20 shadow-lg shadow-black/60"
+          : ""
       }`}
     >
       {thumbnail && (
@@ -608,6 +717,13 @@ function TimelineClipComponent({
           className="absolute inset-0 z-0 opacity-70"
           style={{ backgroundImage: `url(${thumbnail})`, backgroundRepeat: "repeat-x", backgroundSize: "auto 100%" }}
         />
+      )}
+      {/* A color-matte clip has no thumbnail (nothing to generate one FROM) — its own fill color is a
+          more useful preview than the generic sky-tinted bar every other video-track clip gets, same
+          "show the thing itself" reasoning `AssetThumbnail`'s own color branch in `MediaLibrary.tsx`
+          already uses. */}
+      {asset?.kind === "color" && (
+        <div aria-hidden className="absolute inset-0 z-0 opacity-70" style={{ backgroundColor: asset.color ?? "#000000" }} />
       )}
       {waveform && (
         // Same `z-0`-below-the-label reasoning as the thumbnail above. `backgroundRepeat: "no-repeat"`

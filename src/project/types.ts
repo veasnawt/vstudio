@@ -10,7 +10,7 @@ import { DEFAULT_FONT_ID } from "./fonts.ts";
  *  silently mangling a project a future version wrote. */
 export const PROJECT_SCHEMA_VERSION = 1;
 
-export type AssetKind = "video" | "audio" | "image" | "text";
+export type AssetKind = "video" | "audio" | "image" | "text" | "color";
 export type TrackKind = "video" | "audio" | "text";
 
 /** An imported media file. `relPath` is relative to the project's own media folder — never an
@@ -69,6 +69,17 @@ export interface Asset {
   textContent?: string;
   /** Present only when `kind === "text"`, alongside `textContent`. */
   textStyle?: TextStyle;
+  /** Present only when `kind === "color"` — a solid-fill "color matte" background asset, same
+   *  no-backing-file shape as a text asset (`relPath` empty, `hasAudio` false, `duration` 0): its
+   *  "content" is this one hex value, authored directly rather than imported. Hex, e.g. "#224466".
+   *  Read by `PlaybackEngine.drawVideoClip`'s `kind === "color"` branch (a flat-fill canvas stands in
+   *  as the `drawImage` source, sized to the FRAME itself since a color matte has no intrinsic
+   *  width/height of its own — see `TransformHandles.tsx`'s matching `assetWidth`/`assetHeight`
+   *  fallback to `project.sequence.width/height`) and `buildExportPlan.ts`'s equivalent export-time
+   *  branch, both of which then run the result through the exact same crop/scale/transform/effects
+   *  pipeline every other video-track clip already goes through — a color matte is just a video-track
+   *  clip whose "source" is a solid fill instead of a decoded frame. */
+  color?: string;
 }
 
 /** Visual style for a text asset. Simpler than `ClipTransform`: font size already controls "how big"
@@ -385,14 +396,26 @@ export type ColorGradingKeyframe = Keyframe<ColorGrading>;
 /** LERP-interpolated between keyframes, like `TransformKeyframe` — see `TextCrop`'s own doc comment. */
 export type TextCropKeyframe = Keyframe<TextCrop>;
 
-/** Every transition style either renderer can produce. Kept to the subset of FFmpeg's own `xfade`
- *  filter's transition names (see `TRANSITION_XFADE_NAME` in `export/buildExportPlan.ts`) that's been
- *  part of that filter since its ORIGINAL introduction (FFmpeg 4.3) — a newer name like `xfade`'s own
- *  `"zoomin"` (added in 6.1) risks failing export outright against an older bundled `ffmpeg-static`
- *  build, which a name this old can't. `PlaybackEngine`'s canvas preview groups these into FOUR
- *  rendering families (dissolve, wipe, slide, circle — see its own `transitionFamily`), not ten
- *  independent implementations; export always renders the exact distinct FFmpeg filter regardless of
- *  which family the preview approximated it with. */
+/** Every transition style either renderer can produce. The first ten are kept to the subset of
+ *  FFmpeg's own `xfade` filter's transition names (see `TRANSITION_XFADE_NAME` in
+ *  `export/buildExportPlan.ts`) that's been part of that filter since its ORIGINAL introduction
+ *  (FFmpeg 4.3) — a newer name like `xfade`'s own `"zoomin"` (added in 6.1) risks failing export
+ *  outright against an older bundled `ffmpeg-static` build, which a name this old can't. `PlaybackEngine`'s
+ *  canvas preview groups these into rendering families (dissolve, wipe, slide, circle, glitch,
+ *  waterRipple — see its own `transitionFamily`), not one independent implementation per value; export
+ *  always renders the exact distinct FFmpeg filter regardless of which family the preview approximated
+ *  it with.
+ *
+ *  `glitchCut`/`waterRippleCut` are the two exceptions to the "real xfade name" rule above — there is
+ *  no such xfade transition, so these render as a genuine PRE-PASS corruption filter (`rgbashift=`+
+ *  `noise=` for glitch, a ramped `geq=` pixel-displacement for water-ripple — see
+ *  `buildGlitchCorruptionFilter`/`buildWaterRippleCorruptionFilter` in `export/buildExportPlan.ts`,
+ *  which reuse the exact same amplitude/period constants `timeline/pixelEffects.ts`'s STATIC per-clip
+ *  `applyGlitch`/`applyWaterRipple` canvas functions do) applied to BOTH sides of the cut, then blended
+ *  underneath with a plain `xfade=transition=fade` — `TRANSITION_XFADE_NAME` maps both to `"fade"`
+ *  for exactly that reason. Video/image clips only — see `TransitionPickerMenu`'s own `isTextTrack`
+ *  doc comment for why a text clip's transition grid excludes these two: `drawtext` has no per-pixel
+ *  corruption pre-pass equivalent, so export would have no way to reproduce what preview shows. */
 export type TransitionType =
   | "crossfade"
   | "dissolve"
@@ -405,7 +428,9 @@ export type TransitionType =
   | "slideUp"
   | "slideDown"
   | "circleOpen"
-  | "circleClose";
+  | "circleClose"
+  | "glitchCut"
+  | "waterRippleCut";
 
 /** A continuous MOTION effect for a text clip, distinct from `transitionIn`/`transitionOut` — those
  *  are one-shot events at a clip's own edges (a cut blended/wiped/dissolved into or out of), rendered
@@ -447,6 +472,17 @@ export type TransitionType =
  *  Its highlight color is genuinely configurable (`Clip.textAnimation.highlightColor`) — the other four
  *  are fixed motion curves with nothing meaningful to expose as a setting yet. */
 export type TextAnimationType = "bounce" | "pulse" | "wiggle" | "typewriter" | "wordHighlight";
+
+/** A continuous per-pixel image-processing effect for a video/image clip — glitch (digital-corruption
+ *  RGB-channel-split + slice-shift + noise) or water-ripple (a wavy, underwater-reflection sine
+ *  displacement) — see `timeline/pixelEffects.ts`'s own `applyGlitch`/`applyWaterRipple` for the pure
+ *  canvas functions both preview (`PlaybackEngine.drawTransformed`) and, for the TRANSITION-flavored
+ *  version of the same two looks, export's own `buildGlitchCorruptionFilter`/
+ *  `buildWaterRippleCorruptionFilter` (`export/buildExportPlan.ts`) implement against. Distinct from
+ *  `TransitionType`'s own `glitchCut`/`waterRippleCut` — those are one-shot events at a clip's own
+ *  edges; this instead plays across a clip's ENTIRE visible duration, same relationship
+ *  `TextAnimationType` has to `transitionIn`/`transitionOut`. */
+export type PixelEffectType = "glitch" | "waterRipple";
 
 /** One clip on a track. The heart of non-destructive editing: a clip is a *reference* to a slice of
  *  a source asset plus a position, never a copy of media. Trimming a 10-minute source down to 15
@@ -583,6 +619,27 @@ export interface Clip {
    *  attenuation; see `setClipGain`'s own ceiling for the UI-facing bound. Absent means `1` (unchanged),
    *  same "small JSON, cheap default path" reasoning as `transform`/`effects`. */
   gain?: number;
+  /** A `LutAsset.id` from the project's own `luts` library — applied AFTER color grading (both
+   *  preview's `PlaybackEngine.drawTransformed` and export's matching filter chain apply curves, then
+   *  the LUT, on top of the same already-color-graded pixels), same "resolve to a real file only at
+   *  render time" pattern `TextStyle.fontFamily` uses for a font id. Absent means no LUT, same "small
+   *  JSON, cheap default path" reasoning as `transform`. Video/image clips only, same gating as
+   *  `chromaKey`/`colorGrading`. Deliberately NOT validated against `project.luts` here — same
+   *  reasoning `transitionIn` isn't validated against its own partner clip: a LUT deleted out from
+   *  under a clip that still references it should degrade gracefully (the renderer's own `lutUrlFor`
+   *  simply returns `null` for an unresolvable id — see `PlaybackEngine.PlaybackHost`'s own doc
+   *  comment), not corrupt the edit. */
+  lutId?: string;
+  /** A continuous glitch/water-ripple pixel effect over this clip's own visible duration — see
+   *  `PixelEffectType`'s own doc comment for what it is and how it differs from the TRANSITION-flavored
+   *  `glitchCut`/`waterRippleCut`. `speed` mirrors `textAnimation.speed`'s exact convention (a
+   *  multiplier on elapsed time fed into `applyGlitch`/`applyWaterRipple`'s own `elapsedSeconds`
+   *  parameter — absent/1 is the effect's own normal pace). Absent means no effect, same "small JSON,
+   *  cheap default path" reasoning as `transform`. Video/image clips only, same gating as `lutId`. Not
+   *  keyframeable — see `PlaybackEngine.drawTransformed`'s own comment on why a spatial displacement
+   *  runs LAST, after every color operation, and has no natural per-keyframe interpolation the way a
+   *  numeric transform field does. */
+  pixelEffect?: { type: PixelEffectType; speed?: number };
 }
 
 export interface Track {
@@ -647,10 +704,72 @@ export interface ExportSettings {
   audioBitrateKbps: number;
 }
 
+/** A `.cube` 3D LUT imported into the project's own reusable library — "My LUTs" in the Inspector's
+ *  LUT picker, referenced by `Clip.lutId`. Same id/name/relPath/importedAt shape `Asset` itself uses
+ *  (portable, JSON-round-trippable, relative to the project's own media folder), kept as a SEPARATE
+ *  library rather than folded into `Project.assets` because a LUT is never placed on the timeline as
+ *  its own clip the way an `Asset` is — it's applied TO a clip, a relationship `Clip.lutId` already
+ *  captures directly, so there's no `Track`/`Clip` machinery a LUT itself would ever need. */
+export interface LutAsset {
+  id: string;
+  /** Shown in the Inspector's "My LUTs" picker — the uploaded filename by default, same convention
+   *  `Asset.name` uses. */
+  name: string;
+  /** Path relative to the project's media directory, same portability contract as `Asset.relPath`. */
+  relPath: string;
+  /** The parsed `LUT_3D_SIZE` dimension (N in the NxNxN lattice) — mirrors `timeline/lut.ts`'s own
+   *  `Lut3D.size` exactly, cached here at import time so the library list can show a LUT's resolution
+   *  without re-fetching/re-parsing its `.cube` file on every render. */
+  size: number;
+  importedAt: number;
+}
+
+/** A user-uploaded font, registered into the project's own reusable library — "My Fonts" in the
+ *  Inspector's font picker, referenced by `TextStyle.fontFamily` exactly like a bundled
+ *  `FontDefinition.id` (see that field's own doc comment) — `resolveFont` (`project/fonts.ts`) is what
+ *  tries this library FIRST, before falling back to the bundled `FONT_REGISTRY`. Single-file, unlike a
+ *  bundled `FontDefinition` (no separate bold/italic/boldItalic uploads in v1 — a custom font always
+ *  renders as its own one regular face, same "single-weight display face" shape `FontDefinition.files`
+ *  already allows for a bundled font that ships only a `regular`). */
+export interface CustomFontAsset {
+  id: string;
+  /** Shown in the Inspector's font picker, same role `FontDefinition.label` plays for a bundled font. */
+  name: string;
+  /** Path relative to the project's media directory, same portability contract as `Asset.relPath`. */
+  relPath: string;
+  /** The `@font-face` family name this font is registered under, once loaded — same role
+   *  `FontDefinition.cssFamily` plays for a bundled font (see its own doc comment for why every font
+   *  needs one: both the browser's `context.font` string and, eventually, a real `@font-face` rule need
+   *  a stable family name distinct from any bundled font or the page's own). */
+  cssFamily: string;
+  importedAt: number;
+}
+
+/** A user-uploaded sound effect, registered into the project's own reusable "My Sounds" library —
+ *  listed above the bundled `SFX_REGISTRY` catalog in `SfxPanel.tsx`. Deliberately NOT a plain `Asset`
+ *  the way an imported media file is: "Add to timeline" (`SfxPanel.tsx`'s `addToTimeline`) always
+ *  re-imports a fresh COPY through the ordinary `importFiles` pipeline to get a real `Asset` id a clip
+ *  can reference, the same hand-off a bundled catalog entry goes through — a `CustomSfxAsset` is the
+ *  reusable SOURCE a user can preview/re-add/delete from the library, not itself a placeable clip
+ *  reference, same "LUT/font-shaped library, not a timeline asset" relationship `LutAsset`/
+ *  `CustomFontAsset` have to `Clip.lutId`/`TextStyle.fontFamily`. */
+export interface CustomSfxAsset {
+  id: string;
+  /** Shown in "My Sounds" and used as the imported clip's display name — mirrors `SfxDefinition.label`
+   *  for a bundled entry. */
+  label: string;
+  /** Path relative to the project's media directory, same portability contract as `Asset.relPath` —
+   *  also doubles as the filename handed to `importFiles` when "Add to timeline" re-imports a copy
+   *  (`SfxPanel.tsx`), mirroring how a bundled entry's own `SfxDefinition.file` is reused for the same
+   *  purpose. */
+  relPath: string;
+  importedAt: number;
+}
+
 export interface Project {
   schemaVersion: number;
   id: string;
-  /** The BP Studio project this belongs to — how a VStudio project is located on disk. */
+  /** The BP Studio project this belongs to — how a VCut project is located on disk. */
   bpProjectId: string;
   name: string;
   createdAt: number;
@@ -658,6 +777,18 @@ export interface Project {
   assets: Asset[];
   sequence: Sequence;
   exportSettings: ExportSettings;
+  /** The project's own reusable LUT library — see `LutAsset`'s own doc comment. Always present (never
+   *  optional): `createProject` seeds it as `[]`, and `deserializeProject` backfills `[]` for a project
+   *  file saved before this field existed, so every consumer (`SfxPanel`-style "My ___" list,
+   *  `PlaybackEngine.PlaybackHost.lutUrlFor`) can read it directly without an `?? []` at every call
+   *  site. */
+  luts: LutAsset[];
+  /** The project's own reusable custom-font library — see `CustomFontAsset`'s own doc comment. Same
+   *  always-present, backfilled-on-load contract as `luts`. */
+  customFonts: CustomFontAsset[];
+  /** The project's own reusable "My Sounds" library — see `CustomSfxAsset`'s own doc comment. Same
+   *  always-present, backfilled-on-load contract as `luts`. */
+  customSfx: CustomSfxAsset[];
 }
 
 /** How long a still image occupies the timeline when first placed, in seconds. */
@@ -668,7 +799,7 @@ export const IMAGE_DEFAULT_DURATION = 5;
 export const TEXT_DEFAULT_DURATION = 5;
 
 /** The "Short" preset from the product spec — vertical 1080×1920 @ 30fps, the default because
- *  short-form vertical video is VStudio's primary target. */
+ *  short-form vertical video is VCut's primary target. */
 export const SHORT_PRESET = { width: 1080, height: 1920, fps: 30 } as const;
 
 export const RESOLUTION_PRESETS = [

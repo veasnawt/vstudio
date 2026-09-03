@@ -19,6 +19,8 @@ export const TRANSITION_TYPE_OPTIONS: TransitionType[] = [
   "slideDown",
   "circleOpen",
   "circleClose",
+  "glitchCut",
+  "waterRippleCut",
 ];
 
 export const TRANSITION_TYPE_LABEL: Record<TransitionType, string> = {
@@ -34,6 +36,8 @@ export const TRANSITION_TYPE_LABEL: Record<TransitionType, string> = {
   slideDown: "Slide Down",
   circleOpen: "Circle Open",
   circleClose: "Circle Close",
+  glitchCut: "Glitch Cut",
+  waterRippleCut: "Water Ripple",
 };
 
 /** What a freshly-enabled transition starts at — half a second is a reasonable default crossfade

@@ -1,5 +1,5 @@
 import { newId } from "../project/createProject.ts";
-import type { Clip, ClipEffects, ClipTransform, ColorGrading, ColorGradingKeyframe, EffectsKeyframe, Keyframe, TextCrop, TextCropKeyframe, TextStyle, TextStyleKeyframe, TransformKeyframe } from "../project/types.ts";
+import type { Clip, ClipEffects, ClipTransform, ColorGrading, ColorGradingKeyframe, EffectsKeyframe, Keyframe, TextCrop, TextCropKeyframe, TextStyle, TransformKeyframe } from "../project/types.ts";
 import { IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../project/types.ts";
 import { frameDuration, snapToFrame } from "./time.ts";
 

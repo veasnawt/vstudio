@@ -109,9 +109,10 @@ function carveRange(
 }
 
 /** How long a newly-placed clip of this asset should be. Video/audio use their full length; a still
- *  image or a text clip has no intrinsic duration and gets a sensible default the user can then trim. */
+ *  image, a color-matte background, or a text clip has no intrinsic duration and gets a sensible
+ *  default the user can then trim. */
 export function defaultClipDuration(asset: Asset): number {
-  if (asset.kind === "image") return IMAGE_DEFAULT_DURATION;
+  if (asset.kind === "image" || asset.kind === "color") return IMAGE_DEFAULT_DURATION;
   if (asset.kind === "text") return TEXT_DEFAULT_DURATION;
   return asset.duration;
 }
@@ -261,10 +262,12 @@ export function trimClip(project: Project, clipId: string, edge: "in" | "out", t
     const fps = draft.sequence.fps;
     const min = frameDuration(fps);
     const asset = findAsset(draft, clip.assetId);
-    // Images and text have no fixed source length, so their out-point can extend freely; real media
-    // is capped at its actual duration.
+    // Images, color-matte backgrounds, and text have no fixed source length, so their out-point can
+    // extend freely; real media is capped at its actual duration.
     const sourceLimit =
-      asset && asset.kind !== "image" && asset.kind !== "text" ? asset.duration : Number.POSITIVE_INFINITY;
+      asset && asset.kind !== "image" && asset.kind !== "text" && asset.kind !== "color"
+        ? asset.duration
+        : Number.POSITIVE_INFINITY;
     const target = snapToFrame(toTime, fps);
 
     if (edge === "in") {
@@ -780,6 +783,42 @@ export function setClipChromaKey(project: Project, clipId: string, settings: Chr
   });
 }
 
+/** Sets or clears a clip's LUT (`null` clears it) — mirrors `setClipChromaKey` exactly: no identity-
+ *  sentinel collapse (a LUT choice is discrete, "some LUT" or "no LUT", the same "present or absent,
+ *  not secretly-a-no-op" shape chroma key has, unlike `setClipTransform`'s identity-collapsing one).
+ *  Deliberately does NOT validate `lutId` against `project.luts` here — same reasoning
+ *  `setClipChromaKey` needs no cross-reference check for its own `color` field: this is a pure,
+ *  project-shape edit; a dangling reference (the LUT was deleted from a stale caller's perspective) is
+ *  harmless and handled at RENDER time (`PlaybackEngine`'s cache-miss path just skips it), not here. */
+export function setClipLut(project: Project, clipId: string, lutId: string | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!lutId) {
+      delete found.clip.lutId;
+    } else {
+      found.clip.lutId = lutId;
+    }
+  });
+}
+
+/** Clears `lutId` from every clip that references `lutId` — the cascade a LUT deletion needs so a
+ *  removed `LutAsset` doesn't leave clips pointing at a file that no longer exists. Used by the LUT
+ *  import route's `DELETE` handler, which edits `project.json` directly (server-side, outside the
+ *  undo stack — deleting a LUT from the library isn't itself a timeline edit, the same "library
+ *  mutation, not a Command" split `MediaLibrary`'s own asset removal already follows) rather than
+ *  through `run(new SetClipLutCommand(...))` per affected clip. */
+export function removeLutReferences(project: Project, lutId: string): Project {
+  return edit(project, (draft) => {
+    for (const track of draft.sequence.tracks) {
+      for (const clip of track.clips) {
+        if (clip.lutId === lutId) delete clip.lutId;
+      }
+    }
+  });
+}
+
 /** Sets or clears a clip's Transform keyframes wholesale (`null`/empty clears them, matching
  *  `setClipTransitionIn`'s "no identity sentinel, absent/null is itself meaningful" shape — an empty
  *  keyframe list is a distinct, meaningful state, "not keyframed," not a value to collapse toward like
@@ -901,6 +940,22 @@ export function setClipTextAnimation(project: Project, clipId: string, textAnima
       delete found.clip.textAnimation;
     } else {
       found.clip.textAnimation = { ...textAnimation };
+    }
+  });
+}
+
+/** Mirrors `setClipTextAnimation`'s exact shape, for `Clip.pixelEffect` instead — see its own doc
+ *  comment for why this isn't keyframeable and so needs no `*Keyframes` sibling the way
+ *  `transform`/`effects`/`colorGrading` each have. */
+export function setClipPixelEffect(project: Project, clipId: string, pixelEffect: Clip["pixelEffect"] | null): Project {
+  return edit(project, (draft) => {
+    const found = findClip(draft, clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    if (found.track.locked) throw new EditError(`${found.track.name} is locked`);
+    if (!pixelEffect) {
+      delete found.clip.pixelEffect;
+    } else {
+      found.clip.pixelEffect = { ...pixelEffect };
     }
   });
 }

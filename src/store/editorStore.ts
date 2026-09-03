@@ -14,10 +14,10 @@ import { nonOverlappingPointStart, nonOverlappingStart } from "../timeline/queri
 import { snapToFrame } from "../timeline/time.ts";
 import { UndoStack } from "../undo/UndoStack.ts";
 
-const LANGUAGE_STORAGE_KEY = "vstudio-language";
+const LANGUAGE_STORAGE_KEY = "vcut-language";
 
 /** SSR-safe: this module's very first render (server, or the first client tick before hydration) has
- *  no `window` — same guard pattern `VStudioApp.tsx`'s own `timelineHeight` initializer already uses
+ *  no `window` — same guard pattern `VCutApp.tsx`'s own `timelineHeight` initializer already uses
  *  for the same reason. Falls back to English on any unexpected read error (a disabled/private-mode
  *  localStorage throwing is a real possibility, not just theoretical) rather than crashing the app
  *  over a UI-language preference. */
@@ -131,6 +131,36 @@ export interface EditorState {
 
   status: { message: string; tone: StatusTone } | null;
   importing: boolean;
+  /** Which "My Sounds" import is currently in flight — disables `SfxPanel`'s own import button so a
+   *  second click can't fire a second upload while the first is still running. Session-only, same
+   *  category as `importing` (this project's own separate flag, not shared with it, since a plain
+   *  media import and a sound-effect-library import are two independent operations a user could
+   *  plausibly trigger at the same time). */
+  importingSfx: boolean;
+
+  /** Which mobile-only bottom-row "sheet" is currently showing in place of Timeline — `null` means
+   *  Timeline itself (the default, and the only state that ever applies at `lg`+, where these two
+   *  toolbar buttons don't even render — see `VCutApp.tsx`'s own comment on why Media/Properties have
+   *  no permanent side column below that breakpoint). Session-only, same category as `activeTrackId`:
+   *  a working-session UI choice, never part of `project`, never undo-tracked. Lives in the STORE
+   *  (not local `VCutApp` state, which is where this started) because `TimelineClip`'s own double-
+   *  tap-to-edit gesture needs to open Properties from deep inside the Timeline tree, with no prop-
+   *  drilling path back up to `VCutApp` — the same "needs to be reachable from somewhere with no direct
+   *  component relationship to the owner" reasoning `playbackEngine`'s own doc comment gives for living
+   *  here instead of as a plain prop. */
+  mobileSheet: "media" | "inspector" | null;
+  setMobileSheet: (next: "media" | "inspector" | null) => void;
+
+  /** The live `<canvas>` `Preview.tsx` currently has attached to its `PlaybackEngine` — set by that
+   *  same effect that calls `engine.attach(canvas)`, cleared back to `null` on unmount, mirroring
+   *  `playbackEngine`'s own set/clear lifecycle exactly (both exist for the identical reason: giving a
+   *  component OUTSIDE `Preview.tsx` a way to reach something `Preview.tsx` owns, with no sensible
+   *  prop-drilling path). `ScopesPanel`'s own waveform/vectorscope/histogram readout is the one
+   *  consumer — it samples this canvas's own live pixels on its own independent `requestAnimationFrame`
+   *  loop rather than being pushed frames, which is what lets it keep updating while scrubbing (not
+   *  just during real playback) with zero coupling to `PlaybackEngine`'s own render loop. */
+  previewCanvas: HTMLCanvasElement | null;
+  setPreviewCanvas: (canvas: HTMLCanvasElement | null) => void;
 
   /** UI chrome language — the first persisted (localStorage) preference in this store; everything
    *  else here is explicitly session-only. Never affects `project` (a text clip's own font/content is
@@ -233,6 +263,17 @@ export interface EditorState {
    *  comment) — used by `VoiceoverRecorder` so a quick take doesn't clutter the Media Library. */
   importFiles: (files: File[], options?: { hiddenFromLibrary?: boolean }) => Promise<Asset[]>;
   removeAsset: (asset: Asset) => Promise<void>;
+  /** Imports one file into the project's own reusable "My Sounds" library (`project.customSfx`) —
+   *  same "not undo-able, an import is more like an asset creation than a timeline edit" reasoning
+   *  `importFiles` itself already follows, just against a separate library array instead of
+   *  `project.assets` (see `CustomSfxAsset`'s own doc comment for why the two are kept apart). Errors
+   *  surface via `setStatus`, matching `importFiles`'s own failure handling. */
+  importSfx: (file: File) => Promise<void>;
+  /** Removes one "My Sounds" entry — same "not undo-able" reasoning as `importSfx`/`removeAsset`. Does
+   *  NOT touch any clip already placed from it (that clip references a real, separate `Asset` the
+   *  import already copied — see `CustomSfxAsset`'s own doc comment), only the reusable library entry
+   *  itself. */
+  removeSfx: (id: string) => Promise<void>;
   /** `avoidOverlap`: place at the playhead only if that spot is actually free, otherwise append after
    *  the track's own last clip instead of carving into whatever's already there — see
    *  `nonOverlappingStart`'s own comment for why a "quick add" caller (Text/Record) needs this and a
@@ -254,7 +295,7 @@ export interface EditorState {
    *  as `importFiles`. Returns its id so a caller can immediately place it (see `addAssetAtPlayhead`)
    *  or open it for editing, rather than requiring a second lookup right after creating it. */
   addTextAsset: () => string | null;
-  /** Renames the project itself (`project.name` — what VStudio's own home page lists it by), not any
+  /** Renames the project itself (`project.name` — what VCut's own home page lists it by), not any
    *  individual clip/asset. Same "not undo-able, a metadata edit rather than a timeline edit" category
    *  as `addTextAsset` — Ctrl+Z undoing a rename in the middle of unrelated clip edits would be a
    *  surprising thing for the undo stack to track. Falls back to "Untitled" for an empty/whitespace-
@@ -356,6 +397,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
     status: null,
     language: readStoredLanguage(),
     importing: false,
+    importingSfx: false,
+    mobileSheet: null,
+    previewCanvas: null,
 
     async load(projectId, projectName) {
       set({ loading: true, loadError: null, projectId });
@@ -539,6 +583,12 @@ export const useEditorStore = create<EditorState>((set, get) => {
     setPlaybackEngine(engine) {
       set({ playbackEngine: engine });
     },
+    setMobileSheet(next) {
+      set({ mobileSheet: next });
+    },
+    setPreviewCanvas(canvas) {
+      set({ previewCanvas: canvas });
+    },
 
     setActiveTrack(trackId) {
       set({ activeTrackId: trackId });
@@ -658,6 +708,39 @@ export const useEditorStore = create<EditorState>((set, get) => {
         get().setStatus(translateText(get().language, "Removed {name}", { name: asset.name }));
       } catch (err) {
         const message = err instanceof Error ? err.message : "Could not remove that media";
+        get().setStatus(translateText(get().language, message), "error");
+      }
+    },
+
+    async importSfx(file) {
+      const { projectId, project, importingSfx } = get();
+      if (!projectId || !project || importingSfx) return;
+      set({ importingSfx: true });
+      try {
+        const sfx = await api.importCustomSfx(projectId, file);
+        const current = get().project;
+        if (current) applyProject({ ...current, customSfx: [...current.customSfx, sfx] });
+        get().setStatus(translateText(get().language, 'Added "{name}" to My Sounds', { name: sfx.label }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not import that sound effect";
+        get().setStatus(translateText(get().language, message), "error");
+      } finally {
+        set({ importingSfx: false });
+      }
+    },
+
+    async removeSfx(id) {
+      const { projectId, project } = get();
+      if (!projectId || !project) return;
+      const sfx = project.customSfx.find((s) => s.id === id);
+      if (!sfx) return;
+      try {
+        await api.deleteCustomSfx(projectId, sfx);
+        const current = get().project;
+        if (current) applyProject({ ...current, customSfx: current.customSfx.filter((s) => s.id !== id) });
+        get().setStatus(translateText(get().language, "Removed {name}", { name: sfx.label }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not remove that sound effect";
         get().setStatus(translateText(get().language, message), "error");
       }
     },

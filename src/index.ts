@@ -1,10 +1,10 @@
-/** Public surface of @veasna/vstudio.
+/** Public surface of @veasnawt/vcut.
  *
- *  Host applications should only need `VStudioApp` — everything else is exported because it's useful
+ *  Host applications should only need `VCutApp` — everything else is exported because it's useful
  *  for tests, tooling, and the server routes that share the project model, not because a host is
  *  expected to reach for it. */
 
-export { VStudioApp } from "./ui/VStudioApp.tsx";
+export { VCutApp } from "./ui/VCutApp.tsx";
 export { reportError } from "./api/crashLog.ts";
 
 export type { Asset, AssetKind, Clip, ClipTransform, ExportSettings, Project, Sequence, TextStyle, Track, TrackKind } from "./project/types.ts";

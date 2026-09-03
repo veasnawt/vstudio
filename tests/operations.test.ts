@@ -13,6 +13,7 @@ import {
   setClipColorGrading,
   setClipColorGradingKeyframes,
   setClipEffects,
+  setClipPixelEffect,
   setClipEffectsKeyframes,
   setClipGain,
   setClipMuted,
@@ -30,7 +31,7 @@ import {
   splitClip,
   trimClip,
 } from "../src/timeline/operations.ts";
-import { audioTrackId, clipsOf, closeTo, comparable, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
+import { audioTrackId, clipsOf, closeTo, colorAsset, comparable, emptyProject, imageAsset, textAsset, textTrackId, videoAsset, videoTrackId } from "./fixture.ts";
 
 describe("addClip", () => {
   it("places a clip spanning the asset's full duration", () => {
@@ -423,6 +424,31 @@ describe("track kind enforcement", () => {
     let base = emptyProject();
     base = addTrack(base, "text");
     assert.throws(() => addClip(base, textTrackId(base), "asset1", 0), EditError);
+  });
+
+  it("puts a color-matte asset on a video track, defaulting to IMAGE_DEFAULT_DURATION (no intrinsic length of its own)", () => {
+    const base = emptyProject([colorAsset()]);
+    const project = addClip(base, videoTrackId(base), "color1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    assert.equal(clipsOf(project, videoTrackId(project)).length, 1);
+    assert.ok(closeTo(clipDuration(clip), 5));
+  });
+
+  it("refuses to add a color-matte asset to an audio track", () => {
+    const base = emptyProject([colorAsset()]);
+    assert.throws(() => addClip(base, audioTrackId(base), "color1", 0), EditError);
+  });
+
+  it("lets a color-matte clip's out-point extend past its own (zero) asset duration, same as an image", () => {
+    const base = emptyProject([colorAsset()]);
+    let project = addClip(base, videoTrackId(base), "color1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    project = trimClip(project, clip.id, "out", 60);
+    const [trimmed] = clipsOf(project, videoTrackId(project));
+
+    assert.ok(closeTo(clipDuration(trimmed), 60), `expected the color-matte clip to trim out to 60s, got ${clipDuration(trimmed)}`);
   });
 });
 
@@ -850,6 +876,58 @@ describe("setClipEffects", () => {
   it("rejects an unknown clip", () => {
     const project = emptyProject();
     assert.throws(() => setClipEffects(project, "missing", IDENTITY_EFFECTS), EditError);
+  });
+});
+
+describe("setClipPixelEffect", () => {
+  it("stores a pixel effect on the clip", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    const adjusted = setClipPixelEffect(project, clip.id, { type: "glitch", speed: 2 });
+    const [result] = clipsOf(adjusted, videoTrackId(adjusted));
+
+    assert.deepEqual(result.pixelEffect, { type: "glitch", speed: 2 });
+  });
+
+  it("deletes the field entirely when set back to null, not stores a null-ish object", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    let adjusted = setClipPixelEffect(project, clip.id, { type: "waterRipple" });
+    adjusted = setClipPixelEffect(adjusted, clip.id, null);
+    const [result] = clipsOf(adjusted, videoTrackId(adjusted));
+
+    assert.equal(result.pixelEffect, undefined);
+    assert.deepEqual(comparable(adjusted), comparable(project));
+  });
+
+  it("switching type keeps whatever speed was already set", () => {
+    const base = emptyProject();
+    const project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+
+    let adjusted = setClipPixelEffect(project, clip.id, { type: "glitch", speed: 3 });
+    adjusted = setClipPixelEffect(adjusted, clip.id, { type: "waterRipple", speed: 3 });
+    const [result] = clipsOf(adjusted, videoTrackId(adjusted));
+
+    assert.deepEqual(result.pixelEffect, { type: "waterRipple", speed: 3 });
+  });
+
+  it("refuses to adjust a pixel effect on a locked track", () => {
+    const base = emptyProject();
+    let project = addClip(base, videoTrackId(base), "asset1", 0);
+    const [clip] = clipsOf(project, videoTrackId(project));
+    project = setTrackFlag(project, videoTrackId(project), "locked", true);
+
+    assert.throws(() => setClipPixelEffect(project, clip.id, { type: "glitch" }), EditError);
+  });
+
+  it("rejects an unknown clip", () => {
+    const project = emptyProject();
+    assert.throws(() => setClipPixelEffect(project, "missing", { type: "glitch" }), EditError);
   });
 });
 

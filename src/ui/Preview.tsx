@@ -137,6 +137,12 @@ export function Preview() {
         if (!asset || !state.projectId) return null;
         return mediaUrl(state.projectId, asset.relPath);
       },
+      lutUrlFor: (lutId) => {
+        const state = useEditorStore.getState();
+        const lut = state.project?.luts.find((l) => l.id === lutId);
+        if (!lut || !state.projectId) return null;
+        return mediaUrl(state.projectId, lut.relPath);
+      },
     });
     engineRef.current = engine;
     useEditorStore.getState().setPlaybackEngine(engine);
@@ -154,6 +160,15 @@ export function Preview() {
   // commit — `engineRef.current` is already set by the time this reads it).
   useEffect(() => {
     if (canvas) engineRef.current?.attach(canvas);
+  }, [canvas]);
+
+  // Publishes the live canvas element to the store — see `EditorState.previewCanvas`'s own doc comment
+  // for why (`ScopesPanel`'s waveform/vectorscope/histogram readout is the one consumer, sampling this
+  // canvas's real pixels on its own independent rAF loop). Mirrors `setPlaybackEngine`'s own set/clear
+  // lifecycle in the effect above exactly, just for the canvas instead of the engine.
+  useEffect(() => {
+    useEditorStore.getState().setPreviewCanvas(canvas);
+    return () => useEditorStore.getState().setPreviewCanvas(null);
   }, [canvas]);
 
   // Letterbox-fits the sequence's aspect ratio inside the STABLE outer panel (sized purely by the
@@ -280,7 +295,7 @@ export function Preview() {
       </div>
 
       {/* This bar sits flush against the row's bottom edge, the exact same spot the Preview/Timeline
-          resize divider (VStudioApp.tsx, z-20) is positioned to be grabbable from. `pointer-events-none`
+          resize divider (VCutApp.tsx, z-20) is positioned to be grabbable from. `pointer-events-none`
           on the bar itself, re-enabled (`pointer-events-auto` + `z-30` to actually win the stacking
           fight, `pointer-events-auto` alone isn't enough — it only makes an element ELIGIBLE to
           receive events, the topmost-at-that-point element still wins the hit-test) on just the button

@@ -39,8 +39,14 @@ export function computeVisibleClipBoxes(
     const asset = findAsset(project, clip.assetId);
     if (!asset) continue;
 
-    if (track.kind === "video" && (asset.kind === "video" || asset.kind === "image") && asset.width && asset.height) {
-      const box = computeTransformedBox(asset.width, asset.height, canvasWidth, canvasHeight, clip.transform ?? IDENTITY_TRANSFORM);
+    // A color-matte clip has no intrinsic `width`/`height` of its own (see `Asset.color`'s own doc
+    // comment — it fills the frame edge-to-edge, same as `PlaybackEngine.drawVideoClip`'s own color
+    // branch uses `frameWidth`/`frameHeight` as its stand-in "source size") — using the canvas's own
+    // dimensions here is what makes it get a real box (and therefore real on-canvas transform handles
+    // and alignment guides) at all, instead of silently being excluded for lacking `asset.width`.
+    const isColor = asset.kind === "color";
+    if (track.kind === "video" && (asset.kind === "video" || asset.kind === "image" || isColor) && (isColor || (asset.width && asset.height))) {
+      const box = computeTransformedBox(isColor ? canvasWidth : asset.width!, isColor ? canvasHeight : asset.height!, canvasWidth, canvasHeight, clip.transform ?? IDENTITY_TRANSFORM);
       if (box) {
         results.push({
           clipId: clip.id,
@@ -56,7 +62,7 @@ export function computeVisibleClipBoxes(
         });
       }
     } else if (track.kind === "text" && asset.kind === "text" && asset.textStyle) {
-      const block = computeTextBlock(context, canvasWidth, canvasHeight, asset.textContent ?? "", asset.textStyle);
+      const block = computeTextBlock(context, canvasWidth, canvasHeight, asset.textContent ?? "", asset.textStyle, project.customFonts);
       results.push({
         clipId: clip.id,
         trackKind: "text",

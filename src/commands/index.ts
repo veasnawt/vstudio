@@ -15,12 +15,14 @@ import {
   setClipEffects,
   setClipEffectsKeyframes,
   setClipGain,
+  setClipLut,
   setClipMuted,
   setClipTextCrop,
   setClipTextCropKeyframes,
   setClipTransform,
   setClipTransformKeyframes,
   setClipTextStyleKeyframes,
+  setClipPixelEffect,
   setClipTextAnimation,
   setClipTransitionIn,
   setClipTransitionOut,
@@ -32,7 +34,6 @@ import {
   splitClip,
   trimClip,
 } from "../timeline/operations.ts";
-import { nonOverlappingStart } from "../timeline/queries.ts";
 import { snapToFrame } from "../timeline/time.ts";
 import type { Command } from "./types.ts";
 
@@ -241,12 +242,105 @@ export class DeleteClipsCommand extends TrackScopedCommand {
   }
 }
 
-/** Duplicates one or more clips — each new copy lands on the SAME track as its original, right after
- *  it if that spot is free (`nonOverlappingStart`, the same "never silently overwrite" placement
- *  `addAssetAtPlayhead`'s own quick-add path already uses), otherwise appended after the track's own
- *  last clip. Duplicating several clips at once processes them in order and mutates the SAME draft
- *  tracks as it goes, so two adjacent originals both land correctly spaced rather than on top of each
- *  other.
+/** Places a GROUP of clips as one rigid block — every clip keeps its position relative to the
+ *  others in the group, sliding the whole group only as far as needed to clear whatever's already
+ *  on the busiest track. Shared by `DuplicateClipsCommand` (anchored right after the group's own
+ *  current span) and `PasteClipsCommand` (anchored at the playhead) — both need "place several
+ *  clips together without breaking their sync" rather than each one independently snapping to its
+ *  own nearest free spot, which would drift a synced pair (e.g. a video clip and a caption above it
+ *  that start together) apart from each other the moment their two tracks don't have identical free
+ *  space at identical offsets.
+ *
+ *  `entries[i].draftTrack.clips` must NOT yet contain the clip being placed — this only reads
+ *  existing (pre-placement) clips to detect collisions against; two entries sharing a track are safe
+ *  to place independently of each other, since they never overlapped originally and a uniform shift
+ *  preserves that. Returns one resolved, frame-snapped start time per entry, same order as `entries`. */
+function placeGroupAt(
+  entries: { timelineStart: number; duration: number; draftTrack: Track }[],
+  anchorStart: number,
+  fps: number
+): number[] {
+  if (entries.length === 0) return [];
+  const groupStart = Math.min(...entries.map((e) => e.timelineStart));
+  let shift = anchorStart - groupStart;
+
+  const requiredShiftFor = (entry: (typeof entries)[number], candidateShift: number): number => {
+    let candidateStart = entry.timelineStart + candidateShift;
+    let moved = true;
+    while (moved) {
+      moved = false;
+      for (const existing of entry.draftTrack.clips) {
+        if (candidateStart < clipEnd(existing) && candidateStart + entry.duration > existing.timelineStart) {
+          candidateStart = clipEnd(existing);
+          moved = true;
+        }
+      }
+    }
+    return candidateStart - entry.timelineStart;
+  };
+
+  // Every clip in the group must move by the SAME amount (or the group breaks apart), so repeatedly
+  // take whichever clip needs the LARGEST shift to clear its own track, apply that to the whole
+  // group, and recheck — a bigger shift can newly collide with something further down a different
+  // track than the previous pass considered. Bounded by the total clip count across every involved
+  // track, so this always terminates well before the 200-pass cap.
+  for (let pass = 0; pass < 200; pass++) {
+    let maxRequired = shift;
+    for (const entry of entries) {
+      const required = requiredShiftFor(entry, shift);
+      if (required > maxRequired) maxRequired = required;
+    }
+    if (maxRequired <= shift) break;
+    shift = maxRequired;
+  }
+
+  return entries.map((e) => snapToFrame(e.timelineStart + shift, fps));
+}
+
+/** Builds one placed clone of `original`'s own content — same look (transform/effects/keyframes/
+ *  mute/gain), a fresh id, and (for a text clip) a fresh independent text asset rather than sharing
+ *  the source's — see `DuplicateClipsCommand`'s own doc comment for why text needs its own asset.
+ *  Shared by `DuplicateClipsCommand` and `PasteClipsCommand`, which differ only in WHERE the group as
+ *  a whole lands (`placeGroupAt`, above) and where the source clip/text content comes from.
+ *
+ *  `transitionIn`/`transitionOut` are deliberately NOT copied — a crossfade is a relationship with
+ *  whichever clip sits immediately before/after it, and the clone's own neighbors are typically
+ *  different (or nonexistent), so carrying the original's transition over would silently attach a
+ *  blend to the wrong adjacency. Keyframe times need no re-basing (unlike `splitClip`'s own copy):
+ *  the clone keeps the exact same `sourceIn`/`sourceOut` span as the original, so its own
+ *  clip-window-relative keyframe times stay valid completely as-is. */
+function cloneClipContent(
+  newClipId: string,
+  original: Clip,
+  textContent: { content: string; style: TextStyle } | null,
+  newStart: number,
+  newAssets: Asset[]
+): Clip {
+  let assetId = original.assetId;
+  if (textContent) {
+    const clonedAsset = createTextAsset(textContent.content, textContent.style);
+    newAssets.push(clonedAsset);
+    assetId = clonedAsset.id;
+  }
+  const clip = createClip({ assetId, sourceIn: original.sourceIn, sourceOut: original.sourceOut, timelineStart: newStart });
+  clip.id = newClipId;
+  if (original.transform) clip.transform = original.transform;
+  if (original.effects) clip.effects = original.effects;
+  if (original.textAnimation) clip.textAnimation = original.textAnimation;
+  if (original.transformKeyframes) clip.transformKeyframes = original.transformKeyframes;
+  if (original.effectsKeyframes) clip.effectsKeyframes = original.effectsKeyframes;
+  if (original.mutedAudio !== undefined) clip.mutedAudio = original.mutedAudio;
+  if (original.gain !== undefined) clip.gain = original.gain;
+  return clip;
+}
+
+/** Duplicates one or more clips as ONE group, right after the group's own current span (the latest
+ *  point any selected clip ends at) — every clip keeps its position relative to the OTHER selected
+ *  clips (see `placeGroupAt`), rather than each independently snapping to "right after itself" on
+ *  its own track, which used to silently break a synced multi-track selection (e.g. a video clip
+ *  and a caption above it that start together) apart from each other. Landing tracks are each
+ *  clip's own original track; a clip whose track is locked is skipped, tolerantly, the same way
+ *  `deleteClips` itself tolerates a missing id.
  *
  *  Not a `TrackScopedCommand`: a video/image/audio clip's duplicate can safely reuse the SAME
  *  `assetId` (multiple clips already commonly reference one shared source file — transform/effects/
@@ -256,13 +350,7 @@ export class DeleteClipsCommand extends TrackScopedCommand {
  *  duplicate gets a genuinely NEW asset (a clone of the original's content+style), which means this
  *  command touches `project.assets` as well as clip arrays, one level beyond what `TrackScopedCommand`'s
  *  memento covers — same reasoning, and the same reference-stored-arrays memento, `AddCaptionsCommand`
- *  already uses for an identical reason.
- *
- *  `transitionIn` is deliberately NOT copied — a crossfade is a relationship with whichever clip sits
- *  immediately before it, and the duplicate's own "before" is a different clip (or nothing), so
- *  carrying the original's transition over would silently attach a crossfade to the wrong adjacency
- *  (or one that doesn't exist at all yet). Every other per-clip look (transform/effects/mute/gain) IS
- *  copied — those are intrinsic to the clip regardless of where it sits. */
+ *  already uses for an identical reason. */
 export class DuplicateClipsCommand implements Command {
   label = "Duplicate";
   /** One id reserved per requested clip, fixed at construction so redo recreates the SAME ids —
@@ -294,45 +382,128 @@ export class DuplicateClipsCommand implements Command {
     const newAssets: Asset[] = [];
     const fps = draft.sequence.fps;
 
-    this.clipIds.forEach((clipId, i) => {
-      // Looked up against the ORIGINAL project (not the in-progress draft) for sourceIn/sourceOut/
-      // transform/effects — those never change mid-loop — but placed onto the DRAFT's own track so
-      // each new clip sees any earlier ones this same loop already added.
-      const found = findClip(project, clipId);
-      if (!found) return;
-      const draftTrack = findTrack(draft, found.track.id);
-      if (!draftTrack || draftTrack.locked) return;
+    // Looked up against the ORIGINAL project (not the in-progress draft) for sourceIn/sourceOut/
+    // transform/effects — those never change mid-loop — but placed onto the DRAFT's own track so
+    // the group-placement pass below sees any pre-existing content each track actually has.
+    const resolved = this.clipIds
+      .map((clipId, i) => {
+        const found = findClip(project, clipId);
+        if (!found) return null;
+        const draftTrack = findTrack(draft, found.track.id);
+        if (!draftTrack || draftTrack.locked) return null;
+        return { newClipId: this.newClipIds[i], original: found.clip, draftTrack };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 
-      const original = found.clip;
+    if (resolved.length === 0) {
+      draft.updatedAt = Date.now();
+      return draft;
+    }
+
+    const groupEnd = Math.max(...resolved.map((r) => clipEnd(r.original)));
+    const starts = placeGroupAt(
+      resolved.map((r) => ({
+        timelineStart: r.original.timelineStart,
+        duration: r.original.sourceOut - r.original.sourceIn,
+        draftTrack: r.draftTrack,
+      })),
+      groupEnd,
+      fps
+    );
+
+    resolved.forEach(({ newClipId, original, draftTrack }, i) => {
       const asset = findAsset(project, original.assetId);
-      let assetId = original.assetId;
-      if (asset?.kind === "text") {
-        const clonedAsset = createTextAsset(asset.textContent ?? "", asset.textStyle ?? DEFAULT_TEXT_STYLE);
-        newAssets.push(clonedAsset);
-        assetId = clonedAsset.id;
-      }
+      const textContent = asset?.kind === "text" ? { content: asset.textContent ?? "", style: asset.textStyle ?? DEFAULT_TEXT_STYLE } : null;
+      const clip = cloneClipContent(newClipId, original, textContent, starts[i], newAssets);
+      draftTrack.clips.push(clip);
+      draftTrack.clips.sort((a, b) => a.timelineStart - b.timelineStart);
+      this.createdClipIds.push(clip.id);
+    });
 
-      const duration = original.sourceOut - original.sourceIn;
-      const start = snapToFrame(nonOverlappingStart(draftTrack, clipEnd(original), duration), fps);
+    draft.assets = [...draft.assets, ...newAssets];
+    draft.updatedAt = Date.now();
+    return draft;
+  }
 
-      const clip = createClip({ assetId, sourceIn: original.sourceIn, sourceOut: original.sourceOut, timelineStart: start });
-      clip.id = this.newClipIds[i];
-      // A duplicate is a full copy of the original's own CONTENT settings — everything here describes
-      // what the clip looks/sounds like, not where it sits on the timeline, so it all carries over
-      // unchanged (unlike `transitionIn`/`transitionOut`, deliberately excluded: those describe a
-      // blend with whatever clip is ADJACENT, which the duplicate — placed at a new, typically
-      // non-adjacent position via `nonOverlappingStart` above — usually isn't). Keyframe times need no
-      // re-basing here (unlike `splitClip`'s own copy): the duplicate keeps the exact same
-      // `sourceIn`/`sourceOut` span as the original, so its own clip-window-relative keyframe times
-      // stay valid completely as-is.
-      if (original.transform) clip.transform = original.transform;
-      if (original.effects) clip.effects = original.effects;
-      if (original.textAnimation) clip.textAnimation = original.textAnimation;
-      if (original.transformKeyframes) clip.transformKeyframes = original.transformKeyframes;
-      if (original.effectsKeyframes) clip.effectsKeyframes = original.effectsKeyframes;
-      if (original.mutedAudio !== undefined) clip.mutedAudio = original.mutedAudio;
-      if (original.gain !== undefined) clip.gain = original.gain;
+  revert(project: Project): Project {
+    if (!this.previousAssets || !this.previousTracks) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return { ...project, assets: this.previousAssets, sequence: { ...project.sequence, tracks: this.previousTracks } };
+  }
+}
 
+/** A copied clip, captured independently of the live project so paste keeps working even if the
+ *  original clip (or its asset) has since been deleted — a real scenario: copy, delete the
+ *  original, paste later. `textSnapshot` is null for every non-text clip kind (those just reuse
+ *  `clip.assetId` directly on paste); see `PasteClipsCommand`'s own doc comment for the text case. */
+export interface ClipboardEntry {
+  /** A snapshot of the clip as it stood at copy time. Its own `id` is discarded on paste (a fresh
+   *  one is always minted, same as `DuplicateClipsCommand`) — everything else (sourceIn/sourceOut,
+   *  transform, effects, keyframes, mutedAudio, gain) carries over unchanged. */
+  clip: Clip;
+  /** Which track the clip was copied FROM — paste targets the same track (skipped if that track has
+   *  since been deleted or locked), so pasting a synced group back lands on the tracks it came from
+   *  rather than needing the user to re-sort clips onto the right lanes by hand. */
+  trackId: string;
+  textSnapshot: { content: string; style: TextStyle } | null;
+}
+
+/** Pastes a previously-copied group of clips at the CURRENT PLAYHEAD — the group's earliest clip
+ *  starts there, every other copied clip keeping its original offset relative to it (see
+ *  `placeGroupAt`), each landing back on the SAME track it was copied from. This is deliberately a
+ *  different placement rule than `DuplicateClipsCommand` (which anchors right after the group's OWN
+ *  current position, not the playhead) — Copy+Paste is "put this somewhere I choose," Duplicate is
+ *  "clone it right where it already is." */
+export class PasteClipsCommand implements Command {
+  label = "Paste";
+  private readonly newClipIds: string[];
+  createdClipIds: string[] = [];
+
+  private entries: ClipboardEntry[];
+  private anchorStart: number;
+  private previousAssets: Asset[] | null = null;
+  private previousTracks: Track[] | null = null;
+
+  constructor(entries: ClipboardEntry[], anchorStart: number) {
+    this.entries = entries;
+    this.anchorStart = anchorStart;
+    this.newClipIds = entries.map(() => newId("c"));
+    this.label = entries.length === 1 ? "Paste Clip" : "Paste Clips";
+  }
+
+  apply(project: Project): Project {
+    this.previousAssets = project.assets;
+    this.previousTracks = project.sequence.tracks;
+    this.createdClipIds = [];
+
+    const draft = structuredClone(project);
+    const newAssets: Asset[] = [];
+    const fps = draft.sequence.fps;
+
+    const resolved = this.entries
+      .map((entry, i) => {
+        const draftTrack = findTrack(draft, entry.trackId);
+        if (!draftTrack || draftTrack.locked) return null;
+        return { newClipId: this.newClipIds[i], entry, draftTrack };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null);
+
+    if (resolved.length === 0) {
+      draft.updatedAt = Date.now();
+      return draft;
+    }
+
+    const starts = placeGroupAt(
+      resolved.map((r) => ({
+        timelineStart: r.entry.clip.timelineStart,
+        duration: r.entry.clip.sourceOut - r.entry.clip.sourceIn,
+        draftTrack: r.draftTrack,
+      })),
+      this.anchorStart,
+      fps
+    );
+
+    resolved.forEach(({ newClipId, entry, draftTrack }, i) => {
+      const clip = cloneClipContent(newClipId, entry.clip, entry.textSnapshot, starts[i], newAssets);
       draftTrack.clips.push(clip);
       draftTrack.clips.sort((a, b) => a.timelineStart - b.timelineStart);
       this.createdClipIds.push(clip.id);
@@ -521,6 +692,36 @@ export class SetClipChromaKeyCommand implements Command {
   revert(project: Project): Project {
     if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
     return setClipChromaKey(project, this.clipId, this.previous);
+  }
+}
+
+/** Sets or clears a clip's LUT — mirrors `SetClipChromaKeyCommand` exactly, same applied-flag pattern
+ *  for the same reason: `null` (no LUT) is a legitimate PREVIOUS value, not just this command's own
+ *  not-yet-applied sentinel. */
+export class SetClipLutCommand implements Command {
+  label = "Set LUT";
+  private applied = false;
+  private previous: string | null = null;
+
+  private clipId: string;
+  private lutId: string | null;
+
+  constructor(clipId: string, lutId: string | null) {
+    this.clipId = clipId;
+    this.lutId = lutId;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.lutId ?? null;
+    this.applied = true;
+    return setClipLut(project, this.clipId, this.lutId);
+  }
+
+  revert(project: Project): Project {
+    if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipLut(project, this.clipId, this.previous);
   }
 }
 
@@ -758,6 +959,34 @@ export class SetClipTextAnimationCommand implements Command {
   revert(project: Project): Project {
     if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
     return setClipTextAnimation(project, this.clipId, this.previous);
+  }
+}
+
+/** Mirrors `SetClipTextAnimationCommand`'s exact shape, for `Clip.pixelEffect` instead. */
+export class SetClipPixelEffectCommand implements Command {
+  label = "Set Pixel Effect";
+  private applied = false;
+  private previous: Clip["pixelEffect"] | null = null;
+
+  private clipId: string;
+  private pixelEffect: Clip["pixelEffect"] | null;
+
+  constructor(clipId: string, pixelEffect: Clip["pixelEffect"] | null) {
+    this.clipId = clipId;
+    this.pixelEffect = pixelEffect;
+  }
+
+  apply(project: Project): Project {
+    const found = findClip(project, this.clipId);
+    if (!found) throw new EditError("That clip no longer exists");
+    this.previous = found.clip.pixelEffect ?? null;
+    this.applied = true;
+    return setClipPixelEffect(project, this.clipId, this.pixelEffect);
+  }
+
+  revert(project: Project): Project {
+    if (!this.applied) throw new Error(`Cannot undo "${this.label}" — it was never applied`);
+    return setClipPixelEffect(project, this.clipId, this.previous);
   }
 }
 

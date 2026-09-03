@@ -28,6 +28,8 @@ function popupPosition(anchor: DOMRect): { bottom: number; left: number } {
  *  currently selected. */
 export function TransitionPickerMenu({
   anchorRef,
+  isAudioTrack,
+  isTextTrack,
   activeIn,
   activeOut,
   onChangeIn,
@@ -35,6 +37,17 @@ export function TransitionPickerMenu({
   onClose,
 }: {
   anchorRef: React.RefObject<HTMLElement | null>;
+  /** An audio clip's transition is always a crossfade — see `buildAudioTrackStream`'s own comment on
+   *  why every `TransitionType` renders identically for audio. Narrows the grid to just the Crossfade
+   *  tile (plus None) instead of showing 11 video-only styles that would all silently apply as a plain
+   *  crossfade anyway — the same "duration only, no style choice" treatment the Inspector's own
+   *  Transitions tab already gives an audio clip. */
+  isAudioTrack: boolean;
+  /** Glitch/water-ripple are video/image-only — see `TransitionType`'s own doc comment on why (export
+   *  has no equivalent corruption pre-pass for the `drawtext`-based text-blend filter graph, so
+   *  offering them here would let the canvas preview show something export can't reproduce). Narrows
+   *  the grid to exclude just those two, unlike `isAudioTrack` above which narrows to one tile total. */
+  isTextTrack: boolean;
   activeIn: TransitionType | null;
   activeOut: TransitionType | null;
   onChangeIn: (type: TransitionType | null) => void;
@@ -68,6 +81,11 @@ export function TransitionPickerMenu({
   const { bottom, left } = popupPosition(anchor);
   const activeType = mode === "in" ? activeIn : activeOut;
   const onChange = mode === "in" ? onChangeIn : onChangeOut;
+  const gridOptions = isAudioTrack
+    ? (["crossfade"] as TransitionType[])
+    : isTextTrack
+      ? TRANSITION_TYPE_OPTIONS.filter((option) => option !== "glitchCut" && option !== "waterRippleCut")
+      : TRANSITION_TYPE_OPTIONS;
 
   return createPortal(
     <div
@@ -91,6 +109,11 @@ export function TransitionPickerMenu({
           </button>
         ))}
       </div>
+      {isAudioTrack && (
+        <p className="mb-2 px-1 text-[10px] leading-snug text-white/40">
+          {t("Audio transitions are always a crossfade — there's no separate visual style to pick.")}
+        </p>
+      )}
       <div className="grid grid-cols-3 gap-1.5">
         <button
           role="menuitem"
@@ -107,7 +130,7 @@ export function TransitionPickerMenu({
           </div>
           <span className="text-[10px] text-white/70">{t("None")}</span>
         </button>
-        {TRANSITION_TYPE_OPTIONS.map((type) => (
+        {gridOptions.map((type) => (
           <button
             key={type}
             role="menuitem"

@@ -49,7 +49,7 @@ interface VideoClipNode {
 }
 
 /** Owns the entire Web Audio mixing graph for the live preview — see this feature's own plan
- *  (`Web Audio Mixing Engine for VStudio Live Preview`) for the full rationale. Two categories of
+ *  (`Web Audio Mixing Engine for VCut Live Preview`) for the full rationale. Two categories of
  *  audio, handled differently on purpose:
  *
  *  - **Audio-track clips** (no picture, unconstrained): `AudioBufferSourceNode`s scheduled against

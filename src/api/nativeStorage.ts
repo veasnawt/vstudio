@@ -6,10 +6,10 @@ import { deserializeProject, serializeProject } from "../project/serialize.ts";
 import type { Asset, AssetKind, Project } from "../project/types.ts";
 import { ApiRequestError } from "./client.ts";
 
-/** On-device counterpart of `studios/vstudio/app/api/vstudio/**`'s filesystem routes, for the native
+/** On-device counterpart of `studios/vcut/app/api/vcut/**`'s filesystem routes, for the native
  *  (Capacitor) shell where there is no server at all — see the "native iOS/Android apps" plan. Mirrors
- *  the server's `.vstudio/<projectId>/{project.json,media/}` layout one-for-one, just rooted under
- *  Capacitor's app-private `Directory.Data` instead of `VSTUDIO_ROOT`.
+ *  the server's `.vcut/<projectId>/{project.json,media/}` layout one-for-one, just rooted under
+ *  Capacitor's app-private `Directory.Data` instead of `VCUT_ROOT`.
  *
  *  What this deliberately does NOT do yet: generate thumbnails/filmstrips/waveforms, or export — both
  *  need real FFmpeg, which only exists here once the native `ffmpeg-kit` plugin (plan Step 5) lands.
@@ -18,7 +18,7 @@ import { ApiRequestError } from "./client.ts";
  *  friends) — so import/edit/preview work now, export waits on the plugin. */
 
 const DIRECTORY = Directory.Data;
-const ROOT = "vstudio-projects";
+const ROOT = "vcut-projects";
 
 function projectDir(projectId: string): string {
   return `${ROOT}/${projectId}`;
@@ -147,7 +147,7 @@ export async function nativeImportMedia(projectId: string, file: File): Promise<
   const ext = `.${file.name.split(".").pop()?.toLowerCase() ?? ""}`;
   const kind = kindForExtension(ext);
   if (!kind) {
-    throw new ApiRequestError(`VStudio can't import "${ext || file.name}" on this device.`, 400, "unsupported-format");
+    throw new ApiRequestError(`VCut can't import "${ext || file.name}" on this device.`, 400, "unsupported-format");
   }
 
   const objectUrl = URL.createObjectURL(file);

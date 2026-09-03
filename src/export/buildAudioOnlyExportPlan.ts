@@ -1,6 +1,5 @@
-import { clipDuration, findAsset, sequenceDuration } from "../project/createProject.ts";
+import { findAsset, sequenceDuration } from "../project/createProject.ts";
 import type { Project } from "../project/types.ts";
-import { audibleClips } from "../timeline/queries.ts";
 import { buildSegments, ExportError } from "./buildExportPlan.ts";
 
 /** Builds the FFmpeg invocation that mixes a project's audio down to a single mono MP3 — no video at
@@ -108,21 +107,53 @@ export function buildAudioOnlyExportPlan(project: Project, options: AudioOnlyPla
     if (trackIndex > 0) extraTrackAudioLabels.push(`[ca${trackIndex}]`);
   });
 
-  // Dedicated audio-track clips (voiceover, music), positioned with `adelay` — identical to
-  // buildExportPlan's own overlay-audio loop.
+  // Dedicated audio-track clips (voiceover, music) — segment-based, same `buildSegments` walk the
+  // video-track loop above uses, so a transition between two audio-track clips gets a real `acrossfade`
+  // here too instead of being silently dropped to a hard cut. Previously a flat per-clip `adelay`+
+  // `volume` loop over `audibleClips` that never consulted `findTransitionPartner`/`findTransitionOut`
+  // at all — that meant Auto-Captions transcribed a hard cut at every audio-track transition boundary
+  // even though the real export's own `buildAudioTrackStream` already blended it correctly. Mirrors
+  // that function's mute/solo/emptiness gating (`anySoloAudioTrack`/`hasAudibleClip`) exactly, so a
+  // track this excludes doesn't even get `buildSegments` run over it.
   const overlayAudio: string[] = [];
-  for (const [j, { track, clip }] of audibleClips(project).entries()) {
-    const asset = findAsset(project, clip.assetId);
-    if (!asset || asset.offline || !asset.hasAudio || clip.mutedAudio) continue;
+  const audioTracks = project.sequence.tracks.filter((track) => track.kind === "audio");
+  const anySoloAudioTrack = audioTracks.some((track) => track.solo);
+  audioTracks.forEach((track, audioTrackIndex) => {
+    if (anySoloAudioTrack ? !track.solo : track.muted) return;
+    const hasAudibleClip = track.clips.some((clip) => {
+      const asset = findAsset(project, clip.assetId);
+      return asset ? !asset.offline && asset.hasAudio && !clip.mutedAudio : false;
+    });
+    if (!hasAudibleClip) return;
 
-    inputs.push("-ss", t(clip.sourceIn), "-t", t(clipDuration(clip)), "-i", options.inputPathFor(clip.assetId));
-    const label = `ov${j}`;
-    const delayMs = Math.round(clip.timelineStart * 1000);
-    const gain = (clip.gain ?? 1) * (track.gain ?? 1);
-    const volumeStage = gain !== 1 ? `,volume=${n(gain)}` : "";
-    filters.push(`[${inputIndex++}:a]aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}${volumeStage}[${label}]`);
-    overlayAudio.push(`[${label}]`);
-  }
+    const sortedClips = [...track.clips].sort((a, b) => a.timelineStart - b.timelineStart);
+    const segments = buildSegments(project, track, sortedClips, options, duration);
+    const labels: string[] = [];
+
+    segments.forEach((segment, i) => {
+      const label = `oa${audioTrackIndex}_${i}`;
+      if (segment.kind === "clip") {
+        const hasAudio = segment.hasAudio && !segment.clip.mutedAudio;
+        pushAudio(hasAudio, hasAudio ? segment.path : null, segment.sourceIn, segment.duration, label, (segment.clip.gain ?? 1) * (track.gain ?? 1));
+      } else if (segment.kind === "transition") {
+        // Same two-slice-then-blend shape as the video-track loop's own transition branch above.
+        const D = segment.duration;
+        const fromLabel = `${label}_from`;
+        const toLabel = `${label}_to`;
+        const fromHasAudio = segment.from.hasAudio && !segment.from.clip.mutedAudio;
+        const toHasAudio = segment.to.hasAudio && !segment.to.clip.mutedAudio;
+        pushAudio(fromHasAudio, fromHasAudio ? segment.from.path : null, segment.from.clip.sourceOut - D, D, fromLabel, (segment.from.clip.gain ?? 1) * (track.gain ?? 1));
+        pushAudio(toHasAudio, toHasAudio ? segment.to.path : null, segment.to.clip.sourceIn, D, toLabel, (segment.to.clip.gain ?? 1) * (track.gain ?? 1));
+        filters.push(`[${fromLabel}][${toLabel}]acrossfade=d=${t(D)}[${label}]`);
+      } else {
+        pushAudio(false, null, 0, segment.duration, label);
+      }
+      labels.push(`[${label}]`);
+    });
+
+    filters.push(`${labels.join("")}concat=n=${segments.length}:v=0:a=1[oa${audioTrackIndex}]`);
+    overlayAudio.push(`[oa${audioTrackIndex}]`);
+  });
 
   const allSources = videoTracks.length > 0 ? [`[ca0]`, ...extraTrackAudioLabels, ...overlayAudio] : overlayAudio;
   if (allSources.length === 0) throw new ExportError("There is no audio in this range to transcribe");

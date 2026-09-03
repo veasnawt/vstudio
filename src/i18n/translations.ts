@@ -1,4 +1,4 @@
-/** Khmer translations for every user-facing string in the VStudio UI, keyed by the exact English
+/** Khmer translations for every user-facing string in the VCut UI, keyed by the exact English
  *  string already in the source — not a synthetic key — so a call site changes from
  *  `<button>Export</button>` to `<button>{t("Export")}</button>` with nothing else to invent or keep
  *  in sync. A string with no entry here simply falls back to the English key itself (see
@@ -35,7 +35,7 @@ export const KM_TRANSLATIONS: Record<string, string> = {
   "Could not save the project": "មិនអាចរក្សាទុកគម្រោងបានទេ",
   "Could not remove that media": "មិនអាចលុបមេឌៀនោះបានទេ",
 
-  // VStudioApp.tsx
+  // VCutApp.tsx
   "Put the playhead over a clip to split it": "ដាក់ទស្សន៍ទ្រនិចលើឈុតដើម្បីកាត់វា",
   "Split at playhead (S)": "កាត់នៅចំណុចទស្សន៍ទ្រនិច (S)",
   Split: "កាត់",
@@ -57,8 +57,8 @@ export const KM_TRANSLATIONS: Record<string, string> = {
   "All changes saved": "រាល់ការកែប្រែបានរក្សាទុក",
   "Project name": "ឈ្មោះគម្រោង",
   "Rename project": "ប្តូរឈ្មោះគម្រោង",
-  "Opening VStudio…": "កំពុងបើក VStudio…",
-  "VStudio couldn't open this project": "VStudio មិនអាចបើកគម្រោងនេះបានទេ",
+  "Opening VCut…": "កំពុងបើក VCut…",
+  "VCut couldn't open this project": "VCut មិនអាចបើកគម្រោងនេះបានទេ",
   "Try again": "ព្យាយាមម្តងទៀត",
   "Switch language": "ប្តូរភាសា",
   "Back to projects": "ត្រឡប់ទៅគម្រោង",
@@ -169,8 +169,8 @@ export const KM_TRANSLATIONS: Record<string, string> = {
   "Export failed": "ការនាំចេញបរាជ័យ",
   "Save or share video": "រក្សាទុក ឬចែករំលែកវីដេអូ",
   "Export video": "នាំចេញវីដេអូ",
-  "FFmpeg isn't available on this machine, so VStudio can't render a file. Reinstall dependencies":
-    "FFmpeg មិនមាននៅលើម៉ាស៊ីននេះទេ ដូច្នេះ VStudio មិនអាចបង្កើតឯកសារបានទេ។ សូមដំឡើងភាពអាស្រ័យឡើងវិញ",
+  "FFmpeg isn't available on this machine, so VCut can't render a file. Reinstall dependencies":
+    "FFmpeg មិនមាននៅលើម៉ាស៊ីននេះទេ ដូច្នេះ VCut មិនអាចបង្កើតឯកសារបានទេ។ សូមដំឡើងភាពអាស្រ័យឡើងវិញ",
   ") to restore it.": ") ដើម្បីស្តារវាឡើងវិញ។",
   "Exporting range": "កំពុងនាំចេញចន្លោះពេល",
   "Reset to full timeline": "កំណត់ត្រឡប់ទៅខ្សែពេលវេលាទាំងមូល",
@@ -390,8 +390,8 @@ export const KM_TRANSLATIONS: Record<string, string> = {
 
   // ErrorBoundary.tsx / error.tsx / global-error.tsx
   "Something went wrong": "មានបញ្ហាកើតឡើង",
-  "VStudio hit an unexpected error and couldn't continue. Your project's last save is safe — reloading will get you back to it.":
-    "VStudio ជួបបញ្ហាដែលមិនបានរំពឹងទុក ហើយមិនអាចបន្តទៀតបានទេ។ ការរក្សាទុកចុងក្រោយរបស់គម្រោងអ្នកនៅមានសុវត្ថិភាព — ការផ្ទុកឡើងវិញនឹងនាំអ្នកត្រឡប់ទៅចំណុចនោះវិញ។",
+  "VCut hit an unexpected error and couldn't continue. Your project's last save is safe — reloading will get you back to it.":
+    "VCut ជួបបញ្ហាដែលមិនបានរំពឹងទុក ហើយមិនអាចបន្តទៀតបានទេ។ ការរក្សាទុកចុងក្រោយរបស់គម្រោងអ្នកនៅមានសុវត្ថិភាព — ការផ្ទុកឡើងវិញនឹងនាំអ្នកត្រឡប់ទៅចំណុចនោះវិញ។",
   Reload: "ផ្ទុកឡើងវិញ",
   "Show log folder": "បង្ហាញថតកំណត់ហេតុ",
 };

@@ -315,7 +315,7 @@ describe("project serialization", () => {
     assert.ok(!("transitionOut" in restored.sequence.tracks[0].clips[0]));
   });
 
-  it("refuses a file written by a newer VStudio rather than round-tripping it lossily", () => {
+  it("refuses a file written by a newer VCut rather than round-tripping it lossily", () => {
     const project = emptyProject();
     const raw = JSON.parse(serializeProject(project));
     raw.schemaVersion = PROJECT_SCHEMA_VERSION + 1;
