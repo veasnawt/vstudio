@@ -11,7 +11,7 @@ import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerE
 import { TimelineClip } from "./TimelineClip.tsx";
 import { TrackHeader } from "./TrackHeader.tsx";
 
-const TRACK_HEIGHT = 56;
+const TRACK_HEIGHT = 44;
 /** Mobile-only row height for a track with nothing on it — a full-height empty row (same height as
  *  a busy one, showing nothing) reads as broken/wasteful on a small screen where every row of height
  *  is precious. Tall enough to still comfortably fit the compact single-row header (drag handle, name,
@@ -19,7 +19,7 @@ const TRACK_HEIGHT = 56;
  *  used everywhere else in that file. Reverts to `TRACK_HEIGHT` the instant a clip actually lands on
  *  the track (or a voiceover recording is in progress on it — see `isTrackCompact`'s own comment). */
 const EMPTY_TRACK_HEIGHT = 32;
-const HEADER_WIDTH = 116;
+const HEADER_WIDTH = 156;
 const RULER_HEIGHT = 26;
 /** Empty space kept past the end of the edit, so there's always somewhere to drop a clip and extend
  *  the timeline rather than being fenced in at exactly the last frame. */

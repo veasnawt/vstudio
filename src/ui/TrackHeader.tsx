@@ -56,12 +56,14 @@ function FlagButton({
       title={label}
       aria-label={label}
       aria-pressed={active}
-      // Fixed min dimensions rather than padding-driven sizing: the worst case (an audio track's
-      // Lock+Mute+Solo, 3 buttons in one row) still comfortably fits HEADER_WIDTH's ~100px of usable
-      // width at 26px each, but the previous padding-only sizing (px-1.5 py-0.5 around a 13px icon or
-      // single letter) measured as small as ~17×19px on a real mobile viewport — too small to
-      // reliably tap for a control used mid-playback (mute/solo while previewing).
-      className={`inline-flex min-h-[26px] min-w-[26px] items-center justify-center rounded text-[11px] font-semibold transition ${
+      // Fixed min HEIGHT rather than padding-driven sizing: the previous padding-only sizing
+      // (px-1.5 py-0.5 around a 13px icon or single letter) measured as small as ~17×19px on a real
+      // mobile viewport — too small to reliably tap for a control used mid-playback (mute/solo while
+      // previewing). Width is tighter (22px, not 26) — now that the whole header is ONE row (name,
+      // drag handle, and up to 3 of these sharing it with Import/Delete), vertical accuracy matters
+      // far more than horizontal for a row of adjacent icons: a thumb still lands on the right button
+      // reliably as long as it's tall enough, even if slightly narrower.
+      className={`inline-flex min-h-[26px] min-w-[22px] items-center justify-center rounded text-[11px] font-semibold transition ${
         active ? activeClass : "text-white/35 hover:bg-white/10 hover:text-white/70"
       }`}
     >
@@ -176,7 +178,7 @@ export function TrackHeader({
         const sourceId = e.dataTransfer.getData(TRACK_DRAG_MIME);
         if (sourceId && sourceId !== track.id) onDropRow(sourceId, track.id, positionInRow(e));
       }}
-      className={`group relative flex shrink-0 cursor-pointer flex-col justify-center gap-1 border-b border-r border-white/10 px-2 ${
+      className={`group relative flex shrink-0 cursor-pointer items-center gap-1 border-b border-r border-white/10 px-1.5 ${
         isActive ? "bg-white/[0.07]" : "bg-[#0d0f14] hover:bg-white/[0.04]"
       }`}
     >
@@ -190,88 +192,36 @@ export function TrackHeader({
         />
       )}
 
-      <div className="flex items-center gap-1.5">
-        <span
-          draggable
-          onDragStart={(e) => {
-            e.stopPropagation();
-            e.dataTransfer.setData(TRACK_DRAG_MIME, track.id);
-            e.dataTransfer.setData(`${TRACK_DRAG_MIME}-kind-${track.kind}`, "");
-            e.dataTransfer.effectAllowed = "move";
-          }}
-          onDragEnd={onDragEndRow}
-          onClick={(e) => e.stopPropagation()}
-          title={t("Drag to reorder")}
-          aria-label={t("Reorder {name}", { name: track.name })}
-          className="shrink-0 cursor-grab select-none text-[10px] leading-none text-white/25 transition hover:text-white/60 active:cursor-grabbing"
-        >
-          ⋮⋮
-        </span>
-        {/* The active track is where a double-clicked library asset lands, so it needs to be
-            visible at a glance rather than something the user has to remember. */}
-        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isActive ? "bg-sky-400" : "bg-transparent"}`} />
-        <span className="truncate text-[11px] font-semibold text-white/80">{track.name}</span>
-        {/* Imports a file straight onto THIS track, at the playhead — the direct alternative to
-            dragging an asset in from the Media Library, which is a fiddly gesture on a touchscreen
-            (long-press to arm the drag, then hit a specific track row) compared to a plain tap here.
-            `ml-auto` pushes this AND the delete button after it to the row's right edge together;
-            text tracks get neither an import button nor anything to import (their content is typed). */}
-        {track.kind !== "text" && (
-          <>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                importInputRef.current?.click();
-              }}
-              disabled={importing}
-              title={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
-              aria-label={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
-              className="ml-auto inline-flex min-h-[26px] min-w-[26px] shrink-0 items-center justify-center rounded text-[15px] font-semibold leading-none text-white/35 transition hover:bg-white/10 hover:text-white/70 disabled:cursor-default disabled:opacity-40"
-            >
-              +
-            </button>
-            <input
-              ref={importInputRef}
-              type="file"
-              multiple
-              accept={ACCEPTED_EXTENSIONS_BY_KIND[track.kind]}
-              className="hidden"
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => {
-                const files = [...(e.target.files ?? [])];
-                // Cleared so re-picking the same file still fires a change event.
-                e.target.value = "";
-                if (files.length === 0) return;
-                void importFiles(files).then((assets) => {
-                  // Sequential, non-overlapping placement — same option addAssetAtPlayhead already
-                  // supports for exactly this "landed several at once" case, so importing 3 clips here
-                  // doesn't stack them all on top of each other at the playhead.
-                  for (const asset of assets) addAssetAtPlayhead(asset.id, track.id, { avoidOverlap: true });
-                });
-              }}
-            />
-          </>
-        )}
-        {/* Faded in on hover/focus at `lg`+ rather than always visible — a permanent delete icon next
-            to every track invites a stray click far more than the same control does when it only
-            appears once you're already pointing at that row. Below `lg` there's no hover to fade it
-            in FROM (touch has no `:hover`), so it stays visible there — same reasoning as the media
-            library's remove button. */}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setConfirmOpen(true);
-          }}
-          title={t("Remove track")}
-          aria-label={t("Remove {name}", { name: track.name })}
-          className="ml-auto flex shrink-0 items-center rounded px-1 py-0.5 text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300 lg:text-white/0 lg:group-hover:text-white/35 lg:focus-visible:text-white/35"
-        >
-          <Delete size={14} />
-        </button>
-      </div>
+      {/* ONE row, not the two stacked rows this used to be — `TRACK_HEIGHT` shrank (a real, deliberate
+          "shorter clips" request), and two rows of genuinely-tappable 26px controls simply no longer
+          fit the vertical space at all, not just look cramped: 26px + a gap + 26px alone already
+          exceeds the new row height before the name/drag-handle/anything else even enters the count.
+          Putting name, flags, import, and delete all in one horizontally-centered row needs no more
+          VERTICAL room than a single 26px control ever did — `items-center` on the row centers
+          everything in whatever `height` this instance got, unchanged from before. */}
+      <span
+        draggable
+        onDragStart={(e) => {
+          e.stopPropagation();
+          e.dataTransfer.setData(TRACK_DRAG_MIME, track.id);
+          e.dataTransfer.setData(`${TRACK_DRAG_MIME}-kind-${track.kind}`, "");
+          e.dataTransfer.effectAllowed = "move";
+        }}
+        onDragEnd={onDragEndRow}
+        onClick={(e) => e.stopPropagation()}
+        title={t("Drag to reorder")}
+        aria-label={t("Reorder {name}", { name: track.name })}
+        className="shrink-0 cursor-grab select-none text-[10px] leading-none text-white/25 transition hover:text-white/60 active:cursor-grabbing"
+      >
+        ⋮⋮
+      </span>
+      {/* The active track is where a double-clicked library asset lands, so it needs to be
+          visible at a glance rather than something the user has to remember. */}
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isActive ? "bg-sky-400" : "bg-transparent"}`} />
+      <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-white/80">{track.name}</span>
 
       {!compact && (
-        <div className="flex items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-0.5">
           <FlagButton
             active={track.locked}
             onClick={() => run(new SetTrackFlagCommand(track.id, "locked", !track.locked))}
@@ -334,6 +284,66 @@ export function TrackHeader({
           )}
         </div>
       )}
+
+      {/* Imports a file straight onto THIS track, at the playhead — the direct alternative to
+          dragging an asset in from the Media Library, which is a fiddly gesture on a touchscreen
+          (long-press to arm the drag, then hit a specific track row) compared to a plain tap here.
+          Text tracks get neither an import button nor anything to import (their content is typed).
+          `lg:w-0 lg:overflow-hidden` (not just a faded color, the way Delete alone used to fade in
+          below) is what makes room for the flag buttons above at the new, tighter row width: below
+          `lg` it stays a normal, always-visible 26px control (there's no `:hover` on touch to reveal
+          it FROM, same reasoning `Delete`'s own comment already gives), but at `lg`+ it collapses to
+          zero width — not just invisible, genuinely out of the way — until the row is hovered, the
+          same "occasional action doesn't need to cost permanent space" tradeoff Delete already made,
+          just extended to actually reclaim the width instead of only the visual weight. */}
+      {track.kind !== "text" && (
+        <>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              importInputRef.current?.click();
+            }}
+            disabled={importing}
+            title={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
+            aria-label={t("Import {kind} onto {name}", { kind: t(track.kind), name: track.name })}
+            className="inline-flex min-h-[26px] min-w-[22px] shrink-0 items-center justify-center overflow-hidden rounded text-[15px] font-semibold leading-none text-white/35 transition hover:bg-white/10 hover:text-white/70 disabled:cursor-default disabled:opacity-40 lg:min-w-0 lg:w-0 lg:group-hover:w-[22px] lg:group-hover:min-w-[22px]"
+          >
+            +
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            multiple
+            accept={ACCEPTED_EXTENSIONS_BY_KIND[track.kind]}
+            className="hidden"
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              const files = [...(e.target.files ?? [])];
+              // Cleared so re-picking the same file still fires a change event.
+              e.target.value = "";
+              if (files.length === 0) return;
+              void importFiles(files).then((assets) => {
+                // Sequential, non-overlapping placement — same option addAssetAtPlayhead already
+                // supports for exactly this "landed several at once" case, so importing 3 clips here
+                // doesn't stack them all on top of each other at the playhead.
+                for (const asset of assets) addAssetAtPlayhead(asset.id, track.id, { avoidOverlap: true });
+              });
+            }}
+          />
+        </>
+      )}
+      {/* Same space-collapsing treatment as Import above, for the same reason — see its own comment. */}
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          setConfirmOpen(true);
+        }}
+        title={t("Remove track")}
+        aria-label={t("Remove {name}", { name: track.name })}
+        className="flex min-h-[26px] min-w-[20px] shrink-0 items-center justify-center overflow-hidden rounded text-white/35 transition hover:bg-rose-500/20 hover:text-rose-300 lg:min-w-0 lg:w-0 lg:group-hover:w-[20px] lg:group-hover:min-w-[20px] lg:focus-visible:w-[20px] lg:focus-visible:min-w-[20px]"
+      >
+        <Delete size={14} />
+      </button>
 
       {confirmOpen && (
         <ConfirmDialog

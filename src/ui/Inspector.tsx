@@ -41,7 +41,7 @@ import {
   SetTextCommand,
 } from "../commands/index.ts";
 import { clipDuration, findAsset, findClip } from "../project/createProject.ts";
-import { FONT_REGISTRY, fontById, preloadFont } from "../project/fonts.ts";
+import { FONT_REGISTRY, fontById, preloadFont, resolveFont } from "../project/fonts.ts";
 import type { ClipEffects, ClipTransform, ColorGrading, TextCrop, TextStyle } from "../project/types.ts";
 import { DEFAULT_CHROMA_KEY, DEFAULT_TEXT_STYLE, IDENTITY_COLOR_GRADING, IDENTITY_EFFECTS, IDENTITY_TEXT_CROP, IDENTITY_TRANSFORM } from "../project/types.ts";
 import { applyTextStylePreset, TEXT_STYLE_PRESETS } from "../project/textStylePresets.ts";
@@ -755,6 +755,10 @@ export function Inspector() {
   const removeLut = useEditorStore((s) => s.removeLut);
   const importingLut = useEditorStore((s) => s.importingLut);
   const lutImportInputRef = useRef<HTMLInputElement>(null);
+  const importFont = useEditorStore((s) => s.importFont);
+  const removeFont = useEditorStore((s) => s.removeFont);
+  const importingFont = useEditorStore((s) => s.importingFont);
+  const fontImportInputRef = useRef<HTMLInputElement>(null);
 
   // Exactly one clip, not just "at least one" — `selectedClipIds[0]` alone would still resolve to a
   // real clip during a genuine multi-select (both/all of them normally still exist in the project), so
@@ -1066,7 +1070,7 @@ export function Inspector() {
                       // own doc comment describes, just for TextStyle instead of ClipTransform.
                       const style = hasTextStyleKeyframes(clip) ? resolveTextStyle(clip, playhead - clip.timelineStart, baseStyle) : baseStyle;
                       const content = asset.textContent ?? "";
-                      const font = fontById(style.fontFamily);
+                      const font = resolveFont(style.fontFamily, project!.customFonts);
                       // Same interpolated-at-the-playhead resolution as `style` above, for `TextCrop`.
                       const crop = resolveTextCrop(clip, playhead - clip.timelineStart);
                       return (
@@ -1106,7 +1110,7 @@ export function Inspector() {
                                 // was opened before that had a chance to finish (a slow connection, or
                                 // a font added to the registry after that warm-up already ran).
                                 if (v) {
-                                  preloadFont(fontById(v));
+                                  preloadFont(resolveFont(v, project!.customFonts));
                                   previewTextStyle(clip.id, asset.id, { fontFamily: v });
                                 } else {
                                   clearPreview();
@@ -1116,13 +1120,88 @@ export function Inspector() {
                               className="min-w-0 flex-1 text-[13px]"
                               searchable
                               searchPlaceholder={t("Search fonts…")}
-                              options={FONT_REGISTRY.map((f) => ({
-                                value: f.id,
-                                label: f.label,
-                                style: { fontFamily: `"${f.cssFamily}"` },
-                              }))}
+                              // The project's own uploaded fonts listed FIRST — a user who just
+                              // imported one almost always wants it right at the top, not buried
+                              // below the 30+-entry bundled registry `searchable` exists for in the
+                              // first place. `resolveFont`'s own doc comment is the ONE place that
+                              // decides a `fontFamily` id can name either library; this list is what
+                              // makes every id it could resolve actually reachable from the picker.
+                              options={[
+                                ...project!.customFonts.map((f) => ({
+                                  value: f.id,
+                                  label: f.name,
+                                  style: { fontFamily: `"${f.cssFamily}"` },
+                                })),
+                                ...FONT_REGISTRY.map((f) => ({
+                                  value: f.id,
+                                  label: f.label,
+                                  style: { fontFamily: `"${f.cssFamily}"` },
+                                })),
+                              ]}
                             />
                           </div>
+                          {/* The project's own uploaded `.ttf`/`.otf` library, right below the picker it
+                              feeds — moved here from a separate section further down the panel:
+                              "manage what's available to pick from" reads far more naturally sitting
+                              right next to "pick one" than scrolled away from it. A freshly-imported
+                              font is already selectable from the dropdown immediately (see its own
+                              `options` comment for why custom entries list first there); this is for
+                              seeing what's already in the library at a glance and removing one, which
+                              the dropdown itself has no room for. No `CollapsibleSection` wrapper (the
+                              LUT/SFX libraries elsewhere in this panel each get their own) — it's
+                              already living inside the Text section's own toggle, and a second nested
+                              collapse control here would be more chrome than the few rows it guards are
+                              worth. Only rendered once there's something to show — an empty "no fonts
+                              yet" placeholder sitting permanently under the dropdown would be exactly
+                              the clutter proximity was supposed to avoid. */}
+                          {project!.customFonts.length > 0 && (
+                            <ul className="-mt-1 space-y-0.5 pb-1.5">
+                              {project!.customFonts.map((font) => (
+                                <li key={font.id} className="flex items-center gap-1.5 rounded-md py-0.5 hover:bg-white/5">
+                                  <button
+                                    onClick={() => {
+                                      clearPreview();
+                                      patchTextStyle(asset.id, content, { fontFamily: font.id });
+                                    }}
+                                    style={{ fontFamily: `"${font.cssFamily}"` }}
+                                    className={`min-w-0 flex-1 truncate rounded px-1.5 py-0.5 text-left text-[11px] transition ${
+                                      style.fontFamily === font.id ? "bg-sky-500/20 text-white" : "text-white/50 hover:text-white"
+                                    }`}
+                                  >
+                                    {font.name}
+                                  </button>
+                                  <button
+                                    onClick={() => void removeFont(font.id)}
+                                    aria-label={t("Remove")}
+                                    title={t("Remove")}
+                                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-white/30 transition hover:bg-red-500/20 hover:text-red-300"
+                                  >
+                                    <Delete size={11} />
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          <button
+                            onClick={() => fontImportInputRef.current?.click()}
+                            disabled={importingFont}
+                            className="mb-1.5 flex w-full items-center justify-center gap-1.5 rounded bg-white/5 py-1 text-[11px] text-white/50 transition hover:bg-white/10 hover:text-white disabled:cursor-default disabled:opacity-50"
+                          >
+                            <Upload size={12} />
+                            {importingFont ? t("Importing…") : t("Import font…")}
+                          </button>
+                          <input
+                            ref={fontImportInputRef}
+                            type="file"
+                            accept=".ttf,.otf"
+                            className="hidden"
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              e.target.value = "";
+                              if (!file) return;
+                              await importFont(file);
+                            }}
+                          />
                           <NumberField
                             label={t("Size")}
                             value={style.fontSize}

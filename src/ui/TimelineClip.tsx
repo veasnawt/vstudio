@@ -666,6 +666,7 @@ function TimelineClipComponent({
   }
 
   const isAudio = track.kind === "audio";
+  const isText = track.kind === "text";
 
   return (
     <div
@@ -748,7 +749,13 @@ function TimelineClipComponent({
             ? "border-sky-300 bg-sky-500/35 ring-1 ring-sky-300/70"
             : isAudio
               ? "border-emerald-400/40 bg-emerald-500/20 hover:bg-emerald-500/30"
-              : "border-sky-400/40 bg-sky-500/20 hover:bg-sky-500/30"
+              : isText
+                // Same amber `TrackHeader.tsx`'s own `KIND_ICON` already colors a text track's icon —
+                // text clips used to fall through to the plain video/image branch below, reading
+                // identically to a video clip on the timeline with nothing to tell them apart at a
+                // glance except the label text. Requested directly: text clips wanted their own color.
+                ? "border-amber-400/40 bg-amber-500/20 hover:bg-amber-500/30"
+                : "border-sky-400/40 bg-sky-500/20 hover:bg-sky-500/30"
       } ${
         // A stronger "picked up" look while an active drag is a MOVE — a shadow + raised z-index
         // instead of the old plain `opacity-80`, so the clip being moved reads as elevated/grabbed

@@ -236,11 +236,14 @@ export async function importCustomFont(projectId: string, file: File): Promise<C
 
 /** Removes one custom-font library entry — same `id`-keyed delete shape `fonts/route.ts`'s own
  *  `DELETE` expects (a custom font needs no clip-level cascade — see that route's own doc comment for
- *  why `fontById`'s existing fallback already covers it). */
-export async function deleteCustomFont(projectId: string, font: CustomFontAsset): Promise<void> {
-  if (isNative) return;
+ *  why `fontById`'s existing fallback already covers it). Returns the server's own updated `Project`,
+ *  same "client applies what the server actually persisted, never a local guess" shape `deleteLut`
+ *  already uses — the route already computes and returns exactly this. */
+export async function deleteCustomFont(projectId: string, font: CustomFontAsset): Promise<Project> {
+  if (isNative) throw new ApiRequestError("Removing fonts isn't available on this device yet.", 501, "font-unavailable");
   const params = new URLSearchParams({ projectId, fontId: font.id });
-  await unwrap<{ ok: boolean }>(await fetch(`${BASE}/fonts?${params}`, { method: "DELETE" }));
+  const body = await unwrap<{ project: Project }>(await fetch(`${BASE}/fonts?${params}`, { method: "DELETE" }));
+  return body.project;
 }
 
 export interface ExportStarted {

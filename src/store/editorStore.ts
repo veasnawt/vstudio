@@ -139,6 +139,8 @@ export interface EditorState {
   importingSfx: boolean;
   /** Same role as `importingSfx`, for the Inspector's "My LUTs" import button instead. */
   importingLut: boolean;
+  /** Same role as `importingSfx`, for the Inspector's "My Fonts" import button instead. */
+  importingFont: boolean;
 
   /** Which mobile-only bottom-row "sheet" is currently showing in place of Timeline — `null` means
    *  Timeline itself (the default, and the only state that ever applies at `lg`+, where these two
@@ -287,6 +289,16 @@ export interface EditorState {
    *  server does the cascade and hands back the fully-updated project rather than this just dropping
    *  the library entry locally. */
   removeLut: (id: string) => Promise<void>;
+  /** Imports a `.ttf`/`.otf` file into the project's own custom-font library (`project.customFonts`)
+   *  — same shape as `importLut`, just against `fonts/route.ts`. A newly-imported font is immediately
+   *  selectable from the Inspector's Font dropdown (see `resolveFont`'s own doc comment for how a
+   *  clip's `fontFamily` id resolves against this library). */
+  importFont: (file: File) => Promise<void>;
+  /** Removes one custom-font library entry — no clip-level cascade needed (see `fonts/route.ts`'s own
+   *  `DELETE` doc comment: `fontById`'s existing fallback already covers a clip left pointing at a
+   *  since-removed font), but still applies the server's own returned project rather than filtering
+   *  locally, the same "server is authoritative" reasoning `removeLut` gives. */
+  removeFont: (id: string) => Promise<void>;
   /** Creates a color-matte asset AND immediately places it as a clip at the playhead — same "Text in
    *  the toolbar always lands the result somewhere visible" shape as `addTextAtPlayhead`, just on a
    *  VIDEO track (a color matte is just a video-track clip whose source is a solid fill — see
@@ -417,6 +429,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     importing: false,
     importingSfx: false,
     importingLut: false,
+    importingFont: false,
     mobileSheet: null,
     previewCanvas: null,
 
@@ -791,6 +804,38 @@ export const useEditorStore = create<EditorState>((set, get) => {
         get().setStatus(translateText(get().language, "Removed {name}", { name: lut.name }));
       } catch (err) {
         const message = err instanceof Error ? err.message : "Could not remove that LUT";
+        get().setStatus(translateText(get().language, message), "error");
+      }
+    },
+
+    async importFont(file) {
+      const { projectId, project, importingFont } = get();
+      if (!projectId || !project || importingFont) return;
+      set({ importingFont: true });
+      try {
+        const font = await api.importCustomFont(projectId, file);
+        const current = get().project;
+        if (current) applyProject({ ...current, customFonts: [...current.customFonts, font] });
+        get().setStatus(translateText(get().language, 'Added "{name}" to My Fonts', { name: font.name }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not import that font";
+        get().setStatus(translateText(get().language, message), "error");
+      } finally {
+        set({ importingFont: false });
+      }
+    },
+
+    async removeFont(id) {
+      const { projectId, project } = get();
+      if (!projectId || !project) return;
+      const font = project.customFonts.find((f) => f.id === id);
+      if (!font) return;
+      try {
+        const updated = await api.deleteCustomFont(projectId, font);
+        applyProject(updated);
+        get().setStatus(translateText(get().language, "Removed {name}", { name: font.name }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not remove that font";
         get().setStatus(translateText(get().language, message), "error");
       }
     },
