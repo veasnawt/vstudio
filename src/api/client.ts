@@ -273,6 +273,19 @@ export async function startExport(projectId: string, project: Project, fileName?
   return unwrap<ExportStarted>(response);
 }
 
+/** Finds the currently-running export for a project, if any — `null` when nothing's running.
+ *  `startExport` rejects a second concurrent export for the same project (see its own route's doc
+ *  comment), which is correct for a genuine double-submit but leaves nothing for a FRESH dialog to
+ *  do with that 409 by itself: a page reload, a second tab, or just re-opening the dialog after
+ *  closing it all lose the in-memory `jobIdRef` a running export needs to be watched or cancelled by.
+ *  This is what lets the dialog recover from any of those — see its own call site. */
+export async function findRunningExport(projectId: string): Promise<string | null> {
+  if (isNative) return null; // native export has no server-side job registry to look one up in
+  const response = await fetch(`${BASE}/export?projectId=${encodeURIComponent(projectId)}`);
+  const { jobId } = await unwrap<{ jobId: string | null }>(response);
+  return jobId;
+}
+
 export async function cancelExport(jobId: string): Promise<void> {
   if (isNative) return nativeCancelExport(jobId);
   // A cancel racing the job's own completion is normal, not an error worth surfacing.

@@ -3,7 +3,15 @@
 import { Capacitor } from "@capacitor/core";
 import { Share } from "@capacitor/share";
 import { useEffect, useRef, useState } from "react";
-import { cancelExport, exportAvailable, exportUrl, startExport, watchExport } from "../api/client.ts";
+import {
+  ApiRequestError,
+  cancelExport,
+  exportAvailable,
+  exportUrl,
+  findRunningExport,
+  startExport,
+  watchExport,
+} from "../api/client.ts";
 import { nativeExportUrl, nativeSaveExportToGallery } from "../api/nativeExport.ts";
 import { trimProjectToRange } from "../export/trimForExport.ts";
 import { useTranslation } from "../i18n/useTranslation.ts";
@@ -64,6 +72,23 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
   useEffect(() => () => unwatchRef.current?.(), []);
 
+  // Recovers a project's already-running export on mount — a page reload, a second tab, or just
+  // closing and reopening this dialog all lose `jobIdRef`, which used to leave nothing behind but the
+  // POST route's own 409 the next time someone clicked Export, with no way to see progress or even
+  // cancel it short of restarting the whole server. Checking here means the dialog picks the export
+  // back up and shows it running normally instead, the same as if it had never lost track at all.
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    void findRunningExport(projectId).then((jobId) => {
+      if (jobId && !cancelled) resume(jobId, null);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-checks when the dialog is opened for a (possibly new) project, not on every render
+  }, [projectId]);
+
   async function autoSaveToGallery(name: string) {
     if (!projectId) return;
     setGallerySave("saving");
@@ -75,6 +100,36 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       // automatic copy-to-gallery step; the "Save / Share" button below still works as a fallback.
       setGallerySave("failed");
     }
+  }
+
+  // Shared by a fresh `startExport` success AND by recovering an export this dialog didn't itself
+  // start (see the mount effect above, and `begin`'s own 409 handling below) — either way, from this
+  // point on watching an in-flight job looks identical regardless of how its id was found.
+  function resume(jobId: string, knownFileName: string | null): void {
+    setError(null);
+    setPhase("running");
+    jobIdRef.current = jobId;
+    if (knownFileName) setFileName(knownFileName);
+
+    unwatchRef.current = watchExport(
+      jobId,
+      (update) => {
+        setProgress(update.progress);
+        setStatusMessage(update.message ?? null);
+        if (!knownFileName) setFileName(update.fileName);
+        if (update.status === "done") {
+          setPhase("done");
+          if (isNative) void autoSaveToGallery(update.fileName);
+        } else if (update.status === "failed") {
+          setPhase("failed");
+          setError(update.error ?? t("Export failed"));
+        } else if (update.status === "cancelled") setPhase("cancelled");
+      },
+      (message) => {
+        setPhase("failed");
+        setError(message);
+      }
+    );
   }
 
   async function begin() {
@@ -100,28 +155,19 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
       const exportProject = isFullRange ? project : trimProjectToRange(project, start, end);
 
       const started = await startExport(projectId, { ...exportProject, exportSettings: settings });
-      jobIdRef.current = started.jobId;
-      setFileName(started.fileName);
-
-      unwatchRef.current = watchExport(
-        started.jobId,
-        (update) => {
-          setProgress(update.progress);
-          setStatusMessage(update.message ?? null);
-          if (update.status === "done") {
-            setPhase("done");
-            if (isNative) void autoSaveToGallery(started.fileName);
-          } else if (update.status === "failed") {
-            setPhase("failed");
-            setError(update.error ?? t("Export failed"));
-          } else if (update.status === "cancelled") setPhase("cancelled");
-        },
-        (message) => {
-          setPhase("failed");
-          setError(message);
-        }
-      );
+      resume(started.jobId, started.fileName);
     } catch (err) {
+      // A 409 here means some OTHER dialog instance (or a since-lost one — see the mount effect's
+      // own comment) already has one running for this project — not a dead end, just a job this
+      // request lost the race to start. Recovering it is strictly better than surfacing the raw
+      // "already running" message with no way to act on it.
+      if (err instanceof ApiRequestError && err.code === "export-already-running") {
+        const jobId = await findRunningExport(projectId).catch(() => null);
+        if (jobId) {
+          resume(jobId, null);
+          return;
+        }
+      }
       setPhase("failed");
       setError(err instanceof Error ? err.message : String(err));
     }
