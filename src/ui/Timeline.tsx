@@ -110,6 +110,17 @@ export function Timeline() {
    *  `TransformHandles` already uses to track its canvas's live on-screen size. */
   const [scrollLeft, setScrollLeft] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(0);
+  /** Passed to every `TimelineClip` as `onPanScroll` — a touch-drag that starts on a clip but turns out
+   *  to be a plain swipe (see that component's own `gateBehindLongPress` handling) scrolls the SAME
+   *  container this way, by the same convention native panning would: dragging right (positive
+   *  `deltaX`) reveals content to the left, so `scrollLeft` moves the opposite direction. `useCallback`
+   *  with an empty dependency array keeps this reference-stable across renders — required for
+   *  `TimelineClip`'s own `React.memo` (see its doc comment) to keep skipping re-renders on every
+   *  scroll frame the way it already relies on every other prop here being stable. */
+  const panTimelineBy = useCallback((deltaX: number) => {
+    const el = scrollRef.current;
+    if (el) el.scrollLeft -= deltaX;
+  }, []);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -941,6 +952,8 @@ export function Timeline() {
                       assetName={assetNames.get(clip.assetId) ?? t("Missing media")}
                       resolveTrackAt={resolveTrackAt}
                       onTargetTrackChange={setDropTrackId}
+                      isMobile={isMobile}
+                      onPanScroll={panTimelineBy}
                     />
                   ))}
                   {recording && recording.trackId === track.id && (

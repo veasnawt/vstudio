@@ -34,6 +34,13 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState(0);
+  // The server's own sub-phase message for everything before FFmpeg exists to report real numeric
+  // progress (see `ExportProgress.message`'s own doc comment) — `null` once encoding starts, where
+  // the percentage below already says everything worth saying. Kept separate from `phase` (this
+  // component's OWN idle/running/done/failed/cancelled) rather than folding into it: this is a
+  // sub-state of "running" specifically, not a new top-level phase the rest of the UI needs to branch
+  // on.
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [available, setAvailable] = useState<boolean | null>(null);
@@ -74,6 +81,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     if (!project || !projectId) return;
     setError(null);
     setProgress(0);
+    setStatusMessage(t("Saving project…"));
     setPhase("running");
     setGallerySave("idle");
 
@@ -99,6 +107,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
         started.jobId,
         (update) => {
           setProgress(update.progress);
+          setStatusMessage(update.message ?? null);
           if (update.status === "done") {
             setPhase("done");
             if (isNative) void autoSaveToGallery(started.fileName);
@@ -242,14 +251,27 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
               <div className="mt-4">
                 <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
                   <div
+                    // `statusMessage` set means FFmpeg doesn't exist yet — `progress` is still 0 and
+                    // would otherwise render as an empty bar that never seems to move, exactly the
+                    // "is this stuck?" impression this whole change exists to fix. A full-width pulse
+                    // reads as "actively working, nothing to measure yet" instead, switching to the
+                    // real determinate width the moment `phase` reaches `encoding` and progress
+                    // becomes a meaningful number.
                     className={`h-full rounded-full transition-all ${
-                      phase === "failed" ? "bg-rose-400" : phase === "done" ? "bg-emerald-400" : "bg-sky-400"
+                      statusMessage
+                        ? "w-full animate-pulse bg-sky-400/50"
+                        : phase === "failed"
+                          ? "bg-rose-400"
+                          : phase === "done"
+                            ? "bg-emerald-400"
+                            : "bg-sky-400"
                     }`}
-                    style={{ width: `${Math.round((phase === "done" ? 1 : progress) * 100)}%` }}
+                    style={statusMessage ? undefined : { width: `${Math.round((phase === "done" ? 1 : progress) * 100)}%` }}
                   />
                 </div>
                 <p className="mt-2 text-[11px] text-white/60">
-                  {phase === "running" && t("Rendering… {percent}%", { percent: Math.round(progress * 100) })}
+                  {phase === "running" &&
+                    (statusMessage ?? t("Rendering… {percent}%", { percent: Math.round(progress * 100) }))}
                   {phase === "done" && t("Export complete")}
                   {phase === "cancelled" && t("Export cancelled")}
                   {phase === "failed" && <span className="text-rose-300">{error}</span>}

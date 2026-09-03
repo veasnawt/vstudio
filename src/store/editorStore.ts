@@ -6,7 +6,7 @@ import { AddCaptionsCommand, AddClipCommand, AddTrackCommand, DuplicateClipsComm
 import type { Language } from "../i18n/translations.ts";
 import { translateText } from "../i18n/translations.ts";
 import type { PlaybackEngine } from "../playback/PlaybackEngine.ts";
-import { createTextAsset, sequenceDuration } from "../project/createProject.ts";
+import { createColorAsset, createTextAsset, sequenceDuration } from "../project/createProject.ts";
 import type { Asset, Project } from "../project/types.ts";
 import type { ClipOverride } from "../timeline/groupMove.ts";
 import { defaultClipDuration, EditError, trackKindForAsset } from "../timeline/operations.ts";
@@ -137,6 +137,8 @@ export interface EditorState {
    *  media import and a sound-effect-library import are two independent operations a user could
    *  plausibly trigger at the same time). */
   importingSfx: boolean;
+  /** Same role as `importingSfx`, for the Inspector's "My LUTs" import button instead. */
+  importingLut: boolean;
 
   /** Which mobile-only bottom-row "sheet" is currently showing in place of Timeline — `null` means
    *  Timeline itself (the default, and the only state that ever applies at `lg`+, where these two
@@ -274,6 +276,22 @@ export interface EditorState {
    *  import already copied — see `CustomSfxAsset`'s own doc comment), only the reusable library entry
    *  itself. */
   removeSfx: (id: string) => Promise<void>;
+  /** Imports a `.cube` file into the project's own LUT library (`project.luts`) — same "not undo-able,
+   *  an import is more like an asset creation than a timeline edit" reasoning as `importSfx`, just
+   *  against a different library array. Errors surface via `setStatus`, matching `importSfx`'s own
+   *  failure handling. */
+  importLut: (file: File) => Promise<void>;
+  /** Removes one LUT library entry, cascading `lutId: undefined` across every clip that referenced it
+   *  — same "not undo-able" reasoning as `removeSfx`, but (unlike a removed SFX, which never touches a
+   *  placed clip at all) this genuinely can change how existing clips render, which is exactly why the
+   *  server does the cascade and hands back the fully-updated project rather than this just dropping
+   *  the library entry locally. */
+  removeLut: (id: string) => Promise<void>;
+  /** Creates a color-matte asset AND immediately places it as a clip at the playhead — same "Text in
+   *  the toolbar always lands the result somewhere visible" shape as `addTextAtPlayhead`, just on a
+   *  VIDEO track (a color matte is just a video-track clip whose source is a solid fill — see
+   *  `Asset.color`'s own doc comment) instead of a text one. */
+  addColorAtPlayhead: (color: string) => void;
   /** `avoidOverlap`: place at the playhead only if that spot is actually free, otherwise append after
    *  the track's own last clip instead of carving into whatever's already there — see
    *  `nonOverlappingStart`'s own comment for why a "quick add" caller (Text/Record) needs this and a
@@ -398,6 +416,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     language: readStoredLanguage(),
     importing: false,
     importingSfx: false,
+    importingLut: false,
     mobileSheet: null,
     previewCanvas: null,
 
@@ -735,12 +754,43 @@ export const useEditorStore = create<EditorState>((set, get) => {
       const sfx = project.customSfx.find((s) => s.id === id);
       if (!sfx) return;
       try {
-        await api.deleteCustomSfx(projectId, sfx);
-        const current = get().project;
-        if (current) applyProject({ ...current, customSfx: current.customSfx.filter((s) => s.id !== id) });
+        const updated = await api.deleteCustomSfx(projectId, sfx);
+        applyProject(updated);
         get().setStatus(translateText(get().language, "Removed {name}", { name: sfx.label }));
       } catch (err) {
         const message = err instanceof Error ? err.message : "Could not remove that sound effect";
+        get().setStatus(translateText(get().language, message), "error");
+      }
+    },
+
+    async importLut(file) {
+      const { projectId, project, importingLut } = get();
+      if (!projectId || !project || importingLut) return;
+      set({ importingLut: true });
+      try {
+        const lut = await api.importLut(projectId, file);
+        const current = get().project;
+        if (current) applyProject({ ...current, luts: [...current.luts, lut] });
+        get().setStatus(translateText(get().language, 'Added "{name}" to My LUTs', { name: lut.name }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not import that LUT";
+        get().setStatus(translateText(get().language, message), "error");
+      } finally {
+        set({ importingLut: false });
+      }
+    },
+
+    async removeLut(id) {
+      const { projectId, project } = get();
+      if (!projectId || !project) return;
+      const lut = project.luts.find((l) => l.id === id);
+      if (!lut) return;
+      try {
+        const updated = await api.deleteLut(projectId, id);
+        applyProject(updated);
+        get().setStatus(translateText(get().language, "Removed {name}", { name: lut.name }));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not remove that LUT";
         get().setStatus(translateText(get().language, message), "error");
       }
     },
@@ -859,6 +909,23 @@ export const useEditorStore = create<EditorState>((set, get) => {
         get().run(addTrack);
         get().addAssetAtPlayhead(assetId, addTrack.trackId, { avoidOverlap: true });
       }
+    },
+
+    addColorAtPlayhead(color) {
+      const current = get().project;
+      if (!current) return;
+      const asset = createColorAsset(color);
+      applyProject({ ...current, assets: [...current.assets, asset] });
+
+      const existingTrack = current.sequence.tracks.find((t) => t.kind === "video" && !t.locked);
+      if (existingTrack) {
+        get().addAssetAtPlayhead(asset.id, existingTrack.id, { avoidOverlap: true });
+      } else {
+        const addTrack = new AddTrackCommand("video");
+        get().run(addTrack);
+        get().addAssetAtPlayhead(asset.id, addTrack.trackId, { avoidOverlap: true });
+      }
+      get().setStatus(translateText(get().language, "Added background color"));
     },
 
     setStatus(message, tone = "info") {

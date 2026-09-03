@@ -160,10 +160,19 @@ export function CurveEditor({ grading, onPreview, onCommit }: Props) {
           </button>
         ))}
       </div>
+      {/* `max-w-[260px]` caps how big the graph grows — without it, `w-full` + `aspect-square` scales
+          the SVG (and so its HEIGHT too) directly with whatever width the Properties column happens to
+          have, which on a widened column pushed the graph tall enough to overflow the panel's own
+          visible height entirely (confirmed live: dragging the column wider grew the square well past
+          the bottom of the screen, nothing below it — LUT, Chroma Key, Details — reachable without first
+          narrowing the column back down). `mx-auto` centers it once the cap kicks in and the column is
+          wider than it, instead of leaving it stuck against the left edge. 260px matches the column's
+          own DEFAULT width (`VCutApp.tsx`'s `propertiesWidth` seed) — the size this graph already read
+          comfortably at before resizing existed, still the natural ceiling now that it can. */}
       <svg
         ref={svgRef}
         viewBox={`0 0 ${GRAPH_SIZE} ${GRAPH_SIZE}`}
-        className="aspect-square w-full touch-none select-none overflow-visible rounded bg-black/30"
+        className="mx-auto aspect-square w-full max-w-[260px] touch-none select-none overflow-visible rounded bg-black/30"
       >
         {/* Full-area click target for "add a point here" — `pointerEvents: all` makes even the fully
             transparent fill hit-testable, since the default SVG hit-testing rule only responds to

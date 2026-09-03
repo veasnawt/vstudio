@@ -80,6 +80,22 @@ interface Props {
   /** Reports the track a drag is currently over (null when it's the clip's own track) so the Timeline
    *  can highlight the destination. */
   onTargetTrackChange: (trackId: string | null) => void;
+  /** Below the `lg` breakpoint (see Timeline.tsx's own `isMobile`), matching everywhere else in this
+   *  app that already branches on it (`TrackHeader`, the timeline ruler, etc.). Two things depend on
+   *  it here: whether a plain touch-drag starting on this clip pans the timeline instead of moving the
+   *  clip (see `onPanScroll` below — desktop never gates a mouse-drag behind anything, so this only
+   *  matters for touch), and whether a tap/click even CAN open the mobile Properties sheet at all (see
+   *  `onDoubleClick`'s own comment) — there's no permanent Inspector column to already be showing it
+   *  once past `lg`, so opening one there would just be dead state nothing renders differently for. */
+  isMobile: boolean;
+  /** Scrolls the Timeline's own horizontal scroll container by `deltaX` CSS pixels — supplied by the
+   *  Timeline, which owns that container's ref. Called from a touch-drag that starts on this clip but
+   *  turns out to be a plain swipe (see `gateBehindLongPress` in `beginDrag`), so the timeline still
+   *  pans the same way it would from empty track space, even though `touch-action: none` on this
+   *  element's root (see its own className comment) means the browser's OWN native panning can never
+   *  reach it. Omitted entirely for trim-handle drags, which never gate behind a long press and so
+   *  never reach the code path that calls this. */
+  onPanScroll: (deltaX: number) => void;
 }
 
 /** Memoized below as `TimelineClip` — with every prop here either a primitive, a `useCallback`/
@@ -101,6 +117,8 @@ function TimelineClipComponent({
   assetName,
   resolveTrackAt,
   onTargetTrackChange,
+  isMobile,
+  onPanScroll,
 }: Props) {
   const t = useTranslation();
   const run = useEditorStore((s) => s.run);
@@ -191,7 +209,22 @@ function TimelineClipComponent({
   // command from there triggers "Cannot update a component while rendering a different component".
   // A ref is the correct place for a value that mouse handlers need to read imperatively.
   const previewRef = useRef<{ start: number; duration: number; sourceIn: number; sourceOut: number; snapped: boolean } | null>(null);
-  const dragRef = useRef<{ mode: DragMode; startX: number; origin: Clip; moved: boolean } | null>(null);
+  const dragRef = useRef<{
+    mode: DragMode;
+    startX: number;
+    origin: Clip;
+    moved: boolean;
+    /** True once a plain (not-yet-long-pressed) touch-drag has been reclassified as a timeline PAN
+     *  rather than a clip move — see `gateBehindLongPress`'s handling in `onMove` below. Once set, every
+     *  further `touchmove` in this same sequence keeps panning; it never flips back to a clip move
+     *  mid-gesture (matching how a real long-press-then-drag always begins from a dead stop, never from
+     *  a swipe already in flight). */
+    panning?: boolean;
+    /** The most recent panned-to X, so each `onMove` step can scroll by the INCREMENTAL delta since the
+     *  last frame rather than the total distance since `startX` (which `onPanScroll` would otherwise
+     *  re-apply cumulatively, one frame's worth on top of the last, snowballing far past the finger). */
+    lastPanX?: number;
+  } | null>(null);
   // Live feedback for an in-progress transition-duration drag (the amber handles at the edge of a
   // clip that already has a transition set) — same local-state-plus-ref-mirror split as `preview`
   // above and for the exact same reason: `beginTransitionDrag`'s mouse handlers run outside React and
@@ -358,18 +391,42 @@ function TimelineClipComponent({
       const drag = dragRef.current;
       if (!drag) return;
       const point = clientPoint(moveEvent);
+
+      // Already reclassified as a pan (below) — keep scrolling by the incremental delta and never
+      // re-evaluate as a clip move for the rest of this touch sequence.
+      if (drag.panning) {
+        onPanScroll(point.x - (drag.lastPanX ?? drag.startX));
+        drag.lastPanX = point.x;
+        return;
+      }
+
       const dx = point.x - drag.startX;
       const threshold = isTouch ? TOUCH_DRAG_THRESHOLD : DRAG_THRESHOLD;
       if (!drag.moved && Math.abs(dx) < threshold) return;
+
+      // A plain touch-drag on the clip BODY that moves before a long-press ever armed it: read as a
+      // swipe to PAN the timeline, not a request to move the clip — same gesture starting from empty
+      // track space would already scroll, and requiring a long-press first is what makes "move this
+      // clip" a deliberate act instead of something a fast swipe triggers by accident. `touch-action:
+      // none` on the root (see its own className comment) means the browser's own native panning can
+      // never take over here, so this drives the Timeline's scroll manually via `onPanScroll` instead —
+      // see that prop's own comment for why. Once armed (long-press already fired) or on mouse (never
+      // gated), movement always means "move the clip," exactly as before.
+      if (!drag.moved && gateBehindLongPress && !longPressFired) {
+        if (longPressTimer !== null) clearTimeout(longPressTimer);
+        longPressTimer = null;
+        drag.panning = true;
+        drag.lastPanX = point.x;
+        onPanScroll(dx);
+        return;
+      }
+
       // Real movement, whether this drag is touch- or mouse-driven: establish the selection right now
-      // and start tracking, exactly like a mouse press-and-drag always has. `touch-none` on the root
-      // element (see its own doc comment) already means this element owns 100% of its own touch
-      // sequence from the very first contact — there's no remaining "might still turn out to be a
-      // scroll" ambiguity left to defer for, so movement no longer waits on `LONG_PRESS_MS` at all;
-      // that timer's only remaining job (`armLongPress`) is the separate "held still with no movement
-      // at all = toggle selection" gesture, which this movement means didn't happen and hence pending
-      // is now moot — clearing it here is what makes `armLongPress`'s own `longPressFired` guard a
-      // harmless no-op if the timer still happens to fire microseconds later.
+      // and start tracking, exactly like a mouse press-and-drag always has. That timer's only remaining
+      // job (`armLongPress`) is the separate "held still with no movement at all = toggle selection"
+      // gesture, which this movement means didn't happen and hence pending is now moot — clearing it
+      // here is what makes `armLongPress`'s own `longPressFired` guard a harmless no-op if the timer
+      // still happens to fire microseconds later.
       if (!drag.moved && !longPressFired) {
         if (longPressTimer !== null) clearTimeout(longPressTimer);
         longPressTimer = null;
@@ -632,36 +689,39 @@ function TimelineClipComponent({
       }}
       // Mouse-only — fires natively and reliably for a real double-click, unlike touch (see
       // `DOUBLE_TAP_MS`'s own comment for that gesture's separate, manually-tracked equivalent in
-      // `onUp` above). Harmless to call unconditionally on every breakpoint: `mobileSheet` only has a
-      // visible effect below `lg`, where opening Properties on a double-click is genuinely useful (no
-      // permanent Inspector column there to already be showing it) — at `lg`+ this just sets a piece of
-      // state nothing renders differently for.
-      onDoubleClick={() => useEditorStore.getState().setMobileSheet("inspector")}
+      // `onUp` above). Gated on `isMobile`: opening Properties on a double-click is a mobile-only
+      // affordance, standing in for the permanent Inspector column desktop (and the Electron-embedded
+      // "webview desktop" case, which resolves to the same `lg`-breakpoint `isMobile` check everywhere
+      // else in this app) already shows at all times — a double-click there has Properties already
+      // visible, so popping the mobile sheet on top of it would just be a confusing, redundant no-op
+      // gesture. Reported directly: a desktop/webview double-click was doing this unconditionally.
+      onDoubleClick={() => {
+        if (isMobile) useEditorStore.getState().setMobileSheet("inspector");
+      }}
       style={{
         left: start * pixelsPerSecond,
         width: Math.max(2, duration * pixelsPerSecond),
       }}
       // `touch-none`, UNCONDITIONALLY, same as the trim handles below and the ruler's own touch-none
-      // in Timeline.tsx — deliberately NOT deferred (an earlier version of this left `touch-action` at
-      // its permissive default until a long-press armed, via a direct style mutation on the clip's own
-      // root element, so a swipe starting on a clip could still become a native pan of the timeline
-      // underneath it). That
-      // turned out to be a real, reported bug, not just an edge case: `touch-action` is a scroll-vs-not
-      // decision browsers commit to per-gesture right at `touchstart`/the first `touchmove`, evaluated
-      // BEFORE any JS runs — flipping it to `none` later, once our own long-press logic decides this
-      // IS a drag, does not retroactively cancel a native scroll the browser already started under the
-      // earlier permissive value. In practice: the timeline itself would pan out from under a clip the
+      // in Timeline.tsx — deliberately NOT left at the permissive default and deferred to the browser's
+      // own native panning. `touch-action` is a scroll-vs-not decision browsers commit to per-gesture
+      // right at `touchstart`/the first `touchmove`, evaluated BEFORE any JS runs — flipping it to
+      // `none` later, once our own long-press logic decides a gesture IS a drag, does not retroactively
+      // cancel a native scroll the browser already started under an earlier permissive value. An
+      // earlier version relied on exactly that (permissive by default, `none` set imperatively once
+      // armed) and hit a real, reported bug: the timeline itself would pan out from under a clip the
       // user was trying to pick up, and since every clip's own screen position is relative to that same
       // scrolled container, ALL of them (this one included) would visibly shift — reported directly as
       // "the clip changes position when I hold it" and "the timeline moves when I just want to move the
-      // clip." Locking `touch-action` down from the very first touch is what makes that impossible:
-      // this element now handles 100% of its own touch sequence, so a real drag tracks the finger
-      // exactly (see `onMove` below, which no longer needs to guess whether a gesture might still turn
-      // into a scroll) and can never leak into moving the timeline out from under itself. The one
-      // gesture this gives up — swiping to PAN the timeline by starting the swipe ON TOP OF a clip — is
-      // still reachable from any empty track space or the ruler; a packed track can lose some of that
-      // convenience, but never at the cost of a clip drag being reliable, which is the more common and
-      // more important of the two on a timeline with any real content. select-none +
+      // clip." Locking `touch-action` down from the very first touch is what makes that impossible: this
+      // element now handles 100% of its own touch sequence, so a real drag tracks the finger exactly and
+      // native panning can never leak into moving the timeline out from under itself. That still leaves
+      // swiping-to-PAN-by-starting-on-a-clip as something users reasonably expect to work (also reported
+      // directly) — `onMove`'s own `gateBehindLongPress` branch is what restores it WITHOUT reopening
+      // the native-panning race above: a plain touch-drag that moves before any long-press armed it is
+      // reclassified as a pan and scrolled manually via `onPanScroll`, entirely in JS, while a drag that
+      // starts only once a long-press has already armed it (a deliberate "pick this clip up" gesture)
+      // still moves the clip immediately, exactly as before. select-none +
       // [-webkit-touch-callout:none] are a SEPARATE fix for a separate browser behavior: they stop the
       // label text (and, for a text clip, its own content name) from being eligible for the browser's
       // own long-press-to-select-text gesture, which used to fire at the same time as the long-press-

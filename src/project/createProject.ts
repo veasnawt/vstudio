@@ -1,4 +1,4 @@
-import type { Asset, Clip, Project, Sequence, TextStyle, Track, TrackKind } from "./types.ts";
+import type { Asset, Clip, LutAsset, Project, Sequence, TextStyle, Track, TrackKind } from "./types.ts";
 import { DEFAULT_TEXT_STYLE, PROJECT_SCHEMA_VERSION, SHORT_PRESET } from "./types.ts";
 
 /** `crypto.randomUUID` is gated to secure contexts (HTTPS, or literally `localhost`) — a plain LAN
@@ -62,6 +62,25 @@ export function createTextAsset(content = "Text", style: TextStyle = DEFAULT_TEX
   };
 }
 
+/** A color-matte asset has no backing file either — same "authored directly, not imported" shape as
+ *  `createTextAsset` (`relPath` empty, `hasAudio` false, `duration` 0), just a solid hex fill instead of
+ *  a text string. See `Asset.color`'s own doc comment for how the preview/export renderers treat it as
+ *  a video-track clip whose "source" is a flat fill. */
+export function createColorAsset(color: string): Asset {
+  const now = Date.now();
+  return {
+    id: newId("clr"),
+    kind: "color",
+    name: color,
+    relPath: "",
+    duration: 0,
+    hasAudio: false,
+    sizeBytes: 0,
+    importedAt: now,
+    color,
+  };
+}
+
 export function createClip(params: {
   assetId: string;
   sourceIn: number;
@@ -118,6 +137,10 @@ export function findAsset(project: Project, assetId: string): Asset | undefined 
 
 export function findTrack(project: Project, trackId: string): Track | undefined {
   return project.sequence.tracks.find((t) => t.id === trackId);
+}
+
+export function findLut(project: Project, lutId: string): LutAsset | undefined {
+  return project.luts.find((l) => l.id === lutId);
 }
 
 /** Locates a clip without the caller needing to know which track holds it — most edit operations

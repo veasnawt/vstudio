@@ -43,7 +43,7 @@ function ControlButton({
   );
 }
 
-export function Preview() {
+export function Preview({ onResizeStart }: { onResizeStart: (e: React.MouseEvent | React.TouchEvent) => void }) {
   // A ref alone can't tell TransformHandles when the canvas becomes available (setting `.current`
   // doesn't trigger a re-render), so the canvas element lives in state — read directly by both the
   // engine-attach effect below and passed straight through as a prop.
@@ -294,17 +294,41 @@ export function Preview() {
         </div>
       </div>
 
-      {/* This bar sits flush against the row's bottom edge, the exact same spot the Preview/Timeline
-          resize divider (VCutApp.tsx, z-20) is positioned to be grabbable from. `pointer-events-none`
-          on the bar itself, re-enabled (`pointer-events-auto` + `z-30` to actually win the stacking
-          fight, `pointer-events-auto` alone isn't enough — it only makes an element ELIGIBLE to
-          receive events, the topmost-at-that-point element still wins the hit-test) on just the button
-          cluster below — NOT a z-index promotion on this WHOLE bar, which would win against the
-          divider across its full width, including all the empty space on either side of the centered
-          buttons (most of it, at typical widths), leaving the divider ungrabbable anywhere under the
-          middle (Preview) column and reachable only under Media/Inspector where nothing else overlaps
-          it — exactly the bug this replaced. */}
-      <div className="pointer-events-none relative flex items-center border-t border-white/10 px-3 py-2">
+      {/* Resize handle — sits in its own thin row between the canvas and the transport bar, centered
+          on the Play button directly below it (same X). Drags the shared Preview/Timeline boundary
+          (`VCutApp.tsx`'s own `timelineHeight`/`beginTimelineResize`, passed down as `onResizeStart`).
+          Earlier this lived as an absolutely-positioned strip sitting ASTRIDE that boundary instead —
+          centering a handle there landed it right under this same transport bar's own Play button
+          (z-30, real buttons win a hit-test the strip's z-20 never could there), so it was only ever
+          grabbable off to the side, with no visual cue showing where. Living here, in normal flow,
+          between the canvas and the controls, sidesteps that entirely — nothing else is ever laid out
+          in this row, so there's no z-index fight left to have, and centering is simply safe. */}
+      <div className="flex shrink-0 justify-center py-1">
+        <button
+          type="button"
+          onMouseDown={onResizeStart}
+          onTouchStart={onResizeStart}
+          aria-label={t("Resize timeline")}
+          title={t("Drag to resize")}
+          className="group flex cursor-row-resize touch-none items-center rounded-full p-2 transition-colors hover:bg-white/5"
+        >
+          <span className="block h-1 w-10 rounded-full bg-white/25 transition-colors group-hover:bg-white/50 group-active:bg-sky-400/90" />
+        </button>
+      </div>
+
+      {/* A real 3-column grid (`1fr auto 1fr`), not absolute-positioned centering — the CENTER column's
+          `auto` track always gets exactly the room its own content needs, and the two `1fr` side
+          columns split whatever's left EQUALLY, so neither one's content can ever be laid out on top of
+          the center cluster. The old approach (center absolutely positioned at the bar's own literal
+          midpoint, undo/redo pinned left, zoom/fullscreen pushed right via `ml-auto`) looked identical
+          at desktop widths — plenty of slack on both sides — but had no mechanism keeping any group
+          out of another's way once the bar got narrow: confirmed live at 360–375px (an ordinary phone
+          width, not an edge case) the zoom-out button and the "Go to end" button ended up rendering on
+          top of each other, un-tappable as separate targets. Grid tracks reserve real, non-overlapping
+          space for each column instead, so the worst a too-narrow bar can do now is overflow at the
+          edges (mitigated below by shedding the zoom stepper buttons there), never silently merge two
+          controls into one. */}
+      <div className="pointer-events-none grid grid-cols-[1fr_auto_1fr] items-center border-t border-white/10 px-3 py-2">
         {/* Undo/redo sit together at the row's left edge — moved here from the bottom toolbar so they
             sit directly next to the controls they most often follow (undo a trim, immediately hit
             play to check it), and so that already-crowded icon-only row (see its own comment on
@@ -312,7 +336,7 @@ export function Preview() {
             the row) — undo/redo are one conceptual control, and reaching for one right after the
             other is the whole point of the shortcut; splitting them across the bar just made that a
             wider mouse trip for no benefit. */}
-        <div className="pointer-events-auto z-30 flex items-center gap-1">
+        <div className="pointer-events-auto z-30 flex items-center gap-1 justify-self-start">
           <ControlButton onClick={undo} label={t("Undo (Ctrl+Z)")} disabled={!canUndo}>
             <Undo size={16} />
           </ControlButton>
@@ -321,10 +345,9 @@ export function Preview() {
           </ControlButton>
         </div>
 
-        {/* Absolutely positioned and centered on the BAR, not just on the leftover space between the
-            undo/redo buttons — a plain flex row would only visually center if both sides happened to
-            be the same width, which is the left/right-hugging look this fixes. */}
-        <div className="pointer-events-auto absolute left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
+        {/* The grid's own CENTER column — genuinely centered by construction (it's the `auto` track
+            between two equal `1fr` tracks), not by measuring the bar's own width against this group's. */}
+        <div className="pointer-events-auto z-30 flex items-center gap-1.5 justify-self-center">
           <ControlButton onClick={() => setPlayhead(0)} label={t("Go to start")} disabled={empty}>
             <SkipBack size={16} />
           </ControlButton>
@@ -342,15 +365,18 @@ export function Preview() {
           </ControlButton>
         </div>
 
-        {/* `ml-auto` on this WRAPPER (not the resolution readout itself) so fullscreen stays pushed to
-            the right and reachable at every width, even below `xl` where the readout goes `hidden` —
-            see that span's own comment for why it specifically is hidden there. */}
-        <div className="pointer-events-auto z-30 ml-auto flex items-center gap-2">
+        <div className="pointer-events-auto z-30 flex items-center justify-end gap-2 justify-self-end">
           {/* Preview canvas zoom — OUT only (never past "Fit"), independent of any clip's own
               Transform scale/fontSize. Same button style/convention as Timeline's own zoom cluster
               (`Timeline.tsx`), including the "click the readout to reset" affordance — deliberately
-              NOT the same Ctrl/Cmd +/- shortcut, which is already globally bound to Timeline zoom. */}
-          <div className="flex items-center gap-0.5">
+              NOT the same Ctrl/Cmd +/- shortcut, which is already globally bound to Timeline zoom.
+              The step buttons (−/+) are `sm:flex hidden` — below `sm` (640px) there isn't room for a
+              full 3-button zoom cluster AND undo/redo AND all five playback buttons without overflowing
+              (measured: ~380px of minimum content width against a 360–375px real phone viewport), so
+              the least essential two (tapping "Fit" itself already resets zoom, which covers the
+              overwhelmingly common case) drop first — the readout stays so zoom is still visible, just
+              not steppable a tap at a time, below that width. */}
+          <div className="hidden items-center gap-0.5 sm:flex">
             <button
               onClick={() => setPreviewZoom((z) => Math.max(0.25, z / 1.25))}
               aria-label={t("Zoom preview out")}
@@ -377,6 +403,14 @@ export function Preview() {
               +
             </button>
           </div>
+          <button
+            onClick={() => setPreviewZoom(1)}
+            aria-label={t("Reset preview zoom")}
+            title={t("Reset preview zoom")}
+            className="min-h-[26px] min-w-[3.5ch] rounded px-1 text-center font-mono text-[11px] tabular-nums text-white/45 transition hover:bg-white/10 hover:text-white sm:hidden"
+          >
+            {previewZoom === 1 ? t("Fit") : `${Math.round(previewZoom * 100)}%`}
+          </button>
           {/* Hidden below `xl`, not `lg` — this bar is the PREVIEW column's own width, not the whole
               viewport, and at `lg` (1024px) that column is only ~1024 − 240 − 260 ≈ 520px after Media
               and Inspector take their fixed share: not enough room next to the centered playback

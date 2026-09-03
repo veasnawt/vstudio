@@ -1,6 +1,6 @@
 import { Capacitor } from "@capacitor/core";
 import { deserializeProject } from "../project/serialize.ts";
-import type { Asset, CustomSfxAsset, Project } from "../project/types.ts";
+import type { Asset, CustomFontAsset, CustomSfxAsset, LutAsset, Project } from "../project/types.ts";
 import { nativeCancelExport, nativeExportAvailable, nativeStartExport, nativeWatchExport } from "./nativeExport.ts";
 import { nativeDeleteMedia, nativeImportMedia, nativeLoadProject, nativeMediaUrl, nativeSaveProject } from "./nativeStorage.ts";
 
@@ -130,9 +130,13 @@ export function exportUrl(projectId: string, fileName: string): string {
  *  served as a plain static asset, not project-scoped the way `mediaUrl` is: a bundled sound effect
  *  isn't stored per-project, it ships with the app the same way a bundled font's `.ttf` does (see
  *  `fonts.ts`'s own `resolveFontVariant` doc comment for the matching "packages/vcut/assets/" bundled-
- *  file convention this mirrors, one directory over — `packages/vcut/assets/sfx/`). */
+ *  file convention this mirrors, one directory over — `packages/vcut/assets/sfx/`).
+ *
+ *  Routed through `sfx/[file]/route.ts` (`_lib/sfx.ts`'s `sfxAssetPath`), same as every other bundled
+ *  asset this app serves via its own API route rather than Next's `public/` static folder — there's
+ *  no `studios/vcut/public/sfx/` directory for a bare `/sfx/${file}` to ever resolve against. */
 export function sfxAssetUrl(file: string): string {
-  return `/sfx/${file}`;
+  return `${BASE}/sfx/${file}`;
 }
 
 /** URL for one entry in the project's own "My Sounds" library (`project.customSfx`) — reuses
@@ -140,7 +144,7 @@ export function sfxAssetUrl(file: string): string {
  *  `CustomSfxAsset` lives in the SAME project media tree, just not itself placed on the timeline (see
  *  `CustomSfxAsset`'s own doc comment for why it's a separate library, not a plain `Asset`). */
 export function customSfxUrl(projectId: string, sfx: CustomSfxAsset): string {
-  return mediaUrl(projectId, sfx.relPath);
+  return `${mediaUrl(projectId, sfx.relPath)}&kind=customSfx`;
 }
 
 /** Imports a file into the project's own "My Sounds" library — same `FormData` upload shape as
@@ -161,11 +165,82 @@ export async function importCustomSfx(projectId: string, file: File): Promise<Cu
   return body.sfx;
 }
 
-/** Removes one "My Sounds" library entry — same `relPath`-keyed delete shape as `deleteMedia`. */
-export async function deleteCustomSfx(projectId: string, sfx: CustomSfxAsset): Promise<void> {
+/** Removes one "My Sounds" library entry — `sfxId`-keyed, matching `sfx/route.ts`'s own `DELETE`
+ *  handler exactly (it looks the entry up by id to find its own `relPath` server-side, the same
+ *  "id in, full updated project back out" shape `deleteLut` uses). */
+export async function deleteCustomSfx(projectId: string, sfx: CustomSfxAsset): Promise<Project> {
+  // Unreachable in practice today — `importCustomSfx` already refuses on native, so there's never a
+  // "My Sounds" entry to remove there — but throws rather than silently no-opping for the same
+  // "surface the real reason, don't pretend it worked" consistency `importLut`/`importCustomFont` give.
+  if (isNative) throw new ApiRequestError("Removing sound effects isn't available on this device yet.", 501, "sfx-unavailable");
+  const params = new URLSearchParams({ projectId, sfxId: sfx.id });
+  const body = await unwrap<{ project: Project }>(await fetch(`${BASE}/sfx?${params}`, { method: "DELETE" }));
+  return body.project;
+}
+
+/** URL for one entry in the project's own LUT library (`project.luts`) — a fetchable `.cube` text file,
+ *  same `media/raw`-route-with-a-`kind`-tag shape `thumbnailUrl`/`filmstripUrl` already use, just
+ *  `kind=lut` instead of `kind=thumbnail` (see that route's own `CONTENT_TYPES`/`baseDir` comment for
+ *  why `.cube` is served through this same generic route rather than a dedicated one). Read by
+ *  `PlaybackEngine.lutUrlFor` (live preview) — export never fetches this URL at all, it hands FFmpeg
+ *  the LUT's real on-disk path directly (`export/lutFilter.ts`). */
+export function lutUrl(projectId: string, lut: LutAsset): string {
+  return `${mediaUrl(projectId, lut.relPath)}&kind=lut`;
+}
+
+/** Imports a `.cube` file into the project's own LUT library — same `FormData` upload shape as
+ *  `importCustomSfx`, against `lut/route.ts` instead. No native branch yet, same v1 scope cut. */
+export async function importLut(projectId: string, file: File): Promise<LutAsset> {
+  if (isNative) throw new ApiRequestError("Importing LUTs isn't available on this device yet.", 501, "lut-unavailable");
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${BASE}/lut?projectId=${encodeURIComponent(projectId)}`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await unwrap<{ lut: LutAsset }>(response);
+  return body.lut;
+}
+
+/** Removes a LUT from the project's library and cascades the clear across every clip that referenced it
+ *  — `lut/route.ts`'s own `DELETE` does the cascade server-side and hands back the fully-updated
+ *  project, so the caller swaps it straight in rather than reconciling clip-level `lutId`s itself. */
+export async function deleteLut(projectId: string, lutId: string): Promise<Project> {
+  if (isNative) throw new ApiRequestError("Removing LUTs isn't available on this device yet.", 501, "lut-unavailable");
+  const params = new URLSearchParams({ projectId, lutId });
+  const body = await unwrap<{ project: Project }>(await fetch(`${BASE}/lut?${params}`, { method: "DELETE" }));
+  return body.project;
+}
+
+/** URL for one entry in the project's own custom-font library (`project.customFonts`) — same
+ *  `kind`-tagged `media/raw` shape as `lutUrl`, just `kind=customFont`. Fetched by
+ *  `registerCustomFont` (`project/fonts.ts`) to construct the real `FontFace` a bundled font's static
+ *  `@font-face` rule already gives it for free. */
+export function customFontUrl(projectId: string, font: CustomFontAsset): string {
+  return `${mediaUrl(projectId, font.relPath)}&kind=customFont`;
+}
+
+/** Imports a `.ttf`/`.otf` file into the project's own custom-font library — same shape as
+ *  `importCustomSfx`, against `fonts/route.ts` instead. */
+export async function importCustomFont(projectId: string, file: File): Promise<CustomFontAsset> {
+  if (isNative) throw new ApiRequestError("Importing fonts isn't available on this device yet.", 501, "font-unavailable");
+  const form = new FormData();
+  form.append("file", file);
+  const response = await fetch(`${BASE}/fonts?projectId=${encodeURIComponent(projectId)}`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await unwrap<{ font: CustomFontAsset }>(response);
+  return body.font;
+}
+
+/** Removes one custom-font library entry — same `id`-keyed delete shape `fonts/route.ts`'s own
+ *  `DELETE` expects (a custom font needs no clip-level cascade — see that route's own doc comment for
+ *  why `fontById`'s existing fallback already covers it). */
+export async function deleteCustomFont(projectId: string, font: CustomFontAsset): Promise<void> {
   if (isNative) return;
-  const params = new URLSearchParams({ projectId, relPath: sfx.relPath });
-  await unwrap<{ ok: boolean }>(await fetch(`${BASE}/sfx?${params}`, { method: "DELETE" }));
+  const params = new URLSearchParams({ projectId, fontId: font.id });
+  await unwrap<{ ok: boolean }>(await fetch(`${BASE}/fonts?${params}`, { method: "DELETE" }));
 }
 
 export interface ExportStarted {
@@ -176,6 +251,13 @@ export interface ExportStarted {
 
 export interface ExportProgress {
   status: "running" | "done" | "failed" | "cancelled";
+  /** `preparing`/`rendering-text` cover everything before FFmpeg exists to report a real `progress`
+   *  fraction (the Khmer pre-pass's own browser launch and per-clip text rendering) — `message` is a
+   *  human-readable status for exactly those two phases; `encoding` is everything after, where
+   *  `progress` is the meaningful number. Optional (native mobile export has no such pre-pass phase
+   *  at all — see `nativeExport.ts` — so its own progress payloads never set this). */
+  phase?: "preparing" | "rendering-text" | "encoding";
+  message?: string;
   progress: number;
   fileName: string;
   error?: string;
@@ -220,12 +302,23 @@ export function watchExport(
   };
 
   source.onerror = () => {
-    // EventSource fires this both for a genuine failure and for the normal close at end-of-stream,
-    // so it's only a real error while the connection was still meant to be open.
-    if (source.readyState !== EventSource.CLOSED) {
+    // `readyState` tells apart two very differently-shaped situations `onerror` fires for, and only
+    // one of them is a real failure. `CONNECTING` means the browser's own EventSource just lost the
+    // connection and is ALREADY retrying it on its own (the platform-standard behavior — no code here
+    // makes that happen) — exactly what a plain network blip, a proxy/browser recycling a
+    // long-idle-looking connection, or a laptop waking from sleep looks like, and utterly routine for
+    // an export that runs several minutes. `CLOSED` means the browser gave up retrying for good
+    // (a non-2xx response, e.g. the 404 `job-missing` the route throws once a finished job's own
+    // cleanup timer removes it, or the dev server restarting mid-export) — that one really is over.
+    // Calling `close()` unconditionally here (an earlier version of this did) used to treat the FIRST
+    // case as fatal too, tearing down the very retry already in flight and orphaning the UI from a
+    // job that was still running server-side the whole time. Confirmed as the actual cause of exports
+    // reported as silently "not working": a 60fps/High-quality render can run many minutes longer
+    // than the defaults, which doesn't break anything about FFmpeg — it just keeps the connection
+    // open long enough to hit an ordinary drop before finishing, which the defaults rarely do.
+    if (source.readyState === EventSource.CLOSED) {
       onError("Lost contact with the export. It may still be running.");
     }
-    source.close();
   };
 
   return () => source.close();
@@ -315,10 +408,12 @@ export function watchInpaint(
   };
 
   source.onerror = () => {
-    if (source.readyState !== EventSource.CLOSED) {
+    // See `watchExport`'s own comment on this exact check — `CONNECTING` means EventSource is
+    // already retrying a dropped connection on its own (routine for a job that runs any real
+    // length of time); only `CLOSED` means the browser gave up for good.
+    if (source.readyState === EventSource.CLOSED) {
       onError("Lost contact with the job. It may still be running.");
     }
-    source.close();
   };
 
   return () => source.close();
@@ -435,10 +530,11 @@ export function watchLocalSetup(
   };
 
   source.onerror = () => {
-    if (source.readyState !== EventSource.CLOSED) {
+    // See `watchExport`'s own comment on this exact check — `CONNECTING` means EventSource is
+    // already retrying a dropped connection on its own; only `CLOSED` means it gave up for good.
+    if (source.readyState === EventSource.CLOSED) {
       onError("Lost contact with the setup job. It may still be running.");
     }
-    source.close();
   };
 
   return () => source.close();

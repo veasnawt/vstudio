@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { ChevronDown, Close } from "@veasnawt/vicons";
+import { ChevronDown, Close, Delete, Upload } from "@veasnawt/vicons";
 import {
   cancelCaptions,
   cancelInpaint,
@@ -28,6 +28,7 @@ import {
   SetClipEffectsCommand,
   SetClipEffectsKeyframesCommand,
   SetClipGainCommand,
+  SetClipLutCommand,
   SetClipMutedCommand,
   SetClipTextAnimationCommand,
   SetClipTextCropCommand,
@@ -750,6 +751,10 @@ export function Inspector() {
   const projectId = useEditorStore((s) => s.projectId);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const run = useEditorStore((s) => s.run);
+  const importLut = useEditorStore((s) => s.importLut);
+  const removeLut = useEditorStore((s) => s.removeLut);
+  const importingLut = useEditorStore((s) => s.importingLut);
+  const lutImportInputRef = useRef<HTMLInputElement>(null);
 
   // Exactly one clip, not just "at least one" — `selectedClipIds[0]` alone would still resolve to a
   // real clip during a genuine multi-select (both/all of them normally still exist in the project), so
@@ -1881,6 +1886,68 @@ export function Inspector() {
                         </>
                       );
                     })()}
+                  </CollapsibleSection>
+                )}
+
+                {/* Same video/image-only scope as Transform/Effects/Color Grading above — see
+                    `Clip.lutId`'s own doc comment. Applied AFTER color grading (both preview and
+                    export chain curves then the LUT onto the same already-graded pixels), so this
+                    sits right below the Color Grading section it composes with. No `KeyframeTrack`
+                    here — a LUT is a fixed, discrete choice from the project's own library, not a
+                    continuously-adjustable dial the way a curve point is. */}
+                {activeTab === "transform" && track.kind === "video" && (
+                  <CollapsibleSection
+                    title={t("LUT")}
+                    accent="bg-teal-400"
+                    open={!collapsed.has("LUT")}
+                    onToggle={() => toggleSection("LUT")}
+                  >
+                    {project!.luts.length === 0 ? (
+                      <p className="py-1.5 text-[12px] text-white/40">{t("No LUTs imported yet")}</p>
+                    ) : (
+                      <ul className="space-y-0.5">
+                        {project!.luts.map((lut) => (
+                          <li key={lut.id} className="flex items-center gap-2 rounded-md py-1 hover:bg-white/5">
+                            <button
+                              onClick={() => run(new SetClipLutCommand(clip.id, clip.lutId === lut.id ? null : lut.id))}
+                              className={`min-w-0 flex-1 truncate rounded px-1.5 py-1 text-left text-[12px] transition ${
+                                clip.lutId === lut.id ? "bg-sky-500/20 text-white" : "text-white/60 hover:text-white"
+                              }`}
+                            >
+                              {lut.name}
+                            </button>
+                            <button
+                              onClick={() => void removeLut(lut.id)}
+                              aria-label={t("Remove")}
+                              title={t("Remove")}
+                              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-white/40 transition hover:bg-red-500/20 hover:text-red-300"
+                            >
+                              <Delete size={12} />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    <button
+                      onClick={() => lutImportInputRef.current?.click()}
+                      disabled={importingLut}
+                      className="mt-2.5 flex w-full items-center justify-center gap-1.5 rounded bg-white/5 py-1.5 text-[12px] text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-default disabled:opacity-50"
+                    >
+                      <Upload size={13} />
+                      {importingLut ? t("Importing…") : t("Import LUT…")}
+                    </button>
+                    <input
+                      ref={lutImportInputRef}
+                      type="file"
+                      accept=".cube"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (!file) return;
+                        await importLut(file);
+                      }}
+                    />
                   </CollapsibleSection>
                 )}
 

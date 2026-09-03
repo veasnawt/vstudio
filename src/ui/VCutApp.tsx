@@ -2,25 +2,49 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ArrowLeft, ClosedCaption, Copy, Delete, Document, Save, Settings, Split, Text, Transition, Video, Volume } from "@veasnawt/vicons";
+import {
+  Ai,
+  ArrowLeft,
+  Art,
+  ClosedCaption,
+  Copy,
+  Delete,
+  Document,
+  Filter,
+  Gauge,
+  Headphone,
+  Save,
+  Settings,
+  Split,
+  Text,
+  Transition,
+  Video,
+  Volume,
+} from "@veasnawt/vicons";
 import { reportError } from "../api/crashLog.ts";
 import { DeleteClipsCommand, SetClipTransitionCommand, SetClipTransitionOutCommand, SplitClipCommand } from "../commands/index.ts";
 import { translateText } from "../i18n/translations.ts";
 import { useTranslation } from "../i18n/useTranslation.ts";
-import { findClip } from "../project/createProject.ts";
+import { findAsset, findClip } from "../project/createProject.ts";
 import { preloadAllFonts } from "../project/fonts.ts";
 import { flushPendingSave, useEditorStore } from "../store/editorStore.ts";
 import { clipAtTime } from "../timeline/queries.ts";
 import { DEFAULT_TRANSITION } from "../timeline/transitions.ts";
 import { AutoCaptionsDialog } from "./AutoCaptionsDialog.tsx";
+import { ColorPickerMenu } from "./ColorPickerMenu.tsx";
+import { EffectsPickerMenu } from "./EffectsPickerMenu.tsx";
 import { ErrorBoundary } from "./ErrorBoundary.tsx";
 import { ExportDialog } from "./ExportDialog.tsx";
 import { TextToClipsDialog } from "./TextToClipsDialog.tsx";
 import { Inspector } from "./Inspector.tsx";
 import { MediaLibrary } from "./MediaLibrary.tsx";
+import { FloatablePanel, type FloatRect } from "./FloatablePanel.tsx";
 import { MixerPanel } from "./MixerPanel.tsx";
+import { PixelEffectPickerMenu } from "./PixelEffectPickerMenu.tsx";
 import { addDragListeners, clientPoint, preventDefaultIfMouse } from "./pointerEvents.ts";
 import { Preview } from "./Preview.tsx";
+import { ScopesPanel } from "./ScopesPanel.tsx";
+import { SfxPanel } from "./SfxPanel.tsx";
 import { Timeline } from "./Timeline.tsx";
 import { TransitionPickerMenu } from "./TransitionPickerMenu.tsx";
 import { VoiceoverRecorder } from "./VoiceoverRecorder.tsx";
@@ -157,24 +181,45 @@ function StatusBar({
   setMobileSheet,
   bottomPanel,
   setBottomPanel,
+  floatingPanel,
+  onDockFloating,
 }: {
   mobileSheet: "media" | "inspector" | null;
   setMobileSheet: (next: "media" | "inspector" | null) => void;
-  bottomPanel: "timeline" | "mixer";
-  setBottomPanel: (next: "timeline" | "mixer") => void;
+  bottomPanel: "timeline" | "mixer" | "scopes";
+  setBottomPanel: (next: "timeline" | "mixer" | "scopes") => void;
+  /** Which of Mixer/Scopes (if either) is currently popped out into its own floating window — see
+   *  `VCutApp.tsx`'s own `floatState` comment. Drives these two buttons' `active` look (a floating
+   *  panel still reads as "open", just not docked) and what tapping one while it's floating does. */
+  floatingPanel: "mixer" | "scopes" | null;
+  onDockFloating: () => void;
 }) {
   const setStatus = useEditorStore((s) => s.setStatus);
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const run = useEditorStore((s) => s.run);
   const save = useEditorStore((s) => s.save);
   const addTextAtPlayhead = useEditorStore((s) => s.addTextAtPlayhead);
+  const addColorAtPlayhead = useEditorStore((s) => s.addColorAtPlayhead);
   const duplicateSelectedClips = useEditorStore((s) => s.duplicateSelectedClips);
   const project = useEditorStore((s) => s.project);
+  const projectId = useEditorStore((s) => s.projectId);
   const t = useTranslation();
   const [showCaptions, setShowCaptions] = useState(false);
   const [showTextImport, setShowTextImport] = useState(false);
   const [showTransitionMenu, setShowTransitionMenu] = useState(false);
+  const [showColorMenu, setShowColorMenu] = useState(false);
+  const [showEffectsMenu, setShowEffectsMenu] = useState(false);
+  const [showPixelEffectMenu, setShowPixelEffectMenu] = useState(false);
+  const [showSfx, setShowSfx] = useState(false);
   const transitionButtonRef = useRef<HTMLButtonElement>(null);
+  const colorButtonRef = useRef<HTMLButtonElement>(null);
+  const effectsButtonRef = useRef<HTMLButtonElement>(null);
+  const pixelEffectButtonRef = useRef<HTMLButtonElement>(null);
+  // Whether the scrollable tool row (below) is scrolled away from its own left edge — drives the
+  // Media/Properties cluster's auto-hide (see its own comment for why). `> 4`, not `> 0`: a bounce/
+  // rubber-band scroll on iOS Safari can report a few stray sub-pixel values at rest, which would
+  // otherwise flicker the collapse in and out right at the resting position.
+  const [toolsScrolled, setToolsScrolled] = useState(false);
 
   // Drives the Transition button's active/disabled look, and what `TransitionPickerMenu` (opened by
   // that button) applies to and highlights as currently selected. Enabled for ANY video/text clip now,
@@ -185,6 +230,15 @@ function StatusBar({
   const foundForTransition = project && selectedId ? findClip(project, selectedId) : undefined;
   const transitionActive = Boolean(foundForTransition?.clip.transitionIn || foundForTransition?.clip.transitionOut);
   const transitionDisabled = !foundForTransition || (foundForTransition.track.kind !== "video" && foundForTransition.track.kind !== "text");
+
+  // Effects/Pixel Effects — video-track clips only (video/image/color-matte), same gating `ClipEffects`/
+  // `pixelEffect`'s own doc comments give; a text/audio clip has neither. Reuses `foundForTransition`'s
+  // already-resolved clip/track rather than a second `findClip` lookup for the same selection.
+  const foundForVideoEffects = foundForTransition && foundForTransition.track.kind === "video" ? foundForTransition : undefined;
+  const effectsDisabled = !foundForVideoEffects;
+  const effectsActive = Boolean(foundForVideoEffects?.clip.effects);
+  const pixelEffectActive = Boolean(foundForVideoEffects?.clip.pixelEffect);
+  const assetForVideoEffects = project && foundForVideoEffects ? findAsset(project, foundForVideoEffects.clip.assetId) : undefined;
 
   return (
     <footer className="flex shrink-0 items-center gap-1 border-t border-white/10 bg-[#0d0f14] px-2 py-1.5 text-[11px]">
@@ -197,7 +251,45 @@ function StatusBar({
           side column anymore (see VCutApp's own comment on `mobileSheet`) — this is where they're
           reached instead, which pushed the button count past what a phone's width can show without
           scrolling; `scrollbar-none` matches Timeline's own horizontal scrollbar treatment. */}
-      <div className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+      {/* Media/Properties, mobile-only — sits at the row's LEFT edge, ahead of the scrollable tool row,
+          and auto-collapses (width/opacity transition, not unmounted — `toolsScrolled` just tracks the
+          tool row's own `scrollLeft`) the instant that row is scrolled away from its start, reappearing
+          the moment it's scrolled back. Media/Properties are the two a mobile user reaches for
+          constantly (they're the ONLY way in to either panel below `lg` — see `mobileSheet`'s own
+          comment), so they stay right there at rest — but the tool row alone already needs horizontal
+          scrolling to show every tool (see that row's own comment), and permanently reserving space for
+          this cluster while actively scrolling through Split/Transition/Effects/etc. just eats into the
+          same cramped width without being reachable mid-scroll anyway. Desktop keeps its permanent side
+          columns (see VCutApp's grid) and never sets `mobileSheet`, so this stays irrelevant there
+          regardless of `lg:hidden`. Toggling: tapping the already-open one returns to Timeline, matching
+          `active`'s highlighted state always reflecting what's actually showing below. */}
+      <div
+        className={`flex shrink-0 items-center gap-0.5 overflow-hidden border-r border-white/10 pr-1 transition-all duration-200 ease-out lg:hidden ${
+          toolsScrolled ? "max-w-0 border-r-0 pr-0 opacity-0" : "max-w-[120px] opacity-100"
+        }`}
+      >
+        <ToolbarButton
+          title={t("Media")}
+          label={t("Media")}
+          active={mobileSheet === "media"}
+          onClick={() => setMobileSheet(mobileSheet === "media" ? null : "media")}
+        >
+          <Video size={18} />
+        </ToolbarButton>
+        <ToolbarButton
+          title={t("Properties")}
+          label={t("Properties")}
+          active={mobileSheet === "inspector"}
+          onClick={() => setMobileSheet(mobileSheet === "inspector" ? null : "inspector")}
+        >
+          <Settings size={18} />
+        </ToolbarButton>
+      </div>
+
+      <div
+        className="scrollbar-none flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto"
+        onScroll={(e) => setToolsScrolled(e.currentTarget.scrollLeft > 4)}
+      >
         {/* Workflow order, left to right: ADD content first (what you reach for to put something new
             on the timeline), then STRUCTURAL edits (reshaping what's already there), then
             destructive/save actions last (Delete right before Save specifically — "remove, then commit
@@ -218,13 +310,54 @@ function StatusBar({
         <ToolbarButton title={t("Auto Captions")} label={t("Captions")} onClick={() => setShowCaptions(true)}>
           <ClosedCaption size={18} />
         </ToolbarButton>
+        <ToolbarButton title={t("Sound Effects")} label={t("SFX")} onClick={() => setShowSfx(true)}>
+          <Headphone size={18} />
+        </ToolbarButton>
+        <ToolbarButton
+          ref={colorButtonRef}
+          title={t("Add a color background")}
+          label={t("Color")}
+          active={showColorMenu}
+          onClick={() => setShowColorMenu((v) => !v)}
+        >
+          <Art size={18} />
+        </ToolbarButton>
+        {showColorMenu && (
+          <ColorPickerMenu
+            anchorRef={colorButtonRef}
+            onPick={(color) => addColorAtPlayhead(color)}
+            onClose={() => setShowColorMenu(false)}
+          />
+        )}
         <ToolbarButton
           title={t("Audio Mixer")}
           label={t("Mixer")}
-          active={bottomPanel === "mixer"}
-          onClick={() => setBottomPanel(bottomPanel === "mixer" ? "timeline" : "mixer")}
+          active={bottomPanel === "mixer" || floatingPanel === "mixer"}
+          onClick={() => {
+            if (floatingPanel === "mixer") {
+              onDockFloating();
+              setBottomPanel("mixer");
+            } else {
+              setBottomPanel(bottomPanel === "mixer" ? "timeline" : "mixer");
+            }
+          }}
         >
           <Volume size={18} />
+        </ToolbarButton>
+        <ToolbarButton
+          title={t("Scopes")}
+          label={t("Scopes")}
+          active={bottomPanel === "scopes" || floatingPanel === "scopes"}
+          onClick={() => {
+            if (floatingPanel === "scopes") {
+              onDockFloating();
+              setBottomPanel("scopes");
+            } else {
+              setBottomPanel(bottomPanel === "scopes" ? "timeline" : "scopes");
+            }
+          }}
+        >
+          <Gauge size={18} />
         </ToolbarButton>
 
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
@@ -283,6 +416,49 @@ function StatusBar({
           />
         )}
 
+        {/* Quick-pick popovers over the selected clip's own Effects/Pixel Effects — the Inspector's
+            Effects section still has the full brightness/contrast/saturation/blur/opacity sliders for
+            fine-tuning afterward; these are the fast, preset-driven path, same split
+            `EffectsPickerMenu`/`PixelEffectPickerMenu`'s own doc comments describe. */}
+        <ToolbarButton
+          ref={effectsButtonRef}
+          title={t("Effects")}
+          label={t("Effects")}
+          disabled={effectsDisabled}
+          active={effectsActive}
+          onClick={() => setShowEffectsMenu((v) => !v)}
+        >
+          <Filter size={18} />
+        </ToolbarButton>
+        {showEffectsMenu && foundForVideoEffects && (
+          <EffectsPickerMenu
+            anchorRef={effectsButtonRef}
+            clip={foundForVideoEffects.clip}
+            asset={assetForVideoEffects}
+            projectId={projectId}
+            onClose={() => setShowEffectsMenu(false)}
+          />
+        )}
+        <ToolbarButton
+          ref={pixelEffectButtonRef}
+          title={t("Pixel Effects")}
+          label={t("Pixel FX")}
+          disabled={effectsDisabled}
+          active={pixelEffectActive}
+          onClick={() => setShowPixelEffectMenu((v) => !v)}
+        >
+          <Ai size={18} />
+        </ToolbarButton>
+        {showPixelEffectMenu && foundForVideoEffects && (
+          <PixelEffectPickerMenu
+            anchorRef={pixelEffectButtonRef}
+            clip={foundForVideoEffects.clip}
+            asset={assetForVideoEffects}
+            projectId={projectId}
+            onClose={() => setShowPixelEffectMenu(false)}
+          />
+        )}
+
         <span className="mx-1 h-5 w-px shrink-0 bg-white/10" />
 
         <ToolbarButton
@@ -303,33 +479,10 @@ function StatusBar({
         >
           <Save size={18} />
         </ToolbarButton>
-
-        {/* Media/Properties, mobile-only — desktop keeps its permanent side columns (see
-            VCutApp's grid) and never sets `mobileSheet`, so these stay irrelevant there regardless
-            of `lg:hidden`. Toggling: tapping the already-open one returns to Timeline, matching
-            `active`'s highlighted state always reflecting what's actually showing below. */}
-        <span className="mx-1 h-5 w-px shrink-0 bg-white/10 lg:hidden" />
-        <ToolbarButton
-          title={t("Media")}
-          label={t("Media")}
-          className="lg:hidden"
-          active={mobileSheet === "media"}
-          onClick={() => setMobileSheet(mobileSheet === "media" ? null : "media")}
-        >
-          <Video size={18} />
-        </ToolbarButton>
-        <ToolbarButton
-          title={t("Properties")}
-          label={t("Properties")}
-          className="lg:hidden"
-          active={mobileSheet === "inspector"}
-          onClick={() => setMobileSheet(mobileSheet === "inspector" ? null : "inspector")}
-        >
-          <Settings size={18} />
-        </ToolbarButton>
       </div>
       {showCaptions && <AutoCaptionsDialog onClose={() => setShowCaptions(false)} />}
       {showTextImport && <TextToClipsDialog onClose={() => setShowTextImport(false)} />}
+      {showSfx && <SfxPanel onClose={() => setShowSfx(false)} />}
     </footer>
   );
 }
@@ -546,7 +699,31 @@ function VCutAppInner({ projectId, projectName, onHome }: VCutAppProps) {
   // replacing the track lanes with a row of channel strips — the DaVinci-Resolve-Fairlight-page
   // pattern, not a new grid column). A literal union rather than a boolean in case a future third
   // bottom-panel mode is ever added.
-  const [bottomPanel, setBottomPanel] = useState<"timeline" | "mixer">("timeline");
+  const [bottomPanel, setBottomPanel] = useState<"timeline" | "mixer" | "scopes">("timeline");
+
+  // Which of Mixer/Scopes (if either) is popped out into its own `FloatablePanel` window instead of
+  // docked in the bottom row — `null` means neither is floating (the normal, default state). Only ONE
+  // can float at a time in v1 (a second `beginFloat` call while one is already floating just replaces
+  // it) — real screen-space-competing floating windows (drag/resize/z-order between several) is real
+  // extra machinery this defers, matching `FloatablePanel.tsx`'s own "currently Mixer/Scopes" doc
+  // comment. `rect` is fully owned here (passed down as `FloatablePanel`'s own controlled prop) so a
+  // dock/re-float cycle doesn't need to remember where the window was last time — it just reseeds a
+  // sensible default position near the top-right, clear of the Preview/Timeline the docked panel would
+  // otherwise occupy.
+  const [floatState, setFloatState] = useState<{ panel: "mixer" | "scopes"; rect: FloatRect } | null>(null);
+
+  function beginFloat(panel: "mixer" | "scopes") {
+    setFloatState({ panel, rect: { x: Math.max(8, window.innerWidth - 428), y: 80, width: 400, height: 320 } });
+    // The panel is now shown in its OWN floating window — leaving it also selected as the docked
+    // `bottomPanel` would render it twice (once floating, once still occupying the Timeline's own
+    // row) and silently fall back to Timeline there instead, matching what tapping the SAME toolbar
+    // button again already does.
+    setBottomPanel((current) => (current === panel ? "timeline" : current));
+  }
+
+  function dockPanel() {
+    setFloatState(null);
+  }
 
   // Lets the user trade vertical space between Preview (clearer to look at, bigger) and Timeline
   // (more clips/tracks visible at once) via a draggable divider, on every breakpoint. Seeded
@@ -920,7 +1097,7 @@ function VCutAppInner({ projectId, projectName, onHome }: VCutAppProps) {
         }
       >
         <div className="row-start-1 min-h-0 min-w-0 lg:order-2 lg:col-start-2 lg:row-start-1">
-          <Preview />
+          <Preview onResizeStart={beginTimelineResize} />
         </div>
 
         {/* Permanent side columns, `lg`+ only — below `lg` these render nothing at all (not even
@@ -945,28 +1122,29 @@ function VCutAppInner({ projectId, projectName, onHome }: VCutAppProps) {
           ) : mobileSheet === "inspector" ? (
             <Inspector />
           ) : bottomPanel === "mixer" ? (
-            <MixerPanel />
+            <MixerPanel onFloat={() => beginFloat("mixer")} />
+          ) : bottomPanel === "scopes" ? (
+            <ScopesPanel onFloat={() => beginFloat("scopes")} />
           ) : (
             <Timeline />
           )}
         </div>
 
-        {/* Draggable divider, every breakpoint — see `timelineHeight`'s own comment. Absolutely
-            positioned (not a real grid row/track) so it never needs its own `row-start`/row-count
-            bookkeeping alongside every other item's explicit placement above; `bottom` lands it
-            exactly on the row boundary since that row is fixed to this same height. No line of its
-            own — Timeline's own `border-t` (its section root, Timeline.tsx) already draws the visible
-            boundary line exactly here when Timeline itself is what's showing; MediaLibrary/Inspector
-            draw their own top edge instead when one of THEM is — either way this stays a purely
-            invisible, taller-than-1px grab area (`h-2.5`) layered on top for an actually-grabbable hit
-            target, rather than drawing a second, redundant line. */}
+        {/* Invisible full-width fallback hit strip, sitting right on the row boundary — the VISIBLE,
+            discoverable handle is Preview's own (the small centered bar between its canvas and
+            transport bar, wired to this exact same `beginTimelineResize` via `onResizeStart`); this
+            is just the "drag from anywhere along the edge" convenience a mouse user gets for free on
+            top of that, matching Media/Properties' own two dividers below. Absolutely positioned (not
+            a real grid row/track) so it never needs its own `row-start`/row-count bookkeeping
+            alongside every other item's explicit placement above; `bottom` lands it exactly on the row
+            boundary since that row is fixed to this same height. */}
         <div
           onMouseDown={beginTimelineResize}
           onTouchStart={beginTimelineResize}
           role="separator"
           aria-orientation="horizontal"
           aria-label={t("Resize timeline")}
-          className="absolute inset-x-0 z-20 block h-2.5 -translate-y-1/2 cursor-row-resize touch-none"
+          className="absolute inset-x-0 z-20 h-2.5 -translate-y-1/2 cursor-row-resize touch-none"
           style={{ bottom: timelineHeight }}
         />
 
@@ -997,9 +1175,28 @@ function VCutAppInner({ projectId, projectName, onHome }: VCutAppProps) {
         />
       </div>
 
-      <StatusBar mobileSheet={mobileSheet} setMobileSheet={setMobileSheet} bottomPanel={bottomPanel} setBottomPanel={setBottomPanel} />
+      <StatusBar
+        mobileSheet={mobileSheet}
+        setMobileSheet={setMobileSheet}
+        bottomPanel={bottomPanel}
+        setBottomPanel={setBottomPanel}
+        floatingPanel={floatState?.panel ?? null}
+        onDockFloating={dockPanel}
+      />
       <StatusToast />
       {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
+      {floatState && (
+        <FloatablePanel
+          title={floatState.panel === "mixer" ? t("Audio Mixer") : t("Scopes")}
+          rect={floatState.rect}
+          onRectChange={(rect) => setFloatState((s) => (s ? { ...s, rect } : s))}
+          onDock={dockPanel}
+          minWidth={280}
+          minHeight={220}
+        >
+          {floatState.panel === "mixer" ? <MixerPanel /> : <ScopesPanel />}
+        </FloatablePanel>
+      )}
     </div>
   );
 }

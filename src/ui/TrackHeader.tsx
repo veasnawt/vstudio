@@ -281,9 +281,10 @@ export function TrackHeader({
             {track.locked ? <Lock size={13} /> : <Unlock size={13} />}
           </FlagButton>
 
-          {track.kind !== "audio" ? (
+          {track.kind !== "audio" && (
             // Video and text tracks both have a visible on-canvas result, so both get the same
-            // show/hide toggle; only audio has nothing to show and gets mute/solo instead.
+            // show/hide toggle; a dedicated audio track has nothing to show and gets mute/solo
+            // instead, below.
             <FlagButton
               active={!track.visible}
               onClick={() => run(new SetTrackFlagCommand(track.id, "visible", !track.visible))}
@@ -292,7 +293,26 @@ export function TrackHeader({
             >
               {track.visible ? <Visibility size={13} /> : <VisibilityOff size={13} />}
             </FlagButton>
-          ) : (
+          )}
+          {track.kind === "video" && (
+            // A video clip's own embedded audio is a genuinely separate thing from its PICTURE —
+            // muting it must not require hiding the track too (see `Clip.mutedAudio`'s own doc
+            // comment on why "hidden implies silent" isn't the same ask as "silent but still visible").
+            // `PlaybackEngine.syncVideoClipAudio` and `buildExportPlan.ts`'s own `buildTrackStreams`
+            // already fold `track.muted` into a video track's embedded-audio check — this button was
+            // simply the missing way to ever SET it for a video track; no Solo here, since solo only
+            // ever applies to dedicated audio tracks (`anySoloAudioTrack`), not a video track's
+            // incidental embedded sound.
+            <FlagButton
+              active={track.muted}
+              onClick={() => run(new SetTrackFlagCommand(track.id, "muted", !track.muted))}
+              label={track.muted ? t("Unmute track") : t("Mute track")}
+              activeClass="bg-rose-500/25 text-rose-300"
+            >
+              M
+            </FlagButton>
+          )}
+          {track.kind === "audio" && (
             <>
               <FlagButton
                 active={track.muted}

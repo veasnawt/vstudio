@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { Maximize } from "@veasnawt/vicons";
 import { SetMasterGainCommand, SetTrackFlagCommand, SetTrackGainCommand, SetTrackPanCommand } from "../commands/index.ts";
 import { useTranslation } from "../i18n/useTranslation.ts";
 import type { Track } from "../project/types.ts";
@@ -145,7 +146,9 @@ function MixerChannelStrip({ track }: { track: Track }) {
  *  track, see `Sequence.masterGain`'s own doc comment). Deliberately scoped to audio tracks only,
  *  matching every existing mute/solo/gain code path (`TrackHeader.tsx`, `audibleClips`, export) — a
  *  video track's own embedded audio isn't mixed from here. */
-export function MixerPanel() {
+/** `onFloat` mirrors `ScopesPanel`'s own prop of the same name — see `VCutApp.tsx`'s `floatState`/
+ *  `beginFloat` for the docked/floating mechanism this panel doesn't otherwise need to know about. */
+export function MixerPanel({ onFloat }: { onFloat?: () => void } = {}) {
   const t = useTranslation();
   const project = useEditorStore((s) => s.project);
   const run = useEditorStore((s) => s.run);
@@ -169,9 +172,24 @@ export function MixerPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#0d0f14]">
-      <div className="flex shrink-0 items-center border-b border-white/5 px-4 py-2">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wider text-white/40">{t("Audio Mixer")}</h2>
-      </div>
+      {/* Hidden entirely while floating — `FloatablePanel`'s own title bar already shows "Audio
+          Mixer" (and its own way back to docked), so this would otherwise be a second, redundant
+          title sitting right below it. `onFloat` is only ever passed for the docked render (see
+          `VCutApp.tsx`'s own `floatState` wiring), so its presence doubles as the "am I docked"
+          signal, same convention `ScopesPanel`'s identical header comment already establishes. */}
+      {onFloat && (
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/5 px-4 py-2">
+          <h2 className="text-[11px] font-semibold uppercase tracking-wider text-white/40">{t("Audio Mixer")}</h2>
+          <button
+            onClick={onFloat}
+            title={t("Float as a window")}
+            aria-label={t("Float Audio Mixer as a window")}
+            className="flex items-center justify-center rounded p-1 text-white/40 transition hover:bg-white/10 hover:text-white"
+          >
+            <Maximize size={13} />
+          </button>
+        </div>
+      )}
 
       {audioTracks.length === 0 ? (
         <p className="px-4 py-3 text-xs text-white/50">{t("No audio tracks yet — record a voiceover or add music to mix it here.")}</p>

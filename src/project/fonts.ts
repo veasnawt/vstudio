@@ -483,6 +483,36 @@ export function preloadAllFonts(): void {
   for (const font of FONT_REGISTRY) preloadFont(font);
 }
 
+/** Which `CustomFontAsset` ids already have a real `FontFace` registered (or in flight) — module-scope,
+ *  same reasoning as `preloadedFontIds` above, keyed by `id` (the same string a `CustomFontAsset.id`
+ *  bounces around as everywhere else) so a second caller for the same custom font (the live editor's own
+ *  picker AND `text-harness/page.tsx`'s render loop both resolve the same clip's `fontFamily`) shares one
+ *  in-flight load instead of racing two separate fetches. Returns the SAME promise to every caller during
+ *  that window, so `await`ing it from either site genuinely waits for one real registration to land. */
+const customFontRegistrations = new Map<string, Promise<void>>();
+
+/** Registers a project-uploaded custom font as a real `FontFace`, fetched from `url` — unlike a bundled
+ *  font (a static `@font-face` rule already sitting in `globals.css`, `preloadFont` above just needs to
+ *  trigger the fetch), a custom font has no such rule anywhere: it was uploaded at runtime, so the ONLY
+ *  way to make `cssFamily` resolve to real glyphs at all is constructing and loading a `FontFace` object
+ *  directly, then adding it to `document.fonts` — after which both Canvas2D's `context.font` and the
+ *  `document.fonts.load()` check `preloadFont`/`text-harness/page.tsx` both already rely on start
+ *  resolving it like any other registered family. A no-op on the server (`document` doesn't exist during
+ *  SSR) — matches `preloadFont`'s own guard. */
+export function registerCustomFont(cssFamily: string, url: string, id: string): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return Promise.resolve();
+  const existing = customFontRegistrations.get(id);
+  if (existing) return existing;
+
+  const promise = (async () => {
+    const face = new FontFace(cssFamily, `url("${url}")`);
+    await face.load();
+    document.fonts.add(face);
+  })();
+  customFontRegistrations.set(id, promise);
+  return promise;
+}
+
 export interface AssFontMetrics {
   /** The font's real internal family name (`name` table, nameID 1, Windows/en-US preferred) — what an
    *  ASS subtitle's `Style: Fontname` field must contain for libass/fontconfig to resolve this exact
