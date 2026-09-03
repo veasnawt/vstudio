@@ -1,7 +1,7 @@
 {
-  "name": "@veasna/vstudio",
+  "name": "@veasnawt/vcut",
   "version": "0.1.0",
-  "description": "VStudio — a focused video editor for short-form creative work",
+  "description": "VCut — a focused video editor for short-form creative work",
   "private": true,
   "main": "src/index.ts",
   "module": "src/index.ts",

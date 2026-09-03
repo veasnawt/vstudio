@@ -1,23 +1,23 @@
-# VStudio Architecture
+# VCut Architecture
 
 ## Shape
 
-`@veasna/vstudio` is a source-only React package. `studios/vstudio` is its real host: a standalone
-Next.js app that consumes the package via `transpilePackages`, mounts `<VStudioApp>` at `/edit`, and
-provides every server route under `/api/vstudio/*`. This follows the repo's existing
+`@veasnawt/vcut` is a source-only React package. `studios/vcut` is its real host: a standalone
+Next.js app that consumes the package via `transpilePackages`, mounts `<VCutApp>` at `/edit`, and
+provides every server route under `/api/vcut/*`. This follows the repo's existing
 `packages/universe` → `studios/universe` split.
 
 `studios/bp` does NOT host the editor itself — it's a consumer, exactly like Universe is a consumer
-of `studios/bp`/`studios/vstudio`/`studios/gamedev`. BP's Create stage
-(`app/projects/[id]/create/page.tsx`) embeds VStudio via `<iframe src="${vstudioUrl}/edit?projectId=...">`,
-resolving `vstudioUrl` from its own tiny `/api/vstudio-url` route (env-var-backed in the packaged
+of `studios/bp`/`studios/vcut`/`studios/gamedev`. BP's Create stage
+(`app/projects/[id]/create/page.tsx`) embeds VCut via `<iframe src="${vcutUrl}/edit?projectId=...">`,
+resolving `vcutUrl` from its own tiny `/api/vcut-url` route (env-var-backed in the packaged
 desktop app, since the Electron `window.veasnaStudios` bridge Universe uses to resolve *its own*
 embedded studios isn't reachable from inside BP's `<webview>`). Same project data either way — BP
-never touches `project.json` or the media folder directly, it only ever talks to VStudio's API
+never touches `project.json` or the media folder directly, it only ever talks to VCut's API
 through the iframe's own same-origin requests.
 
 ```
-packages/vstudio/src/
+packages/vcut/src/
   project/     model, creation, serialization      (pure, no React, no I/O)
   timeline/    split/trim/move/delete, snapping    (pure)
   commands/    one class per reversible edit       (pure)
@@ -28,10 +28,10 @@ packages/vstudio/src/
   playback/    PlaybackEngine (clock, media pool, canvas compositor)
   ui/          React components
 
-studios/vstudio/
-  app/edit/          the editor page — reads ?projectId=&projectName= and renders <VStudioApp>
-  app/page.tsx        VStudio's own home page — list/create projects with no host app involved
-  app/api/vstudio/
+studios/vcut/
+  app/edit/          the editor page — reads ?projectId=&projectName= and renders <VCutApp>
+  app/page.tsx        VCut's own home page — list/create projects with no host app involved
+  app/api/vcut/
     _lib/        workspace paths, ffmpeg binaries, local-only guard
     project/     GET / PUT project.json
     media/       POST import · DELETE remove · raw/ GET with Range
@@ -46,7 +46,7 @@ test suite lives.
 
 ```
 user action → Command → UndoStack.execute → new Project → store → UI re-render
-                                                        ↘ autosave → PUT /api/vstudio/project
+                                                        ↘ autosave → PUT /api/vcut/project
 ```
 
 The UI never mutates media and never mutates the project in place. It constructs a command and hands

@@ -1,25 +1,25 @@
-# Developing VStudio
+# Developing VCut
 
 ## Setup
 
 ```bash
 pnpm install
-pnpm dev:vstudio
+pnpm dev:vcut
 ```
 
-Open `http://localhost:3002` — VStudio's own home page, no BP project required. To develop against
+Open `http://localhost:3002` — VCut's own home page, no BP project required. To develop against
 BP's Create-stage embedding specifically (the `<iframe>` path), also run `pnpm dev:bp` and open a
 project's Create stage from there instead.
 
-Next.js 16 allows **one dev server per project directory**. If `pnpm dev:vstudio` reports the port is
+Next.js 16 allows **one dev server per project directory**. If `pnpm dev:vcut` reports the port is
 in use, an earlier server is still running; Next prints its PID and the exact `taskkill` / `kill`
-command to stop it. Note that the packaged Veasna OS desktop app also serves VStudio on :3002, so
+command to stop it. Note that the packaged Veasna OS desktop app also serves VCut on :3002, so
 close it (or run `next dev -p <other>`) when developing.
 
 ## Tests
 
 ```bash
-pnpm --filter @veasna/vstudio test        # node --test over tests/*.test.ts
+pnpm --filter @veasnawt/vcut test        # node --test over tests/*.test.ts
 ```
 
 These run Node's built-in test runner **directly against TypeScript source** — no build step and no
@@ -38,18 +38,18 @@ Type-only imports must use `import type`, for the same erasure reason.
 
 ```bash
 # the package
-./studios/universe/node_modules/.bin/tsc --noEmit -p packages/vstudio/tsconfig.json
+./studios/universe/node_modules/.bin/tsc --noEmit -p packages/vcut/tsconfig.json
 # the host (also typechecks the package's source)
-cd studios/vstudio && ./node_modules/.bin/tsc --noEmit -p tsconfig.json
+cd studios/vcut && ./node_modules/.bin/tsc --noEmit -p tsconfig.json
 ```
 
 ## Styling
 
-VStudio's components use Tailwind utilities, but Tailwind only scans the app it runs in.
-`studios/vstudio` therefore declares this package as an extra source in `app/globals.css`:
+VCut's components use Tailwind utilities, but Tailwind only scans the app it runs in.
+`studios/vcut` therefore declares this package as an extra source in `app/globals.css`:
 
 ```css
-@source "../../../packages/vstudio/src";
+@source "../../../packages/vcut/src";
 ```
 
 **Without it the editor renders completely unstyled** — every utility class it uses simply won't exist

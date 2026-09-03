@@ -1,14 +1,14 @@
-# VStudio
+# VCut
 
 > Create faster. Think deeper. Tell better stories.
 
 A fast, focused video editor for short-form creative work — built for a solo creator making 30–60
 second educational and cinematic videos, not as a replacement for Premiere or Resolve.
 
-VStudio is both a real **standalone studio** in Veasna OS (its own desktop icon, its own home page
-at [studios/vstudio](../../studios/vstudio), its own port) and the **Create** stage of
+VCut is both a real **standalone studio** in Veasna OS (its own desktop icon, its own home page
+at [studios/vcut](../../studios/vcut), its own port) and the **Create** stage of
 [BP Studio](../../studios/bp): a BP project goes Idea → Script → **Create** → Publish, and BP embeds
-VStudio via `<iframe>` for that last-but-one stage rather than owning the editor itself. Same editor,
+VCut via `<iframe>` for that last-but-one stage rather than owning the editor itself. Same editor,
 same projects, two doors in.
 
 <p align="center">
@@ -27,7 +27,7 @@ same projects, two doors in.
 This is the spec's "First Milestone" — the smallest set of operations that make an editor real.
 Every one of these is implemented and verified end-to-end against a running app:
 
-1. Launch VStudio from a BP project
+1. Launch VCut from a BP project
 2. Create a project (created automatically on first open)
 3. Import a video
 4. See it in the media library with real duration / resolution / frame rate / audio info
@@ -39,7 +39,7 @@ Every one of these is implemented and verified end-to-end against a running app:
 10. Move the resulting clips
 11. Undo and redo every edit
 12. Save the project
-13. Close VStudio
+13. Close VCut
 14. Reopen and see the identical timeline
 15. Export the edit to an MP4 that matches it
 
@@ -116,7 +116,7 @@ one-click reset back to the full timeline.
 **Fullscreen preview**, and the **playhead automatically follows** playback once it scrolls past the
 right edge of the visible timeline.
 
-**Runs natively on mobile**, too — VStudio ships inside the Capacitor-wrapped mobile app
+**Runs natively on mobile**, too — VCut ships inside the Capacitor-wrapped mobile app
 ([apps/mobile](../../apps/mobile)) with its own on-device FFmpeg plugin (iOS and Android), so import,
 preview, and export all work without a server round-trip.
 
@@ -155,7 +155,7 @@ other clip. They render in the preview and export correctly (FFmpeg `-loop 1`).
 - Node 22+
 - FFmpeg and ffprobe — installed automatically as `ffmpeg-static` / `ffprobe-static`, no system
   install needed. If a package manager's build policy blocks install scripts, the binary won't
-  download; VStudio detects this and tells you to run `pnpm rebuild ffmpeg-static` rather than
+  download; VCut detects this and tells you to run `pnpm rebuild ffmpeg-static` rather than
   failing mysteriously at export time.
 
 ## Running it
@@ -164,17 +164,17 @@ Standalone (its own home page — create/open a project directly, no BP involved
 
 ```bash
 pnpm install
-pnpm dev:vstudio                 # VStudio on :3002
+pnpm dev:vcut                 # VCut on :3002
 ```
 
 Then open `http://localhost:3002`.
 
-Or from inside BP Studio, which embeds VStudio via `<iframe>` for its **Create** stage — both need
+Or from inside BP Studio, which embeds VCut via `<iframe>` for its **Create** stage — both need
 to be running:
 
 ```bash
 pnpm dev:bp                      # BP Studio on :3001
-pnpm dev:vstudio                 # VStudio on :3002
+pnpm dev:vcut                 # VCut on :3002
 ```
 
 Then open a project and choose **Create**, or go straight to
@@ -183,7 +183,7 @@ Then open a project and choose **Create**, or go straight to
 ## Tests
 
 ```bash
-pnpm --filter @veasna/vstudio test
+pnpm --filter @veasnawt/vcut test
 ```
 
 Runs Node's built-in test runner directly against the TypeScript source — no build step, no test
@@ -196,7 +196,7 @@ Projects are stored under the workspace root (`Documents/Veasna OS` in the packa
 repo root in development):
 
 ```
-.vstudio/<bpProjectId>/
+.vcut/<bpProjectId>/
   project.json      the edit — clips, tracks, settings
   media/            imported media (copies; originals are never touched)
   thumbnails/       generated library thumbnails
@@ -215,4 +215,4 @@ media. This is covered by an end-to-end test that hashes the source file before 
 ## More
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — how the pieces fit together and why
-- [DEVELOPMENT.md](./DEVELOPMENT.md) — working on VStudio
+- [DEVELOPMENT.md](./DEVELOPMENT.md) — working on VCut
